@@ -1,0 +1,60 @@
+
+    <scene version="2.0.0">
+        <default name="spp" value="1024"/>
+        <default name="res_w" value="1024"/>
+        <default name="res_h" value="768"/>
+
+        <integrator type="path">
+            <integer name="max_depth" value="5"/>
+        </integrator>
+
+        <!-- ITU Radio Materials -->
+        <bsdf type="itu-radio-material" id="itu_concrete">
+            <string name="name" value="itu_concrete"/>
+        </bsdf>
+
+        <bsdf type="itu-radio-material" id="itu_plasterboard">
+            <string name="name" value="itu_plasterboard"/>
+        </bsdf>
+
+        <!-- Floor (concrete) -->
+        <shape type="rectangle">
+            <transform name="to_world">
+                <scale x="15" y="15" z="1"/>
+                <translate x="5" y="5" z="0"/>  
+            </transform>
+            <ref id="itu_concrete"/>
+        </shape>
+
+        <!-- Corner blocker (plasterboard wall) -->
+        <shape type="cube">
+            <transform name="to_world">
+                <scale x="8" y="8" z="1.5"/>
+                <translate x="-5" y="-5" z="1.5"/>
+            </transform>
+            <ref id="itu_plasterboard"/>
+        </shape>
+
+        <!-- South Wall (plasterboard) -->
+        <shape type="rectangle">
+            <transform name="to_world">
+                <scale x="15" y="1.5" z="1.5"/>  
+                <rotate x="1" angle="90"/>
+                <translate x="5" y="-3" z="1.5"/>
+            </transform>
+            <ref id="itu_plasterboard"/>
+        </shape>
+
+        <!-- East Wall (plasterboard) -->
+        <shape type="rectangle">
+            <transform name="to_world">
+                <scale x="1.5" y="15" z="1.5"/>
+                <rotate x="1" angle="90"/>
+                <rotate y="1" angle="90"/>
+                <translate x="15" y="5" z="1.5"/>
+            </transform>
+            <ref id="itu_plasterboard"/>
+        </shape>
+
+    </scene>
+    

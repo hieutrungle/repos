@@ -1,0 +1,63 @@
+[project]
+name = "reflector-position"
+version = "0.1.0"
+description = "Physics-aware optimal placement for mechanical reflectors in NLOS scenarios using differentiable ray tracing"
+authors = [{ name = "Your Name", email = "your.email@example.com" }]
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10,<3.14"
+keywords = ["wireless", "ray-tracing", "optimization", "reflector", "sionna", "gradient-descent"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+dependencies = [
+    "tensorflow>=2.20.0",
+    "sionna>=1.2.1",
+    "sionna-rt>=1.2.1",
+    "numpy==1.26.4",
+    "matplotlib>=3.10.0",
+    "torch>=2.9.1",
+    "torchvision>=0.24.1",
+    "drjit>=1.2.0",
+    "mitsuba>=3.7.0",
+    "scipy>=1.16.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.0.2",
+    "black>=26.1.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0",
+    "jupyter>=1.0",
+    "ipykernel>=7.1.0",
+    "ipywidgets>=8.1.0",
+]
+
+[project.scripts]
+reflector-optimize = "reflector_position.cli:main"
+
+[tool.black]
+line-length = 100
+target-version = ["py310", "py311", "py312", "py313"]
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E203", "E266", "E501"]
+fix = true
+
+[tool.ruff.format]
+docstring-code-format = true
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-q"
+pythonpath = ["src"]
