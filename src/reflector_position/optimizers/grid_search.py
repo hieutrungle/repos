@@ -13,11 +13,12 @@ import torch
 import matplotlib.pyplot as plt
 import sionna.rt
 
+from .base_optimizer import BaseAPOptimizer
 from ..utils import compute_radio_map_with_tx_position
 from ..metrics import compute_min_rss_metric, compute_coverage_metric, rss_to_dbm
 
 
-class GridSearchAPOptimizer:
+class GridSearchAPOptimizer(BaseAPOptimizer):
     """
     Grid search optimizer for AP position.
 
@@ -40,10 +41,9 @@ class GridSearchAPOptimizer:
             grid_resolution: Grid spacing in meters
             fixed_z: Fixed height for AP (z-coordinate)
         """
-        self.scene = scene
+        super().__init__(scene=scene, fixed_z=fixed_z, position_bounds=search_bounds)
         self.search_bounds = search_bounds
         self.grid_resolution = grid_resolution
-        self.fixed_z = fixed_z
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         # Create grid using torch

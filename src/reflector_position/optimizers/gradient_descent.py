@@ -16,6 +16,7 @@ import sionna.rt
 from sionna.rt import RadioMapSolver
 import copy
 
+from .base_optimizer import BaseAPOptimizer
 from ..metrics import (
     compute_min_rss_metric,
     compute_soft_min_rss_metric,
@@ -24,7 +25,7 @@ from ..metrics import (
 )
 
 
-class GradientDescentAPOptimizer:
+class GradientDescentAPOptimizer(BaseAPOptimizer):
     """
     Gradient descent optimizer for AP position using differentiable ray tracing.
 
@@ -48,9 +49,7 @@ class GradientDescentAPOptimizer:
             fixed_z: Fixed height for AP (z-coordinate)
             position_bounds: Dictionary with 'x_min', 'x_max', 'y_min', 'y_max' for constraints
         """
-        self.scene = scene
-        self.fixed_z = fixed_z
-        self.position_bounds = position_bounds
+        super().__init__(scene=scene, fixed_z=fixed_z, position_bounds=position_bounds)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         # Initialize trainable position using PyTorch tensors on appropriate device
@@ -79,7 +78,7 @@ class GradientDescentAPOptimizer:
 
     def apply_position_constraints(self) -> None:
         """Project position back to valid bounds if constraints are specified."""
-        if self.position_bounds is not None:
+        if self.position_bounds and len(self.position_bounds) > 0:
             with torch.no_grad():
                 self.tx_x.clamp_(self.position_bounds["x_min"], self.position_bounds["x_max"])
                 self.tx_y.clamp_(self.position_bounds["y_min"], self.position_bounds["y_max"])
@@ -293,6 +292,18 @@ class GradientDescentAPOptimizer:
 
         return final_position, final_min_rss
 
+    def plot_results(self, **kwargs) -> None:
+        """
+        Plot the optimization results.
+        
+        Implements the abstract method from BaseAPOptimizer by plotting
+        the optimization trajectory and convergence metrics.
+        
+        Args:
+            **kwargs: Not used, accepts for interface compatibility
+        """
+        self.plot_optimization_trajectory()
+    
     def plot_optimization_trajectory(self) -> None:
         """Plot the optimization trajectory."""
         positions = np.array(self.history["positions"])
