@@ -7,7 +7,13 @@ using differentiable ray tracing with Sionna.
 
 __version__ = "0.1.0"
 
-from .optimizers import GridSearchAPOptimizer, GradientDescentAPOptimizer
+from .optimizers import (
+    BaseAPOptimizer,
+    GridSearchAPOptimizer,
+    GradientDescentAPOptimizer,
+    OptimizerFactory,
+    create_optimizer,
+)
 from .scene_setup import setup_building_floor_scene, create_camera
 from .metrics import (
     compute_min_rss_metric,
@@ -26,8 +32,11 @@ from .config import (
 __all__ = [
     "__version__",
     # Optimizers
+    "BaseAPOptimizer",
     "GridSearchAPOptimizer",
     "GradientDescentAPOptimizer",
+    "OptimizerFactory",
+    "create_optimizer",
     # Scene setup
     "setup_building_floor_scene",
     "create_camera",

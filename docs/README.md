@@ -24,14 +24,30 @@ In-depth explanations of optimization approaches and research methodology:
 
 - **[OPTIMIZATION_WORKFLOW.md](methodology/OPTIMIZATION_WORKFLOW.md)** - Ray-based distributed optimization architecture for physical object placement
 - **[RAY_ARCHITECTURE.md](methodology/RAY_ARCHITECTURE.md)** - Why Ray is needed for reflector optimization (vs vectorization)
+- **[RAY_PARALLEL_GUIDE.md](methodology/RAY_PARALLEL_GUIDE.md)** - Complete guide to using Ray for parallel optimization with examples
+- **[RAY_IMPLEMENTATION_SUMMARY.md](methodology/RAY_IMPLEMENTATION_SUMMARY.md)** - Implementation summary and usage patterns
 - **[BASELINES.md](methodology/BASELINES.md)** - Baseline comparison methods (GA, PSO, AO) for benchmarking
 - **[FUTURE_ROADMAP.md](methodology/FUTURE_ROADMAP.md)** - Planned features and research extensions
+
+### 🧪 Tests (Testing & Quality Assurance)
+Comprehensive testing documentation and guides:
+
+- **[tests/README.md](tests/README.md)** - Complete testing documentation hub
+- **[tests/TESTING_GUIDE.md](tests/TESTING_GUIDE.md)** - Step-by-step testing instructions
+- **[tests/TEST_SUMMARY.md](tests/TEST_SUMMARY.md)** - Test suite overview and statistics
+- **[tests/TEST_CATEGORIES.md](tests/TEST_CATEGORIES.md)** - Detailed breakdown of each test category
+- **[tests/MODULE_GUIDE.md](tests/MODULE_GUIDE.md)** - What each test module does
+- **[tests/TESTING.md](tests/TESTING.md)** - Complete testing reference
+
+**Quick Stats**: 62 tests | 4 test files | 82-92% core coverage | All passing ✅
 
 ## 🚀 Quick Navigation
 
 ### I want to...
 - **Install the package** → [guides/INSTALL.md](guides/INSTALL.md)
 - **Run an optimization** → [guides/USAGE.md](guides/USAGE.md)
+- **Use parallel optimization (Ray)** → [methodology/RAY_PARALLEL_GUIDE.md](methodology/RAY_PARALLEL_GUIDE.md)
+- **Test the code** → [tests/README.md](tests/README.md)
 - **Understand the code structure** → [architecture/PROJECT_STRUCTURE.md](architecture/PROJECT_STRUCTURE.md)
 - **Learn about the optimization algorithm** → [methodology/OPTIMIZATION_WORKFLOW.md](methodology/OPTIMIZATION_WORKFLOW.md)
 - **Compare with other methods** → [methodology/BASELINES.md](methodology/BASELINES.md)
@@ -42,15 +58,17 @@ In-depth explanations of optimization approaches and research methodology:
 If you're using this framework for research:
 
 1. **Start with**: [OPTIMIZATION_WORKFLOW.md](methodology/OPTIMIZATION_WORKFLOW.md) to understand the Ray-based distributed optimization approach
-2. **Then read**: [BASELINES.md](methodology/BASELINES.md) for recommended comparison methods
-3. **Check**: [FUTURE_ROADMAP.md](methodology/FUTURE_ROADMAP.md) for advanced features
+2. **Learn Ray usage**: [RAY_PARALLEL_GUIDE.md](methodology/RAY_PARALLEL_GUIDE.md) for practical implementation
+3. **Compare methods**: [BASELINES.md](methodology/BASELINES.md) for recommended comparison methods
+4. **Future work**: [FUTURE_ROADMAP.md](methodology/FUTURE_ROADMAP.md) for advanced features
 
 ## 🛠️ For Developers
 
 If you're contributing to the codebase:
 
-1. **Start with**: [PROJECT_STRUCTURE.md](architecture/PROJECT_STRUCTURE.md) to understand the architecture
-2. **Then read**: [INSTALL.md](guides/INSTALL.md) for development setup
+1. **Then read**: [INSTALL.md](guides/INSTALL.md) for development setup
+3. **Run tests**: [tests/TESTING_GUIDE.md](tests/TESTING_GUIDE.md) for testing workflows
+4. **Then read**: [INSTALL.md](guides/INSTALL.md) for development setup
 3. **Check**: [CHANGELOG.md](architecture/CHANGELOG.md) before making changes
 
 ## 📝 For Quick Users
@@ -86,7 +104,8 @@ See the [examples/](../examples/) directory for:
 
 ## Need Help?
 
-1. Check [QUICKREF.md](QUICKREF.md) for common commands
-2. Read [USAGE.md](USAGE.md) for detailed examples
-3. See [INSTALL.md](INSTALL.md) for installation issues
-4. Run `reflector-optimize --help` for CLI help
+1. Check [guides/QUICKREF.md](guides/QUICKREF.md) for common commands
+2. Read [guides/USAGE.md](guides/USAGE.md) for detailed examples
+3. See [guides/INSTALL.md](guides/INSTALL.md) for installation issues
+4. Review [tests/README.md](tests/README.md) for testing help
+5. Run `reflector-optimize --help` for CLI help
