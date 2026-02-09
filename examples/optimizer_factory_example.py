@@ -5,6 +5,7 @@ This example demonstrates how to use the optimizer factory pattern
 to easily switch between different optimization methods.
 """
 
+from pathlib import Path
 from reflector_position import (
     setup_building_floor_scene,
     OptimizerFactory,
@@ -15,17 +16,17 @@ from reflector_position import (
 def main():
     # Setup scene (same for all methods)
     scene = setup_building_floor_scene(
-        scene_path="l_shape_scene.xml",
+        scene_path=Path.home() / "blender" / "models" / "building_floor" / "building_floor.xml",
         frequency=5.18e9,
         tx_power_dbm=5.0,
     )
     
     # Define common parameters
     position_bounds = {
-        'x_min': 5.0,
-        'x_max': 25.0,
-        'y_min': 5.0,
-        'y_max': 25.0,
+        'x_min': 0.0,
+        'x_max': 20.0,
+        'y_min': 0.0,
+        'y_max': 20.0,
     }
     
     # Method 1: Using OptimizerFactory.create()

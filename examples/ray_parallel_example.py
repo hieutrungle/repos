@@ -1,470 +1,282 @@
 """
 Example: Distributed parallel optimization using Ray.
 
-This example demonstrates how to use the RayParallelOptimizer to run
-multiple independent optimization trajectories in parallel, exploring
-different starting positions to find the global optimum.
+Demonstrates how to use RayParallelOptimizer to run multiple independent
+optimization trajectories in parallel for both gradient descent and grid search.
 
-Key Features Demonstrated:
-1. Multi-worker parallel execution
-2. GPU resource management
-3. Diverse initial position generation
-4. Result aggregation and winner selection
-5. Performance analysis and visualization
+The scene setup follows the same pattern as full_comparison.py and
+optimizer_factory_example.py, using setup_building_floor_scene() to properly
+configure transmitters, receivers, and antenna arrays.
+
+Results are saved to files instead of displayed interactively.
 
 Usage:
     python examples/ray_parallel_example.py
 """
 
+import json
+import os
+import time
+from pathlib import Path
+
 import numpy as np
 import ray
-from reflector_position.optimizers import (
+
+from reflector_position.optimizers.ray_parallel_optimizer import (
     RayParallelOptimizer,
     generate_random_initial_positions,
 )
 
+# ── Configuration ─────────────────────────────────────────────────────────────
 
-def example_basic_parallel_optimization():
+# Scene path — same as full_comparison.py and optimizer_factory_example.py
+SCENE_PATH = Path.home() / "blender" / "models" / "building_floor" / "building_floor.xml"
+
+# Scene configuration matching setup_building_floor_scene() defaults
+SCENE_CONFIG = {
+    "scene_path": str(SCENE_PATH),
+    "frequency": 5.18e9,
+    "tx_power_dbm": 5.0,
+    # tx_positions and rx_position use defaults from setup_building_floor_scene
+}
+
+# Search space bounds (same as optimizer_factory_example.py)
+POSITION_BOUNDS = {
+    "x_min": 5.0,
+    "x_max": 25.0,
+    "y_min": 5.0,
+    "y_max": 25.0,
+}
+
+OUTPUT_DIR = "results/ray_parallel"
+
+
+# ── Example 1: Parallel Gradient Descent ──────────────────────────────────────
+
+def example_parallel_gradient_descent():
     """
-    Basic example: Run 8 parallel gradient descent optimizations.
-    
-    This demonstrates the simplest use case - parallel execution of
-    gradient descent with different starting positions.
+    Run multiple gradient descent optimizations in parallel.
+
+    Each worker starts from a different random position and optimizes
+    independently. The best result is selected at the end.
+
+    This follows the same optimizer initialization pattern as
+    optimizer_factory_example.py:
+        OptimizerFactory.create(
+            method="gradient_descent",
+            scene=scene,
+            initial_position=(x, y),
+            position_bounds={...},
+        )
     """
-    print("\n" + "="*80)
-    print("EXAMPLE 1: Basic Parallel Optimization")
-    print("="*80)
-    
-    # Configuration
-    NUM_WORKERS = 8
+    print("\n" + "=" * 80)
+    print("EXAMPLE 1: Parallel Gradient Descent")
+    print("=" * 80)
+
+    NUM_WORKERS = 4
     GPU_FRACTION = 0.25  # 4 workers per GPU
-    
-    # Scene configuration
-    scene_config = {
-        "xml_path": "l_shape_scene.xml",
-        "reflector_name": "reflector",
-    }
-    
-    # Search space bounds
-    bounds = {
-        "x_min": 0.0,
-        "x_max": 20.0,
-        "y_min": 0.0,
-        "y_max": 20.0,
-    }
-    
+
     # Generate diverse starting positions
     initial_positions = generate_random_initial_positions(
         num_positions=NUM_WORKERS,
-        bounds=bounds,
-        fixed_z=3.8,
-        seed=42,  # For reproducibility
-    )
-    
-    print(f"\nGenerated {NUM_WORKERS} initial positions:")
-    for i, pos in enumerate(initial_positions):
-        print(f"  Worker {i}: [{pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}]")
-    
-    # Initialize parallel optimizer
-    parallel_optimizer = RayParallelOptimizer(
-        num_workers=NUM_WORKERS,
-        gpu_fraction=GPU_FRACTION,
-        optimizer_method="gradient_descent",
-    )
-    
-    # Optimization parameters (passed to each worker's optimize())
-    optimization_params = {
-        "num_iterations": 30,
-        "learning_rate": 0.5,
-        "samples_per_tx": 500_000,
-        "max_depth": 13,
-        "use_soft_min": True,
-        "temperature": 0.2,
-    }
-    
-    # Run parallel optimization
-    results = parallel_optimizer.optimize(
-        scene_config=scene_config,
-        initial_positions=initial_positions,
-        optimization_params=optimization_params,
-        verbose=True,
-    )
-    
-    # Analyze results
-    print("\n" + "="*80)
-    print("RESULTS ANALYSIS")
-    print("="*80)
-    
-    best = results["best_result"]
-    stats = results["aggregate_stats"]
-    
-    print(f"\nBest Configuration (Worker #{best['worker_id']}):")
-    print(f"  Final Position: [{best['best_position'][0]:.2f}, "
-          f"{best['best_position'][1]:.2f}, {best['best_position'][2]:.2f}]")
-    print(f"  Final Metric: {best['best_metric']:.4f}")
-    print(f"  Time: {best['time_elapsed']:.2f}s")
-    
-    print(f"\nPerformance:")
-    print(f"  Parallel Speedup: {stats['speedup']:.2f}x")
-    print(f"  Wall-clock Time: {stats['total_wall_clock_time']:.2f}s")
-    print(f"  Avg Worker Time: {stats['mean_time_per_worker']:.2f}s")
-    
-    # Plot results
-    parallel_optimizer.plot_results(results, metric_name="Min RSS (dBm)")
-    
-    # Cleanup
-    parallel_optimizer.shutdown()
-    
-    return results
-
-
-def example_grid_search_parallel():
-    """
-    Example: Parallel grid search with different grid regions.
-    
-    This demonstrates how to use Ray with grid search, where each
-    worker explores a different region of the space.
-    """
-    print("\n" + "="*80)
-    print("EXAMPLE 2: Parallel Grid Search")
-    print("="*80)
-    
-    NUM_WORKERS = 4
-    
-    # Divide the space into 4 quadrants
-    full_bounds = {"x_min": 0.0, "x_max": 20.0, "y_min": 0.0, "y_max": 20.0}
-    
-    # Each worker searches a different quadrant
-    worker_configs = []
-    quadrant_bounds = [
-        {"x_min": 0.0, "x_max": 10.0, "y_min": 0.0, "y_max": 10.0},   # Quadrant 1
-        {"x_min": 10.0, "x_max": 20.0, "y_min": 0.0, "y_max": 10.0},  # Quadrant 2
-        {"x_min": 0.0, "x_max": 10.0, "y_min": 10.0, "y_max": 20.0},  # Quadrant 3
-        {"x_min": 10.0, "x_max": 20.0, "y_min": 10.0, "y_max": 20.0}, # Quadrant 4
-    ]
-    
-    # Generate configs for each worker
-    for i, bounds in enumerate(quadrant_bounds):
-        worker_configs.append({
-            "search_bounds": bounds,
-            "grid_resolution": 2.0,
-        })
-    
-    print(f"\nDividing space into {NUM_WORKERS} quadrants:")
-    for i, config in enumerate(worker_configs):
-        bounds = config["search_bounds"]
-        print(f"  Worker {i}: x=[{bounds['x_min']:.0f}, {bounds['x_max']:.0f}], "
-              f"y=[{bounds['y_min']:.0f}, {bounds['y_max']:.0f}]")
-    
-    # Scene config
-    scene_config = {"xml_path": "l_shape_scene.xml"}
-    
-    # Initialize parallel optimizer
-    parallel_optimizer = RayParallelOptimizer(
-        num_workers=NUM_WORKERS,
-        gpu_fraction=0.25,
-        optimizer_method="grid_search",
-    )
-    
-    # Optimization parameters
-    optimization_params = {
-        "samples_per_tx": 1_000_000,
-        "max_depth": 13,
-    }
-    
-    # Run parallel grid search
-    # Note: For grid search, we don't need initial_positions,
-    # but we provide dummy ones for interface consistency
-    dummy_positions = [np.array([10.0, 10.0, 3.8])] * NUM_WORKERS
-    
-    results = parallel_optimizer.optimize(
-        scene_config=scene_config,
-        initial_positions=dummy_positions,
-        optimization_params=optimization_params,
-        optimizer_configs=worker_configs,
-        verbose=True,
-    )
-    
-    # Plot results
-    parallel_optimizer.plot_results(results, metric_name="Min RSS (dBm)")
-    
-    # Cleanup
-    parallel_optimizer.shutdown()
-    
-    return results
-
-
-def example_hyperparameter_search():
-    """
-    Example: Parallel hyperparameter search.
-    
-    This demonstrates using Ray to test different hyperparameter
-    combinations in parallel (e.g., different learning rates).
-    """
-    print("\n" + "="*80)
-    print("EXAMPLE 3: Parallel Hyperparameter Search")
-    print("="*80)
-    
-    NUM_WORKERS = 6
-    
-    # Same starting position, different hyperparameters
-    base_position = np.array([10.0, 10.0, 3.8])
-    initial_positions = [base_position.copy() for _ in range(NUM_WORKERS)]
-    
-    # Test different learning rates
-    learning_rates = [0.1, 0.3, 0.5, 0.7, 1.0, 1.5]
-    
-    print(f"\nTesting {NUM_WORKERS} learning rates:")
-    for i, lr in enumerate(learning_rates):
-        print(f"  Worker {i}: learning_rate = {lr}")
-    
-    # Scene config
-    scene_config = {"xml_path": "l_shape_scene.xml"}
-    
-    # Initialize parallel optimizer
-    parallel_optimizer = RayParallelOptimizer(
-        num_workers=NUM_WORKERS,
-        gpu_fraction=0.25,
-        optimizer_method="gradient_descent",
-    )
-    
-    # Create different optimization params for each worker
-    # We'll use a workaround: modify learning_rate in optimizer_config
-    optimizer_configs = [
-        {"initial_position": base_position[:2]} for _ in range(NUM_WORKERS)
-    ]
-    
-    # Base optimization parameters
-    base_opt_params = {
-        "num_iterations": 30,
-        "samples_per_tx": 500_000,
-        "max_depth": 13,
-        "use_soft_min": True,
-        "temperature": 0.2,
-    }
-    
-    # Run parallel optimization with different learning rates
-    # Note: This is a simplified example. For true hyperparameter tuning,
-    # consider using Ray Tune instead.
-    all_results = []
-    
-    for i, lr in enumerate(learning_rates):
-        opt_params = base_opt_params.copy()
-        opt_params["learning_rate"] = lr
-        
-        # Run single worker (for demonstration)
-        single_worker_optimizer = RayParallelOptimizer(
-            num_workers=1,
-            gpu_fraction=0.5,
-            optimizer_method="gradient_descent",
-        )
-        
-        result = single_worker_optimizer.optimize(
-            scene_config=scene_config,
-            initial_positions=[initial_positions[i]],
-            optimization_params=opt_params,
-            verbose=False,
-        )
-        
-        all_results.append({
-            "learning_rate": lr,
-            "result": result["best_result"],
-        })
-        
-        single_worker_optimizer.shutdown()
-    
-    # Analyze hyperparameter search results
-    print("\n" + "="*80)
-    print("HYPERPARAMETER SEARCH RESULTS")
-    print("="*80)
-    print(f"\n{'LR':<8} {'Metric':<12} {'Time (s)':<10}")
-    print("-" * 30)
-    
-    best_lr = None
-    best_metric = -float('inf')
-    
-    for res in all_results:
-        lr = res["learning_rate"]
-        metric = res["result"]["best_metric"]
-        time_elapsed = res["result"]["time_elapsed"]
-        
-        print(f"{lr:<8.2f} {metric:<12.4f} {time_elapsed:<10.2f}")
-        
-        if metric > best_metric:
-            best_metric = metric
-            best_lr = lr
-    
-    print("-" * 30)
-    print(f"\nBest learning rate: {best_lr}")
-    print(f"Best metric: {best_metric:.4f}")
-    
-    return all_results
-
-
-def example_production_workflow():
-    """
-    Example: Production-grade parallel optimization workflow.
-    
-    This demonstrates best practices for production use:
-    1. Proper error handling
-    2. Checkpointing intermediate results
-    3. Adaptive resource allocation
-    4. Result persistence
-    """
-    print("\n" + "="*80)
-    print("EXAMPLE 4: Production Workflow")
-    print("="*80)
-    
-    import os
-    import json
-    from datetime import datetime
-    
-    # Configuration
-    NUM_WORKERS = 16
-    GPU_FRACTION = 0.1  # 10 workers per GPU
-    OUTPUT_DIR = "results/ray_parallel"
-    
-    # Create output directory
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = os.path.join(OUTPUT_DIR, f"run_{timestamp}")
-    os.makedirs(run_dir, exist_ok=True)
-    
-    print(f"\nOutput directory: {run_dir}")
-    
-    # Scene configuration
-    scene_config = {
-        "xml_path": "l_shape_scene.xml",
-        "reflector_name": "reflector",
-    }
-    
-    # Search bounds
-    bounds = {
-        "x_min": 0.0,
-        "x_max": 20.0,
-        "y_min": 0.0,
-        "y_max": 20.0,
-    }
-    
-    # Generate initial positions with good coverage
-    initial_positions = generate_random_initial_positions(
-        num_positions=NUM_WORKERS,
-        bounds=bounds,
+        bounds=POSITION_BOUNDS,
         fixed_z=3.8,
         seed=42,
     )
-    
-    # Save initial positions
-    np.save(
-        os.path.join(run_dir, "initial_positions.npy"),
-        np.array(initial_positions)
-    )
-    
-    # Initialize parallel optimizer
-    parallel_optimizer = RayParallelOptimizer(
-        num_workers=NUM_WORKERS,
-        gpu_fraction=GPU_FRACTION,
-        optimizer_method="gradient_descent",
-    )
-    
-    # Optimization parameters
+
+    print(f"\nGenerated {NUM_WORKERS} initial positions:")
+    for i, pos in enumerate(initial_positions):
+        print(f"  Worker {i}: [{pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}]")
+
+    # Build per-worker optimizer kwargs
+    # These match the kwargs you'd pass to OptimizerFactory.create()
+    worker_optimizer_kwargs = [
+        {
+            "initial_position": (float(pos[0]), float(pos[1])),
+            "position_bounds": POSITION_BOUNDS,
+            "fixed_z": 3.8,
+        }
+        for pos in initial_positions
+    ]
+
+    # Optimization parameters — passed to optimizer.optimize()
+    # Same parameters as in full_comparison.py
     optimization_params = {
-        "num_iterations": 50,
+        "num_iterations": 10,
         "learning_rate": 0.5,
-        "samples_per_tx": 1_000_000,
+        "samples_per_tx": 500_000,
         "max_depth": 13,
         "use_soft_min": True,
         "temperature": 0.2,
+        "verbose": False,
     }
-    
-    # Save configuration
-    config = {
-        "num_workers": NUM_WORKERS,
-        "gpu_fraction": GPU_FRACTION,
-        "optimizer_method": "gradient_descent",
-        "scene_config": scene_config,
-        "bounds": bounds,
-        "optimization_params": optimization_params,
-        "timestamp": timestamp,
-    }
-    
-    with open(os.path.join(run_dir, "config.json"), "w") as f:
-        json.dump(config, f, indent=2)
-    
-    print("\nConfiguration saved")
-    
-    # Run parallel optimization
-    try:
-        results = parallel_optimizer.optimize(
-            scene_config=scene_config,
-            initial_positions=initial_positions,
-            optimization_params=optimization_params,
-            verbose=True,
-        )
-        
-        # Save results
-        # Convert numpy arrays to lists for JSON serialization
-        serializable_results = {
-            "best_worker_id": results["best_worker_id"],
-            "total_time": results["total_time"],
-            "aggregate_stats": results["aggregate_stats"],
-            "best_result": {
-                "worker_id": results["best_result"]["worker_id"],
-                "best_position": results["best_result"]["best_position"].tolist(),
-                "best_metric": float(results["best_result"]["best_metric"]),
-                "time_elapsed": results["best_result"]["time_elapsed"],
-            },
-            "all_metrics": [
-                float(r["best_metric"]) for r in results["all_results"]
-            ],
-            "all_positions": [
-                r["best_position"].tolist() for r in results["all_results"]
-            ],
-        }
-        
-        with open(os.path.join(run_dir, "results.json"), "w") as f:
-            json.dump(serializable_results, f, indent=2)
-        
-        print(f"\nResults saved to: {run_dir}")
-        
-        # Plot and save figure
-        import matplotlib.pyplot as plt
-        parallel_optimizer.plot_results(results)
-        plt.savefig(os.path.join(run_dir, "results_plot.png"), dpi=150)
-        print(f"Plot saved to: {os.path.join(run_dir, 'results_plot.png')}")
-        
-    except Exception as e:
-        print(f"\nError during optimization: {e}")
-        raise
-    
-    finally:
-        # Always cleanup
-        parallel_optimizer.shutdown()
-    
+
+    # Create orchestrator and run
+    parallel_opt = RayParallelOptimizer(
+        num_workers=NUM_WORKERS,
+        gpu_fraction=GPU_FRACTION,
+    )
+
+    results = parallel_opt.run(
+        scene_config=SCENE_CONFIG,
+        optimizer_method="gradient_descent",
+        worker_optimizer_kwargs=worker_optimizer_kwargs,
+        optimization_params=optimization_params,
+        verbose=True,
+    )
+
+    # Save results
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    _save_results(results, os.path.join(OUTPUT_DIR, "gd_results.json"))
+
+    # Save plot
+    parallel_opt.save_results_plot(
+        results,
+        save_path=os.path.join(OUTPUT_DIR, "gd_parallel_results.png"),
+        metric_name="Min RSS",
+    )
+
     return results
 
 
+# ── Example 2: Parallel Grid Search ──────────────────────────────────────────
+
+def example_parallel_grid_search():
+    """
+    Run grid search optimizations in parallel, each covering a different
+    spatial quadrant.
+
+    Each worker receives different search_bounds, splitting the full search
+    space into quadrants. This follows the same optimizer initialization
+    pattern as full_comparison.py:
+        GridSearchAPOptimizer(
+            scene=scene,
+            search_bounds={...},
+            grid_resolution=2.0,
+            fixed_z=3.8,
+        )
+    """
+    print("\n" + "=" * 80)
+    print("EXAMPLE 2: Parallel Grid Search (quadrant split)")
+    print("=" * 80)
+
+    NUM_WORKERS = 4
+    GPU_FRACTION = 0.25
+
+    # Divide the search space into 4 quadrants
+    x_mid = (POSITION_BOUNDS["x_min"] + POSITION_BOUNDS["x_max"]) / 2
+    y_mid = (POSITION_BOUNDS["y_min"] + POSITION_BOUNDS["y_max"]) / 2
+
+    quadrants = [
+        {"x_min": POSITION_BOUNDS["x_min"], "x_max": x_mid,
+         "y_min": POSITION_BOUNDS["y_min"], "y_max": y_mid},    # SW
+        {"x_min": x_mid,                    "x_max": POSITION_BOUNDS["x_max"],
+         "y_min": POSITION_BOUNDS["y_min"], "y_max": y_mid},    # SE
+        {"x_min": POSITION_BOUNDS["x_min"], "x_max": x_mid,
+         "y_min": y_mid,                    "y_max": POSITION_BOUNDS["y_max"]},  # NW
+        {"x_min": x_mid,                    "x_max": POSITION_BOUNDS["x_max"],
+         "y_min": y_mid,                    "y_max": POSITION_BOUNDS["y_max"]},  # NE
+    ]
+
+    print(f"\nDividing space into {NUM_WORKERS} quadrants:")
+    for i, q in enumerate(quadrants):
+        print(f"  Worker {i}: x=[{q['x_min']:.1f}, {q['x_max']:.1f}], "
+              f"y=[{q['y_min']:.1f}, {q['y_max']:.1f}]")
+
+    # Build per-worker optimizer kwargs for grid search
+    # These match the kwargs you'd pass to OptimizerFactory.create()
+    worker_optimizer_kwargs = [
+        {
+            "search_bounds": q,
+            "grid_resolution": 5.0,
+            "fixed_z": 3.8,
+        }
+        for q in quadrants
+    ]
+
+    # Optimization parameters — passed to optimizer.optimize()
+    optimization_params = {
+        "samples_per_tx": 500_000,
+        "max_depth": 13,
+        "verbose": False,
+    }
+
+    # Create orchestrator and run
+    parallel_opt = RayParallelOptimizer(
+        num_workers=NUM_WORKERS,
+        gpu_fraction=GPU_FRACTION,
+    )
+
+    results = parallel_opt.run(
+        scene_config=SCENE_CONFIG,
+        optimizer_method="grid_search",
+        worker_optimizer_kwargs=worker_optimizer_kwargs,
+        optimization_params=optimization_params,
+        verbose=True,
+    )
+
+    # Save results
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    _save_results(results, os.path.join(OUTPUT_DIR, "gs_results.json"))
+
+    # Save plot
+    parallel_opt.save_results_plot(
+        results,
+        save_path=os.path.join(OUTPUT_DIR, "gs_parallel_results.png"),
+        metric_name="Min RSS",
+    )
+
+    return results
+
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+
+def _save_results(results: dict, path: str) -> None:
+    """Save results dict to JSON, converting numpy types."""
+    serializable = {
+        "best_worker_id": results["best_worker_id"],
+        "total_time": results["total_time"],
+        "aggregate_stats": results["aggregate_stats"],
+        "best_result": {
+            "worker_id": results["best_result"]["worker_id"],
+            "best_position": results["best_result"]["best_position"],
+            "best_metric": results["best_result"]["best_metric"],
+            "best_metric_dbm": results["best_result"]["best_metric_dbm"],
+            "time_elapsed": results["best_result"]["time_elapsed"],
+        },
+        "all_metrics_dbm": [r["best_metric_dbm"] for r in results["all_results"]],
+        "all_positions": [r["best_position"] for r in results["all_results"]],
+    }
+    with open(path, "w") as f:
+        json.dump(serializable, f, indent=2, default=str)
+    print(f"Results saved to: {path}")
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
-    # Initialize Ray
+    # Initialize Ray once (all examples share the same cluster)
     ray.init(ignore_reinit_error=True)
-    
-    # Run examples (uncomment the ones you want to run)
-    
-    # Example 1: Basic parallel optimization
-    results_1 = example_basic_parallel_optimization()
-    
-    # Example 2: Parallel grid search
-    # results_2 = example_grid_search_parallel()
-    
-    # Example 3: Hyperparameter search
-    # results_3 = example_hyperparameter_search()
-    
-    # Example 4: Production workflow
-    # results_4 = example_production_workflow()
-    
-    # Shutdown Ray
-    ray.shutdown()
-    
-    print("\n" + "="*80)
-    print("All examples completed!")
-    print("="*80)
+
+    try:
+        # Example 1: Parallel gradient descent
+        gd_results = example_parallel_gradient_descent()
+
+        # Example 2: Parallel grid search
+        gs_results = example_parallel_grid_search()
+
+        # ── Summary ───────────────────────────────────────────────────
+        print("\n" + "=" * 80)
+        print("OVERALL SUMMARY")
+        print("=" * 80)
+        print(f"\nGradient Descent (parallel):")
+        print(f"  Best position: {gd_results['best_result']['best_position']}")
+        print(f"  Best Min RSS:  {gd_results['best_result']['best_metric_dbm']:.2f} dBm")
+        print(f"  Wall-clock:    {gd_results['total_time']:.2f}s")
+        print(f"\nGrid Search (parallel):")
+        print(f"  Best position: {gs_results['best_result']['best_position']}")
+        print(f"  Best Min RSS:  {gs_results['best_result']['best_metric_dbm']:.2f} dBm")
+        print(f"  Wall-clock:    {gs_results['total_time']:.2f}s")
+
+    finally:
+        ray.shutdown()

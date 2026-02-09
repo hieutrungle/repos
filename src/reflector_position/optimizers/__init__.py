@@ -18,6 +18,7 @@ __all__ = [
     "GradientDescentAPOptimizer",
     "OptimizerFactory",
     "create_optimizer",
+    # Ray parallel
     "RayParallelOptimizer",
     "OptimizationWorker",
     "generate_random_initial_positions",

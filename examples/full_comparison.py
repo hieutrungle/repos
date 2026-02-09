@@ -28,29 +28,29 @@ def main():
     
     # Grid search configuration
     gs_config = GridSearchConfig(
-        x_min=10.0,
-        x_max=30.0,
-        y_min=10.0,
-        y_max=30.0,
+        x_min=5.0,
+        x_max=25.0,
+        y_min=5.0,
+        y_max=25.0,
         grid_resolution=2.0,  # 2 meter spacing
         fixed_z=3.8,
-        samples_per_tx=500_000,
+        samples_per_tx=1_000_000,
         max_depth=13,
     )
     
     # Gradient descent configuration
     gd_config = GradientDescentConfig(
-        initial_x=20.0,
-        initial_y=20.0,
-        x_min=10.0,
-        x_max=30.0,
-        y_min=10.0,
-        y_max=30.0,
+        initial_x=15.0,
+        initial_y=15.0,
+        x_min=5.0,
+        x_max=25.0,
+        y_min=5.0,
+        y_max=25.0,
         fixed_z=3.8,
-        num_iterations=20,
-        learning_rate=0.5,
+        num_iterations=30,
+        learning_rate=0.25,
         samples_per_tx=1_000_000,
-        max_depth=15,
+        max_depth=13,
         use_soft_min=True,
         temperature=0.2,
     )
