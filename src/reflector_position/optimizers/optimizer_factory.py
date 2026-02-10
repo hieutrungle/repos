@@ -10,7 +10,7 @@ import sionna.rt
 
 from .base_optimizer import BaseAPOptimizer
 from .gradient_descent import GradientDescentAPOptimizer
-from .grid_search import GridSearchAPOptimizer
+from .grid_search import GridSearchAPOptimizer, SinglePointGridSearchOptimizer
 
 
 class OptimizerFactory:
@@ -25,6 +25,7 @@ class OptimizerFactory:
     _optimizers: Dict[str, Type[BaseAPOptimizer]] = {
         "gradient_descent": GradientDescentAPOptimizer,
         "grid_search": GridSearchAPOptimizer,
+        "grid_search_point": SinglePointGridSearchOptimizer,
     }
     
     @classmethod

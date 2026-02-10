@@ -3,10 +3,13 @@ Grid search optimizer for AP position.
 
 This module implements exhaustive grid search over a 2D spatial grid
 to find optimal AP placement that maximizes minimum RSS.
+
+For Ray-parallel usage, use generate_grid_positions() to create all grid
+points, then submit each as a SinglePointGridSearchOptimizer task.
 """
 
 import time
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Optional
 
 import numpy as np
 import torch
@@ -16,6 +19,51 @@ import sionna.rt
 from .base_optimizer import BaseAPOptimizer
 from ..utils import compute_radio_map_with_tx_position
 from ..metrics import compute_min_rss_metric, compute_coverage_metric, rss_to_dbm
+
+
+def generate_grid_positions(
+    search_bounds: Dict[str, float],
+    grid_resolution: float = 1.0,
+    fixed_z: float = 3.8,
+) -> List[np.ndarray]:
+    """
+    Generate uniformly-spaced grid positions for parallel grid search.
+
+    Creates all grid points within the search bounds at the specified
+    resolution. Each point can then be submitted as an independent
+    Ray task for truly parallel grid search evaluation.
+
+    Args:
+        search_bounds: Dictionary with 'x_min', 'x_max', 'y_min', 'y_max'.
+        grid_resolution: Grid spacing in meters.
+        fixed_z: Fixed z-coordinate (height) for all positions.
+
+    Returns:
+        List of position arrays [x, y, z].
+
+    Example:
+        >>> bounds = {'x_min': 5.0, 'x_max': 25.0, 'y_min': 5.0, 'y_max': 25.0}
+        >>> positions = generate_grid_positions(bounds, grid_resolution=1.0)
+        >>> print(f"{len(positions)} grid points")
+        441 grid points
+    """
+    x_range = np.arange(
+        search_bounds["x_min"],
+        search_bounds["x_max"] + grid_resolution / 2,  # inclusive endpoint
+        grid_resolution,
+    )
+    y_range = np.arange(
+        search_bounds["y_min"],
+        search_bounds["y_max"] + grid_resolution / 2,
+        grid_resolution,
+    )
+
+    positions = []
+    for x in x_range:
+        for y in y_range:
+            positions.append(np.array([x, y, fixed_z]))
+
+    return positions
 
 
 class GridSearchAPOptimizer(BaseAPOptimizer):
@@ -229,3 +277,110 @@ class GridSearchAPOptimizer(BaseAPOptimizer):
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
         plt.show()
+
+
+class SinglePointGridSearchOptimizer(BaseAPOptimizer):
+    """
+    Evaluates a single grid point's radio map and computes metrics.
+
+    Designed for Ray-parallel grid search: the orchestrator generates all
+    grid points via generate_grid_positions(), then each point is submitted
+    as a separate task. Each task creates one SinglePointGridSearchOptimizer
+    that evaluates exactly one position.
+
+    This is the Ray-parallel counterpart of GridSearchAPOptimizer:
+    - GridSearchAPOptimizer: evaluates ALL grid points sequentially (standalone)
+    - SinglePointGridSearchOptimizer: evaluates ONE point (Ray-parallel)
+    """
+
+    def __init__(
+        self,
+        scene: sionna.rt.Scene,
+        evaluation_position: Tuple[float, float],
+        fixed_z: float = 3.8,
+        position_bounds: Optional[Dict[str, float]] = None,
+    ):
+        """
+        Initialize single-point grid search evaluator.
+
+        Args:
+            scene: Sionna Scene object.
+            evaluation_position: (x, y) position to evaluate.
+            fixed_z: Fixed height for AP (z-coordinate).
+            position_bounds: Optional bounds (unused, for interface compatibility).
+        """
+        super().__init__(scene=scene, fixed_z=fixed_z, position_bounds=position_bounds)
+        self.evaluation_position = evaluation_position
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Store results for the single evaluation
+        self.results = {
+            "positions": [],
+            "min_rss_values": [],
+            "min_rss_dbm_values": [],
+            "coverage_values": [],
+        }
+
+    def optimize(
+        self,
+        samples_per_tx: int = 1_000_000,
+        max_depth: int = 13,
+        coverage_threshold_dbm: float = -100.0,
+        verbose: bool = False,
+    ) -> Tuple[np.ndarray, float]:
+        """
+        Evaluate the single grid point.
+
+        Computes the radio map for the configured position and returns
+        the min RSS metric.
+
+        Args:
+            samples_per_tx: Number of ray tracing samples.
+            max_depth: Maximum ray tracing depth.
+            coverage_threshold_dbm: Threshold for coverage calculation.
+            verbose: Print progress.
+
+        Returns:
+            position: [x, y, z] of evaluated position.
+            min_rss: Minimum RSS value (linear Watts).
+        """
+        x, y = self.evaluation_position
+        tx_position = [float(x), float(y), float(self.fixed_z)]
+
+        start_time = time.time()
+
+        rm = compute_radio_map_with_tx_position(
+            self.scene,
+            tx_position,
+            samples_per_tx=samples_per_tx,
+            max_depth=max_depth,
+        )
+
+        rss_tensor = torch.from_numpy(np.array(rm.rss)).to(self.device)
+        min_rss = compute_min_rss_metric(rss_tensor)
+        min_rss_dbm = rss_to_dbm(min_rss)
+        coverage = compute_coverage_metric(rss_tensor, coverage_threshold_dbm)
+
+        position = np.array([x, y, self.fixed_z])
+
+        # Store results
+        self.results["positions"].append(position)
+        self.results["min_rss_values"].append(min_rss.cpu().item())
+        self.results["min_rss_dbm_values"].append(min_rss_dbm.cpu().item())
+        self.results["coverage_values"].append(coverage.cpu().item())
+
+        elapsed = time.time() - start_time
+
+        if verbose:
+            print(
+                f"  Grid point ({x:.2f}, {y:.2f}, {self.fixed_z:.2f}): "
+                f"Min RSS = {min_rss_dbm.item():.2f} dBm, "
+                f"Coverage = {coverage.item():.1f}%, "
+                f"Time = {elapsed:.2f}s"
+            )
+
+        return position, min_rss.cpu().item()
+
+    def plot_results(self, **kwargs) -> None:
+        """No-op for single point evaluation."""
+        pass

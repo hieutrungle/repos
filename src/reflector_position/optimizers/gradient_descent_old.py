@@ -211,7 +211,7 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
                 rm = self.radio_solver(
                     self.scene,
                     cell_size=(1.0, 1.0),
-                    samples_per_tx=samples_per_tx,
+                    samples_per_tx=int(samples_per_tx / 10),  # Use fewer samples for logging
                     max_depth=max_depth,
                     refraction=True,
                     diffraction=True,
