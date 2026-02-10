@@ -33,7 +33,7 @@ def compute_min_rss_metric(rss_map: torch.Tensor) -> torch.Tensor:
 
 
 def compute_soft_min_rss_metric(
-    rss_map: torch.Tensor, temperature: float = 0.3
+    rss_map: torch.Tensor, temperature: float = 0.2
 ) -> torch.Tensor:
     """
     Compute a soft (differentiable) minimum RSS using LogSumExp trick.
@@ -71,7 +71,7 @@ def compute_soft_min_rss_metric(
 
 
 def compute_coverage_metric(
-    rss_map: torch.Tensor, threshold_dbm: float = -100.0
+    rss_map: torch.Tensor, threshold_dbm: float = -120.0
 ) -> torch.Tensor:
     """
     Compute coverage area percentage (RSS above threshold).
