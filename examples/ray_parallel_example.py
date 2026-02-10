@@ -1,8 +1,16 @@
 """
-Example: Distributed parallel optimization using Ray.
+Example: Distributed parallel optimization using Ray ActorPool.
 
-Demonstrates how to use RayParallelOptimizer to run multiple independent
-optimization trajectories in parallel for both gradient descent and grid search.
+Demonstrates how to use RayParallelOptimizer with the ActorPool pattern to
+process many independent optimization tasks (e.g., 32) using a small fixed
+pool of reusable workers (e.g., 6). Each worker loads the heavy Scene once
+and reuses it for multiple tasks.
+
+Key concepts demonstrated:
+1. Decoupled task count: 32 tasks processed by 6 workers
+2. Actor reuse: Scene loaded once per worker, not once per task
+3. Pool reuse: Same pool shared between gradient descent and grid search
+4. Automatic queuing: ActorPool distributes work to idle workers
 
 The scene setup follows the same pattern as full_comparison.py and
 optimizer_factory_example.py, using setup_building_floor_scene() to properly
@@ -26,8 +34,9 @@ from reflector_position.optimizers.ray_parallel_optimizer import (
     RayParallelOptimizer,
     generate_random_initial_positions,
 )
+from reflector_position.optimizers.grid_search import generate_grid_positions
 
-# ── Configuration ─────────────────────────────────────────────────────────────
+# -- Configuration -------------------------------------------------------------
 
 # Scene path — same as full_comparison.py and optimizer_factory_example.py
 SCENE_PATH = Path.home() / "blender" / "models" / "building_floor" / "building_floor.xml"
@@ -50,15 +59,24 @@ POSITION_BOUNDS = {
 
 OUTPUT_DIR = "results/ray_parallel"
 
+# Pool configuration — fixed pool size, decoupled from task count
+NUM_POOL_WORKERS = 4        # Fixed pool size (actors loading Scene)
+GPU_FRACTION = 0.25         # 4 workers per GPU
 
-# ── Example 1: Parallel Gradient Descent ──────────────────────────────────────
+# Unified Min RSS scale (dBm) for all plots — enables visual comparison
+# between GD and GS results. Set to None for auto-scaling.
+RSS_RANGE_DBM = (-130.0, -90.0)  # (min_dbm, max_dbm)
 
-def example_parallel_gradient_descent():
+
+# -- Example 1: Parallel Gradient Descent (many tasks, small pool) -------------
+
+def example_parallel_gradient_descent(parallel_opt: RayParallelOptimizer):
     """
-    Run multiple gradient descent optimizations in parallel.
+    Run 16 gradient descent trajectories using a pool of 4 reusable workers.
 
-    Each worker starts from a different random position and optimizes
-    independently. The best result is selected at the end.
+    Each task starts from a different random position and optimizes
+    independently. The ActorPool automatically queues the 16 tasks across
+    4 workers (~4 tasks/worker). The Scene is loaded only 4 times total.
 
     This follows the same optimizer initialization pattern as
     optimizer_factory_example.py:
@@ -70,27 +88,28 @@ def example_parallel_gradient_descent():
         )
     """
     print("\n" + "=" * 80)
-    print("EXAMPLE 1: Parallel Gradient Descent")
+    print("EXAMPLE 1: Parallel Gradient Descent (ActorPool)")
     print("=" * 80)
 
-    NUM_WORKERS = 4
-    GPU_FRACTION = 0.25  # 4 workers per GPU
+    NUM_TASKS = 64  # Tasks >> pool workers -> queuing
 
-    # Generate diverse starting positions
+    # Generate diverse starting positions for all tasks
     initial_positions = generate_random_initial_positions(
-        num_positions=NUM_WORKERS,
+        num_positions=NUM_TASKS,
         bounds=POSITION_BOUNDS,
         fixed_z=3.8,
         seed=42,
     )
 
-    print(f"\nGenerated {NUM_WORKERS} initial positions:")
+    print(f"\nPool: {NUM_POOL_WORKERS} workers | Tasks: {NUM_TASKS}")
+    print(f"~{NUM_TASKS / NUM_POOL_WORKERS:.0f} tasks per worker (auto-queued)")
+    print(f"\nGenerated {NUM_TASKS} initial positions:")
     for i, pos in enumerate(initial_positions):
-        print(f"  Worker {i}: [{pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}]")
+        print(f"  Task {i:2d}: [{pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}]")
 
-    # Build per-worker optimizer kwargs
+    # Build per-task optimizer kwargs
     # These match the kwargs you'd pass to OptimizerFactory.create()
-    worker_optimizer_kwargs = [
+    work_items = [
         {
             "initial_position": (float(pos[0]), float(pos[1])),
             "position_bounds": POSITION_BOUNDS,
@@ -104,23 +123,18 @@ def example_parallel_gradient_descent():
     optimization_params = {
         "num_iterations": 10,
         "learning_rate": 0.5,
-        "samples_per_tx": 500_000,
+        "samples_per_tx": 1_000_000,
         "max_depth": 13,
         "use_soft_min": True,
         "temperature": 0.2,
         "verbose": False,
     }
 
-    # Create orchestrator and run
-    parallel_opt = RayParallelOptimizer(
-        num_workers=NUM_WORKERS,
-        gpu_fraction=GPU_FRACTION,
-    )
-
+    # Run all tasks through the pool
     results = parallel_opt.run(
         scene_config=SCENE_CONFIG,
         optimizer_method="gradient_descent",
-        worker_optimizer_kwargs=worker_optimizer_kwargs,
+        work_items=work_items,
         optimization_params=optimization_params,
         verbose=True,
     )
@@ -129,88 +143,86 @@ def example_parallel_gradient_descent():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     _save_results(results, os.path.join(OUTPUT_DIR, "gd_results.json"))
 
-    # Save plot
+    # Save overview plot
     parallel_opt.save_results_plot(
         results,
         save_path=os.path.join(OUTPUT_DIR, "gd_parallel_results.png"),
         metric_name="Min RSS",
+        position_bounds=POSITION_BOUNDS,
+        rss_range_dbm=RSS_RANGE_DBM,
+    )
+
+    # Save per-task trajectory plots for detailed analysis
+    trajectory_dir = os.path.join(OUTPUT_DIR, "gd_trajectories")
+    parallel_opt.save_task_trajectory_plots(
+        results,
+        save_dir=trajectory_dir,
+        filename_prefix="gd_task",
+        position_bounds=POSITION_BOUNDS,
+        rss_range_dbm=RSS_RANGE_DBM,
     )
 
     return results
 
 
-# ── Example 2: Parallel Grid Search ──────────────────────────────────────────
+# -- Example 2: Parallel Grid Search (true parallel, one point per task) -------
 
-def example_parallel_grid_search():
+def example_parallel_grid_search(parallel_opt: RayParallelOptimizer):
     """
-    Run grid search optimizations in parallel, each covering a different
-    spatial quadrant.
+    Run a true parallel grid search over the entire search space.
 
-    Each worker receives different search_bounds, splitting the full search
-    space into quadrants. This follows the same optimizer initialization
-    pattern as full_comparison.py:
-        GridSearchAPOptimizer(
-            scene=scene,
-            search_bounds={...},
-            grid_resolution=2.0,
-            fixed_z=3.8,
-        )
+    All grid points are generated upfront with the specified resolution,
+    and each point is submitted as an independent Ray task. The ActorPool
+    distributes single-point evaluations across workers in parallel.
+
+    This follows the pattern:
+        1. generate_grid_positions() -> list of [x, y, z] positions
+        2. Each position becomes a SinglePointGridSearchOptimizer task
+        3. ActorPool evaluates all points in parallel
+        4. Best position is selected from all evaluations
     """
     print("\n" + "=" * 80)
-    print("EXAMPLE 2: Parallel Grid Search (quadrant split)")
+    print("EXAMPLE 2: Parallel Grid Search (true parallel, one point per task)")
     print("=" * 80)
 
-    NUM_WORKERS = 4
-    GPU_FRACTION = 0.25
+    GRID_RESOLUTION = 1.0  # meters between grid points
 
-    # Divide the search space into 4 quadrants
-    x_mid = (POSITION_BOUNDS["x_min"] + POSITION_BOUNDS["x_max"]) / 2
-    y_mid = (POSITION_BOUNDS["y_min"] + POSITION_BOUNDS["y_max"]) / 2
+    # Generate ALL grid positions upfront
+    grid_positions = generate_grid_positions(
+        search_bounds=POSITION_BOUNDS,
+        grid_resolution=GRID_RESOLUTION,
+        fixed_z=3.8,
+    )
+    num_tasks = len(grid_positions)
 
-    quadrants = [
-        {"x_min": POSITION_BOUNDS["x_min"], "x_max": x_mid,
-         "y_min": POSITION_BOUNDS["y_min"], "y_max": y_mid},    # SW
-        {"x_min": x_mid,                    "x_max": POSITION_BOUNDS["x_max"],
-         "y_min": POSITION_BOUNDS["y_min"], "y_max": y_mid},    # SE
-        {"x_min": POSITION_BOUNDS["x_min"], "x_max": x_mid,
-         "y_min": y_mid,                    "y_max": POSITION_BOUNDS["y_max"]},  # NW
-        {"x_min": x_mid,                    "x_max": POSITION_BOUNDS["x_max"],
-         "y_min": y_mid,                    "y_max": POSITION_BOUNDS["y_max"]},  # NE
-    ]
+    print(f"\nGrid resolution: {GRID_RESOLUTION}m")
+    print(f"Search space: x=[{POSITION_BOUNDS['x_min']}, {POSITION_BOUNDS['x_max']}], "
+          f"y=[{POSITION_BOUNDS['y_min']}, {POSITION_BOUNDS['y_max']}]")
+    print(f"Generated {num_tasks} grid points")
+    print(f"Pool: {NUM_POOL_WORKERS} workers | Tasks: {num_tasks}")
+    print(f"~{num_tasks / NUM_POOL_WORKERS:.0f} tasks per worker (auto-queued)")
 
-    print(f"\nDividing space into {NUM_WORKERS} quadrants:")
-    for i, q in enumerate(quadrants):
-        print(f"  Worker {i}: x=[{q['x_min']:.1f}, {q['x_max']:.1f}], "
-              f"y=[{q['y_min']:.1f}, {q['y_max']:.1f}]")
-
-    # Build per-worker optimizer kwargs for grid search
-    # These match the kwargs you'd pass to OptimizerFactory.create()
-    worker_optimizer_kwargs = [
+    # Build per-task optimizer kwargs — each task evaluates ONE grid point
+    work_items = [
         {
-            "search_bounds": q,
-            "grid_resolution": 5.0,
+            "evaluation_position": (float(pos[0]), float(pos[1])),
             "fixed_z": 3.8,
         }
-        for q in quadrants
+        for pos in grid_positions
     ]
 
     # Optimization parameters — passed to optimizer.optimize()
     optimization_params = {
-        "samples_per_tx": 500_000,
+        "samples_per_tx": 1_000_000,
         "max_depth": 13,
         "verbose": False,
     }
 
-    # Create orchestrator and run
-    parallel_opt = RayParallelOptimizer(
-        num_workers=NUM_WORKERS,
-        gpu_fraction=GPU_FRACTION,
-    )
-
+    # Run — pool is reused from GD example (no Scene reload!)
     results = parallel_opt.run(
         scene_config=SCENE_CONFIG,
-        optimizer_method="grid_search",
-        worker_optimizer_kwargs=worker_optimizer_kwargs,
+        optimizer_method="grid_search_point",
+        work_items=work_items,
         optimization_params=optimization_params,
         verbose=True,
     )
@@ -224,24 +236,30 @@ def example_parallel_grid_search():
         results,
         save_path=os.path.join(OUTPUT_DIR, "gs_parallel_results.png"),
         metric_name="Min RSS",
+        position_bounds=POSITION_BOUNDS,
+        rss_range_dbm=RSS_RANGE_DBM,
     )
 
     return results
 
 
-# ── Utilities ─────────────────────────────────────────────────────────────────
+# -- Utilities -----------------------------------------------------------------
 
 def _save_results(results: dict, path: str) -> None:
     """Save results dict to JSON, converting numpy types."""
     serializable = {
-        "best_worker_id": results["best_worker_id"],
+        "best_task_id": results["best_task_id"],
         "total_time": results["total_time"],
         "aggregate_stats": results["aggregate_stats"],
+        "pool_info": results["pool_info"],
         "best_result": {
+            "task_id": results["best_result"]["task_id"],
             "worker_id": results["best_result"]["worker_id"],
             "best_position": results["best_result"]["best_position"],
             "best_metric": results["best_result"]["best_metric"],
             "best_metric_dbm": results["best_result"]["best_metric_dbm"],
+            "best_iteration": results["best_result"].get("best_iteration", -1),
+            "final_position": results["best_result"].get("final_position"),
             "time_elapsed": results["best_result"]["time_elapsed"],
         },
         "all_metrics_dbm": [r["best_metric_dbm"] for r in results["all_results"]],
@@ -252,31 +270,47 @@ def _save_results(results: dict, path: str) -> None:
     print(f"Results saved to: {path}")
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# -- Main ----------------------------------------------------------------------
 
 if __name__ == "__main__":
     # Initialize Ray once (all examples share the same cluster)
     ray.init(ignore_reinit_error=True)
 
+    # Create a single orchestrator with a fixed pool size.
+    # The pool is shared across both GD and GS examples — workers persist
+    # and the Scene is loaded only once per worker (not once per task).
+    parallel_opt = RayParallelOptimizer(
+        num_workers=NUM_POOL_WORKERS,
+        gpu_fraction=GPU_FRACTION,
+    )
+
     try:
-        # Example 1: Parallel gradient descent
-        gd_results = example_parallel_gradient_descent()
+        # Example 1: 16 GD trajectories -> 4-worker pool
+        gd_results = example_parallel_gradient_descent(parallel_opt)
 
-        # Example 2: Parallel grid search
-        gs_results = example_parallel_grid_search()
+        # Example 2: parallel grid search -> same 4-worker pool (reused!)
+        gs_results = example_parallel_grid_search(parallel_opt)
 
-        # ── Summary ───────────────────────────────────────────────────
+        # -- Summary -----------------------------------------------------------
         print("\n" + "=" * 80)
         print("OVERALL SUMMARY")
         print("=" * 80)
-        print(f"\nGradient Descent (parallel):")
+        print(f"\nPool: {NUM_POOL_WORKERS} workers (Scene loaded once per worker)")
+        print(f"\nGradient Descent ({len(gd_results['all_results'])} tasks):")
+        print(f"  Best task:     #{gd_results['best_task_id']}")
+        print(f"  Best iteration: {gd_results['best_result'].get('best_iteration', -1) + 1}")
         print(f"  Best position: {gd_results['best_result']['best_position']}")
         print(f"  Best Min RSS:  {gd_results['best_result']['best_metric_dbm']:.2f} dBm")
         print(f"  Wall-clock:    {gd_results['total_time']:.2f}s")
-        print(f"\nGrid Search (parallel):")
+        print(f"  Speedup:       {gd_results['aggregate_stats']['speedup']:.2f}x")
+        print(f"\nGrid Search ({len(gs_results['all_results'])} grid points):")
+        print(f"  Best task:     #{gs_results['best_task_id']}")
         print(f"  Best position: {gs_results['best_result']['best_position']}")
         print(f"  Best Min RSS:  {gs_results['best_result']['best_metric_dbm']:.2f} dBm")
         print(f"  Wall-clock:    {gs_results['total_time']:.2f}s")
+        print(f"  Speedup:       {gs_results['aggregate_stats']['speedup']:.2f}x")
 
     finally:
+        # Explicitly kill pool actors and shutdown Ray
+        parallel_opt.shutdown()
         ray.shutdown()
