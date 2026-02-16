@@ -4,110 +4,76 @@
 
 This document outlines planned enhancements based on the optimization framework analysis.
 
-## Parallel Batch Optimization (Priority: HIGH)
+## Parallel Batch Optimization ✅ COMPLETE
 
-### Current Implementation
-- Single AP position optimization per run
-- Sequential optimization (one configuration at a time)
+### Implementation
+- Ray ActorPool with persistent `OptimizationWorker` actors
+- Multi-start gradient descent (64 tasks → 4 workers)
+- True parallel grid search (441 single-point tasks)
+- Ordered `pool.map` (synchronous, freeze-safe)
+- Configurable GPU fraction per worker (0.25 = 4 workers/GPU)
 
-### Planned Enhancement
-Implement **Batch-Parallelized Multi-Start Gradient Descent** with parallel worlds:
+### Architecture
 
 ```python
-# Target Implementation
-batch_size = 32  # 32 parallel optimization worlds
+# Actual Implementation (ray_parallel_optimizer.py)
+import ray
+from ray.util import ActorPool
 
-# Tensor shapes for vectorized operations
-ap_positions = tf.Variable(
-    shape=[32, 2, 3],  # [batch, num_APs, xyz]
-    initial_value=random_init()
-)
+@ray.remote(num_gpus=gpu_fraction)
+class OptimizationWorker:
+    def __init__(self, scene_config):
+        self.scene = setup_building_floor_scene(**scene_config)
 
-ris_positions = tf.Variable(
-    shape=[32, 1, 1],  # [batch, num_RIS, wall_param]
-    initial_value=random_init()
-)
+    def evaluate(self, task_config):
+        optimizer = create_optimizer(self.scene, task_config)
+        return optimizer.optimize()
 
-# Each world explores independently
-for iteration in range(max_iter):
-    # Parallel physics computation for all 32 worlds
-    losses = parallel_ray_trace(ap_positions, ris_positions)  # [32,]
-    
-    # Parallel gradient computation
-    gradients = tape.gradient(losses, [ap_positions, ris_positions])
-    
-    # Parallel updates (no communication between worlds)
-    optimizer.apply_gradients(zip(gradients, variables))
-
-# Winner selection
-best_idx = tf.argmin(losses)
-best_config = ap_positions[best_idx]
+# ActorPool with persistent workers
+pool = ActorPool([OptimizationWorker.remote(cfg) for _ in range(num_workers)])
+results = list(pool.map(lambda w, t: w.evaluate.remote(t), tasks))
 ```
 
-### Benefits
-- **Robust Exploration**: 32 independent searches avoid local minima
-- **GPU Efficiency**: Sionna RT handles batch processing natively
-- **No Communication Overhead**: Worlds don't share information (unlike PSO)
-- **Guaranteed Diversity**: Different random seeds ensure varied exploration
-
-### Implementation Checklist
-- [ ] Vectorize scene initialization for batched inputs
-- [ ] Modify RadioMapSolver to accept batched positions
-- [ ] Implement parallel loss computation
-- [ ] Add winner selection logic
-- [ ] Benchmark against single-instance optimization
+### Results
+- **Near-linear speedup** with number of workers on GPU
+- **Scene loaded once** per worker (not per task)
+- **Three methods supported**: GD, GS, GA
 
 ---
 
 ## Baseline Method Implementations
 
-### 1. Genetic Algorithm (GA) - **Next Priority**
+### 1. Genetic Algorithm (GA) ✅ COMPLETE
 
-**Timeline**: Phase 2 (2-3 weeks)
+**Status**: Implemented using DEAP library with Ray-parallel fitness evaluation.
 
-#### Implementation Plan
+#### Implementation Summary
+- **Library**: DEAP 1.4.1+ (not PyGAD)
+- **Architecture**: IoC pattern — `GeneticAlgorithmRunner` (pure DEAP, no Ray) + `RayActorPoolExecutor` (generic Ray engine)
+- **Population**: 50–100 individuals encoding (x, y) AP positions
+- **Operators**: Blend crossover (`cxBlend`), Gaussian mutation, tournament selection
+- **Fitness**: Maximises minimum RSS (linear Watts) via `SinglePointGridSearchOptimizer`
+- **Evaluation**: Ray ActorPool with `pool.map` (ordered, synchronous)
+
+**Full Details**: See [GA_DEAP_IMPLEMENTATION.md](GA_DEAP_IMPLEMENTATION.md)
+
+**Entry Point**: `examples/run_ga_modular.py`
+
 ```python
-# Using PyGAD library
-import pygad
+from reflector_position.optimizers import RayActorPoolExecutor, GeneticAlgorithmRunner
 
-class GeneticAlgorithmOptimizer:
-    def __init__(self, scene_config, population_size=50, num_generations=100):
-        self.scene_config = scene_config
-        self.pop_size = population_size
-        self.generations = num_generations
-        
-    def fitness_function(self, ga_instance, solution, solution_idx):
-        # Decode solution to AP positions
-        ap_pos = solution.reshape(self.scene_config.num_aps, 3)
-        
-        # Compute coverage using Sionna
-        coverage = self.evaluate_coverage(ap_pos)
-        
-        # GA maximizes, so negate loss
-        return -coverage
-    
-    def optimize(self):
-        ga_instance = pygad.GA(
-            num_generations=self.generations,
-            num_parents_mating=self.pop_size // 2,
-            fitness_func=self.fitness_function,
-            sol_per_pop=self.pop_size,
-            num_genes=self.scene_config.num_aps * 3,
-            gene_space=self.get_position_bounds(),
-            parent_selection_type="tournament",
-            crossover_type="uniform",
-            mutation_type="adaptive",
-            mutation_percent_genes=10
-        )
-        
-        ga_instance.run()
-        return ga_instance.best_solution()
+executor = RayActorPoolExecutor(scene_config={...}, num_workers=4, gpu_fraction=0.25)
+ga = GeneticAlgorithmRunner(
+    position_bounds={"x_min": 5, "x_max": 25, "y_min": 5, "y_max": 25},
+    fixed_z=3.8,
+    executor_map=executor.map,
+)
+results = ga.run(
+    optimization_params={"samples_per_tx": 1_000_000, "max_depth": 13},
+    ga_params={"pop_size": 50, "n_gen": 20},
+    seed=42,
+)
 ```
-
-**Key Metrics to Report**:
-- Total ray tracing calls: `population_size × generations`
-- Convergence rate (generations to 95% optimal)
-- Final coverage vs DRT
 
 ---
 
@@ -354,12 +320,12 @@ class RLOptimizer:
 | Phase | Features | Duration | Status |
 |-------|----------|----------|--------|
 | **Phase 1** | Basic gradient descent, grid search | Completed | ✅ |
-| **Phase 2** | Genetic Algorithm baseline | 2-3 weeks | 📋 Planned |
-| **Phase 3** | PSO baseline + parallel batching | 2-3 weeks | 📋 Planned |
+| **Phase 2** | Ray parallel + DEAP genetic algorithm | Completed | ✅ |
+| **Phase 3** | PSO baseline + testing | 2-3 weeks | 📋 Planned |
 | **Phase 4** | Joint optimization (AP + RIS) | 3-4 weeks | 📋 Planned |
 | **Phase 5** | Multi-floor + constraints | 2 weeks | 📋 Planned |
 | **Phase 6** | Performance optimizations | 2 weeks | 📋 Planned |
-| **Research** | RL baselines, meta-learning | Ongoing | 💡 Future |
+| **Research** | RL baselines, meta-learning, hybrid GA+GD | Ongoing | 💡 Future |
 
 ---
 

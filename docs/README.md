@@ -26,6 +26,7 @@ In-depth explanations of optimization approaches and research methodology:
 - **[RAY_ARCHITECTURE.md](methodology/RAY_ARCHITECTURE.md)** - Why Ray is needed for reflector optimization (vs vectorization)
 - **[RAY_PARALLEL_GUIDE.md](methodology/RAY_PARALLEL_GUIDE.md)** - Complete guide to using Ray for parallel optimization with examples
 - **[RAY_IMPLEMENTATION_SUMMARY.md](methodology/RAY_IMPLEMENTATION_SUMMARY.md)** - Implementation summary and usage patterns
+- **[GA_DEAP_IMPLEMENTATION.md](methodology/GA_DEAP_IMPLEMENTATION.md)** - Genetic Algorithm (DEAP) with Ray-parallel fitness evaluation and IoC architecture
 - **[BASELINES.md](methodology/BASELINES.md)** - Baseline comparison methods (GA, PSO, AO) for benchmarking
 - **[FUTURE_ROADMAP.md](methodology/FUTURE_ROADMAP.md)** - Planned features and research extensions
 
@@ -47,6 +48,7 @@ Comprehensive testing documentation and guides:
 - **Install the package** → [guides/INSTALL.md](guides/INSTALL.md)
 - **Run an optimization** → [guides/USAGE.md](guides/USAGE.md)
 - **Use parallel optimization (Ray)** → [methodology/RAY_PARALLEL_GUIDE.md](methodology/RAY_PARALLEL_GUIDE.md)
+- **Run genetic algorithm (DEAP)** → [methodology/GA_DEAP_IMPLEMENTATION.md](methodology/GA_DEAP_IMPLEMENTATION.md)
 - **Test the code** → [tests/README.md](tests/README.md)
 - **Understand the code structure** → [architecture/PROJECT_STRUCTURE.md](architecture/PROJECT_STRUCTURE.md)
 - **Learn about the optimization algorithm** → [methodology/OPTIMIZATION_WORKFLOW.md](methodology/OPTIMIZATION_WORKFLOW.md)
@@ -59,8 +61,9 @@ If you're using this framework for research:
 
 1. **Start with**: [OPTIMIZATION_WORKFLOW.md](methodology/OPTIMIZATION_WORKFLOW.md) to understand the Ray-based distributed optimization approach
 2. **Learn Ray usage**: [RAY_PARALLEL_GUIDE.md](methodology/RAY_PARALLEL_GUIDE.md) for practical implementation
-3. **Compare methods**: [BASELINES.md](methodology/BASELINES.md) for recommended comparison methods
-4. **Future work**: [FUTURE_ROADMAP.md](methodology/FUTURE_ROADMAP.md) for advanced features
+3. **Run GA baseline**: [GA_DEAP_IMPLEMENTATION.md](methodology/GA_DEAP_IMPLEMENTATION.md) for DEAP genetic algorithm with Ray-parallel evaluation
+4. **Compare methods**: [BASELINES.md](methodology/BASELINES.md) for recommended comparison methods
+5. **Future work**: [FUTURE_ROADMAP.md](methodology/FUTURE_ROADMAP.md) for advanced features
 
 ## 🛠️ For Developers
 
@@ -100,6 +103,8 @@ See [STATUS.md](../STATUS.md) in the repository root for:
 See the [examples/](../examples/) directory for:
 - `quick_test.py` - Fast gradient descent test
 - `full_comparison.py` - Compare grid search vs gradient descent
+- `ray_parallel_example.py` - Ray-parallel gradient descent (64 tasks) and grid search (441 points) via ActorPool
+- `run_ga_modular.py` - **Modular GA** — DEAP genetic algorithm with Ray-parallel fitness evaluation (IoC pattern)
 - `config_example.py` - Configuration template
 
 ## Need Help?

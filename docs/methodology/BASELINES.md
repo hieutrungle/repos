@@ -10,9 +10,11 @@ Grid Search alone is insufficient as a baseline because it is widely considered 
 
 ## Recommended Baselines
 
-### 1. Genetic Algorithm (GA) - **Gold Standard Baseline**
+### 1. Genetic Algorithm (GA) - **Gold Standard Baseline** ✅ IMPLEMENTED
 
-**Priority**: **CRITICAL** - This is the most important baseline to include.
+**Priority**: **COMPLETE** — Implemented using DEAP library with Ray-parallel fitness evaluation.
+
+**Full Implementation Details**: See [GA_DEAP_IMPLEMENTATION.md](GA_DEAP_IMPLEMENTATION.md)
 
 #### Why Use GA?
 - **Industry Standard**: In 2024-2025 literature, GA is the default "heuristic" benchmark for placement problems (RIS, UAV, Base Station)
@@ -34,23 +36,30 @@ Grid Search alone is insufficient as a baseline because it is widely considered 
 #### Key Argument
 > "While GA eventually finds good solutions, it requires thousands of forward-pass simulations (Population × Generations). Our DRT method converges in ~100 steps with gradient guidance."
 
-#### Python Implementation
-Use `PyGAD` library or `DEAP` framework:
+#### Python Implementation ✅
+Using `DEAP` framework (implemented in `src/reflector_position/optimizers/deap_logic.py`):
 ```python
-import pygad
+from reflector_position.optimizers import RayActorPoolExecutor, GeneticAlgorithmRunner
+import ray
 
-def fitness_function(solution, solution_idx):
-    # Wrap your Sionna compute_loss() function
-    return -coverage_loss(solution)  # GA maximizes fitness
+ray.init()
+executor = RayActorPoolExecutor(scene_config={...}, num_workers=4, gpu_fraction=0.25)
 
-ga_instance = pygad.GA(
-    num_generations=100,
-    num_parents_mating=20,
-    fitness_func=fitness_function,
-    sol_per_pop=50,
-    num_genes=6,  # 2 APs × 3 coordinates
-    gene_space={'low': 0, 'high': 10}
+ga = GeneticAlgorithmRunner(
+    position_bounds={"x_min": 5, "x_max": 25, "y_min": 5, "y_max": 25},
+    fixed_z=3.8,
+    executor_map=executor.map,  # Dependency Injection
 )
+
+results = ga.run(
+    optimization_params={"samples_per_tx": 1_000_000, "max_depth": 13},
+    ga_params={"pop_size": 50, "n_gen": 20},
+    seed=42,
+)
+
+print(f"Best: {results['best_position']}  RSS: {results['best_fitness_dbm']:.2f} dBm")
+executor.shutdown()
+ray.shutdown()
 ```
 
 ---
@@ -177,9 +186,9 @@ Compare baselines on:
 
 ## Implementation Priority
 
-**Phase 1** (Current): Grid Search baseline ✓  
-**Phase 2** (Next): Genetic Algorithm implementation  
-**Phase 3** (Optional): PSO for stronger comparison  
+**Phase 1** (Complete): Grid Search baseline ✅  
+**Phase 2** (Complete): Genetic Algorithm (DEAP) with Ray-parallel evaluation ✅  
+**Phase 3** (Next): PSO for stronger comparison  
 **Phase 4** (Future): Alternating Optimization for joint optimization claims
 
 ## References

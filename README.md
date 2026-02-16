@@ -8,8 +8,11 @@ Physics-aware optimal placement for mechanical reflectors in NLOS (Non-Line-of-S
 
 - **Grid Search Optimization**: Exhaustive search over spatial grid for baseline performance
 - **Gradient Descent Optimization**: Fast gradient-based optimization using differentiable ray tracing
+- **Genetic Algorithm (DEAP)**: Evolutionary optimization with population-based search using the DEAP library
+- **Ray-Parallel Execution**: Distributed evaluation via Ray ActorPool — all three methods run in parallel across persistent GPU workers
+- **Inversion of Control (IoC) Architecture**: Clean separation of algorithm logic (DEAP) from execution engine (Ray) via dependency injection
 - **Metrics**: Minimum RSS, coverage area, and soft minimum for smooth optimization
-- **Visualizations**: Heatmaps, convergence plots, and trajectory visualization
+- **Visualizations**: Heatmaps, convergence plots, trajectory visualization, and GA evolution plots
 - **CLI Tool**: Command-line interface for easy experimentation
 
 ## Installation
@@ -173,12 +176,16 @@ See the `examples/` directory for complete examples:
 
 - `examples/quick_test.py`: Fast gradient descent test with reduced parameters
 - `examples/full_comparison.py`: Compare grid search vs gradient descent
+- `examples/ray_parallel_example.py`: Ray-parallel gradient descent (64 tasks) and grid search (441 points) via ActorPool
+- `examples/run_ga_modular.py`: **Modular GA** — DEAP genetic algorithm with Ray-parallel fitness evaluation (IoC pattern)
 
 Run examples:
 
 ```bash
 python examples/quick_test.py
 python examples/full_comparison.py
+python examples/ray_parallel_example.py
+python examples/run_ga_modular.py
 ```
 
 ## Project Structure
@@ -186,19 +193,30 @@ python examples/full_comparison.py
 ```
 reflector-position/
 ├── src/reflector_position/
-│   ├── __init__.py          # Package initialization
-│   ├── cli.py               # Command-line interface
-│   ├── config.py            # Configuration dataclasses
-│   ├── metrics.py           # RSS metrics and utilities
-│   ├── scene_setup.py       # Scene configuration
-│   ├── utils.py             # Helper functions
+│   ├── __init__.py              # Package initialization
+│   ├── cli.py                   # Command-line interface
+│   ├── config.py                # Configuration dataclasses
+│   ├── metrics.py               # RSS metrics and utilities
+│   ├── scene_setup.py           # Scene configuration
+│   ├── utils.py                 # Helper functions
 │   └── optimizers/
 │       ├── __init__.py
-│       ├── grid_search.py   # Grid search optimizer
-│       └── gradient_descent.py  # Gradient descent optimizer
-├── examples/                # Example scripts
-├── pyproject.toml          # Package configuration
-└── README.md               # This file
+│       ├── base_optimizer.py        # Abstract base class
+│       ├── gradient_descent.py      # Gradient descent (differentiable RT)
+│       ├── grid_search.py           # Grid search + SinglePointGridSearch
+│       ├── optimizer_factory.py     # Factory pattern for optimizer creation
+│       ├── ray_parallel_optimizer.py # ActorPool orchestrator + OptimizationWorker
+│       ├── ray_evaluator.py         # Generic Ray execution engine (IoC)
+│       ├── deap_logic.py            # Pure DEAP GA logic (no Ray imports)
+│       └── ray_deap_optimizer.py    # Monolithic DEAP+Ray (legacy)
+├── examples/
+│   ├── ray_parallel_example.py  # Parallel GD + GS via ActorPool
+│   ├── run_ga_modular.py        # Modular GA entry point (IoC)
+│   └── ...                      # Other examples
+├── docs/                        # Comprehensive documentation
+├── tests/                       # pytest test suite (62 tests)
+├── pyproject.toml               # Package configuration
+└── README.md                    # This file
 ```
 
 ## Methodology
@@ -224,57 +242,72 @@ Uses differentiable ray tracing to optimize via gradients:
 - PyTorch + DrJit integration via `@dr.wrap` decorator
 - 50-100× faster than grid search
 
-### Advanced Workflow: Ray-Based Distributed Optimization ✅
+#### Genetic Algorithm (DEAP Library) ✅
 
-The framework includes **Ray-Based Distributed Multi-Start Gradient Descent** for robust exploration of non-convex optimization landscapes when optimizing physical reflector positions:
+Evolutionary optimisation using the DEAP framework:
+- **Population-based search**: 50-100 individuals encoding (x, y) AP positions
+- **Operators**: Blend crossover (`cxBlend`), Gaussian mutation, tournament selection
+- **Maximises minimum RSS** (linear Watts) as fitness
+- **Ray-parallel evaluation**: each individual evaluated via `SinglePointGridSearchOptimizer` on Ray ActorPool
+- **Modular IoC architecture**: algorithm logic (no Ray imports) separated from execution engine
+
+### Ray-Based Distributed Optimization ✅
+
+All three methods (GD, GS, GA) run on a shared **Ray ActorPool** infrastructure:
 
 ```
-[N Independent Ray Actors] → [Isolated Scene Instances] → [Parallel Optimization]
-                                        ↓
-                               [Independent Gradients]
-                                        ↓
-                               [Winner Selection]
+┌─────────────────────────────────────────────────────────┐
+│              Driver (Algorithm Logic)                    │
+│  Gradient Descent / Grid Search / DEAP GA               │
+│         │                                               │
+│         │  toolbox.map(evaluate, population)             │
+│         ▼                                               │
+│  ┌─────────────────────────────┐                        │
+│  │  RayActorPoolExecutor.map() │  ← Dependency Injection│
+│  │  (pool.map — ordered, sync) │                        │
+│  └──────────┬──────────────────┘                        │
+│             │                                           │
+│    ┌────────┼────────┬────────┐                         │
+│    ▼        ▼        ▼        ▼                         │
+│  Worker0  Worker1  Worker2  Worker3                     │
+│  (Scene)  (Scene)  (Scene)  (Scene)                     │
+│  GPU 0.25 GPU 0.25 GPU 0.25 GPU 0.25                   │
+└─────────────────────────────────────────────────────────┘
 ```
-
-**Status**: ✅ Implementation Complete, ⏳ Testing In Progress
 
 **Key Features:**
-- **N Independent Processes**: Each Ray Actor runs in its own Python process with isolated memory
-- **Unique Scene Geometry**: Each actor has its own Scene copy with different reflector positions
-- **Process-Level Isolation**: True independence - actors cannot interfere with each other
-- **Robust Exploration**: Avoids local minima through complete isolation and diversity
-- **Winner Selection**: Choose the best configuration from N independent attempts
-- **GPU Efficiency**: Configurable GPU fraction per worker (e.g., 0.25 = 4 workers per GPU)
+- **ActorPool pattern**: Fixed pool of persistent workers; Scene loaded once per worker
+- **Ordered synchronous map** (`pool.map`): prevents freeze issues from `map_unordered`
+- **GPU efficiency**: Configurable fraction per worker (0.25 = 4 workers/GPU)
+- **IoC pattern**: Algorithm logic knows nothing about Ray; uses injected `map` function
+- **Three optimisation methods**: GD (multi-start), GS (true parallel), GA (DEAP evolutionary)
 
-**Why Ray Instead of Vectorization?**
-- **Vectorization**: Suitable for parameter optimization (Tx/Rx positions, phase shifts) within a single scene
-- **Ray**: Required when each optimization trajectory needs **different physical geometry** (reflector positions, obstacles)
-
-Since reflectors are physical objects that change the scene geometry, each optimization instance needs its own independent Scene copy. Ray provides this process-level isolation that vectorization cannot.
-
-**Quick Example:**
+**Quick Example — Modular GA:**
 ```python
 import ray
-from reflector_position.optimizers import RayParallelOptimizer, generate_random_initial_positions
+from reflector_position.optimizers import RayActorPoolExecutor, GeneticAlgorithmRunner
 
 ray.init()
-parallel_opt = RayParallelOptimizer(num_workers=8, gpu_fraction=0.25)
-initial_positions = generate_random_initial_positions(
-    8, bounds={"x_min": 0, "x_max": 40, "y_min": 0, "y_max": 40}
+executor = RayActorPoolExecutor(scene_config={...}, num_workers=4, gpu_fraction=0.25)
+
+ga = GeneticAlgorithmRunner(
+    position_bounds={"x_min": 5, "x_max": 25, "y_min": 5, "y_max": 25},
+    fixed_z=3.8,
+    executor_map=executor.map,  # Dependency Injection
 )
 
-results = parallel_opt.optimize(
-    scene_config={"xml_path": "scene.xml"},
-    initial_positions=initial_positions,
-    optimization_params={"num_iterations": 50, "learning_rate": 0.5}
+results = ga.run(
+    optimization_params={"samples_per_tx": 1_000_000, "max_depth": 13},
+    ga_params={"pop_size": 50, "n_gen": 20},
+    seed=42,
 )
 
-print(f"Best position: {results['best_result']['best_position']}")
-print(f"Best RSS: {results['best_result']['best_metric']:.2f} dBm")
+print(f"Best: {results['best_position']}  RSS: {results['best_fitness_dbm']:.2f} dBm")
+executor.shutdown()
 ```
 
 **For complete details**, see:
-- [RAY_PARALLEL_GUIDE.md](docs/methodology/RAY_PARALLEL_GUIDE.md) - Complete guide with examples (800+ lines)
+- [RAY_PARALLEL_GUIDE.md](docs/methodology/RAY_PARALLEL_GUIDE.md) - Complete guide with examples
 - [RAY_ARCHITECTURE.md](docs/methodology/RAY_ARCHITECTURE.md) - Why Ray vs vectorization
 - [OPTIMIZATION_WORKFLOW.md](docs/methodology/OPTIMIZATION_WORKFLOW.md) - Complete architecture
 - [RAY_IMPLEMENTATION_SUMMARY.md](docs/methodology/RAY_IMPLEMENTATION_SUMMARY.md) - Implementation status
@@ -295,12 +328,13 @@ Typical performance on building floor scenario:
 |--------|-------------|------|------------------|
 | Grid Search (2m grid) | ~100-200 | ~30-60 min | Baseline |
 | Gradient Descent | 10-20 | ~20-40 min | Within 1 dB |
-| Ray Parallel (8 workers) | 80-160 | ~5-8 min | Best of 8 starts |
-| Ray Parallel (32 workers) | 320-640 | ~10-20 min | Best of 32 starts |
+| Ray Parallel GD (4 workers, 64 tasks) | 640 | ~10-20 min | Best of 64 starts |
+| Ray Parallel GS (4 workers, 441 pts) | 441 | ~5-15 min | Exhaustive |
+| DEAP GA (pop=50, 20 gen, 4 workers) | ~700-1000 | ~15-30 min | Population-optimal |
 
-Gradient descent achieves similar quality with significantly fewer evaluations. Ray-based parallel optimization provides additional robustness by exploring multiple starting points simultaneously, with near-linear speedup based on available GPU resources.
+Gradient descent achieves similar quality with significantly fewer evaluations. The DEAP GA explores the search space more broadly via an evolving population, complementing gradient-based methods. All three methods leverage the same Ray ActorPool for parallel evaluation with near-linear speedup.
 
-**Testing Status**: Core optimizers validated with 62 unit and integration tests (82-92% coverage). Ray parallel implementation complete but testing in progress.
+**Testing Status**: Core optimizers validated with 62 unit and integration tests (82-92% coverage). Ray parallel and GA implementations complete.
 
 ## Development
 
@@ -337,14 +371,15 @@ pytest
 - ✅ **Optimizer Factory**: Factory pattern for creating optimizers
 - ✅ **Base Optimizer ABC**: Abstract base class enforcing optimizer interface
 
-### Ray-Based Parallel Optimization (Implemented, Testing In Progress)
-- ✅ **RayParallelOptimizer**: Orchestrator for distributed multi-start optimization
-- ✅ **OptimizationWorker**: Ray actor for isolated optimization instances
-- ✅ **Process-Level Isolation**: Each worker has independent Scene copy
-- ✅ **GPU Management**: Configurable GPU fraction per worker
-- ✅ **Helper Functions**: Random position generation, result aggregation
-- ✅ **Comprehensive Documentation**: 800+ line guide with examples
-- ⏳ **Testing**: Unit and integration tests pending
+### Ray-Based Parallel Optimization ✅
+- ✅ **RayParallelOptimizer**: ActorPool orchestrator for distributed multi-start GD and parallel GS
+- ✅ **OptimizationWorker**: Persistent Ray actor with reusable Scene instance
+- ✅ **RayActorPoolExecutor**: Generic execution engine with ordered `pool.map` (IoC pattern)
+- ✅ **GeneticAlgorithmRunner**: Pure DEAP GA logic — no Ray imports, uses injected `map`
+- ✅ **SinglePointGridSearchOptimizer**: Evaluates single (x, y) position for GA fitness
+- ✅ **GPU Management**: Configurable GPU fraction per worker (0.25 = 4 workers/GPU)
+- ✅ **Freeze-safe**: Uses `pool.map` (ordered, synchronous) instead of `map_unordered`
+- ✅ **Comprehensive Documentation**: Detailed guides with examples
 
 ### Testing & Quality Assurance ✅
 - ✅ **Unit Tests**: 62 tests across 4 test files
@@ -481,28 +516,29 @@ pytest
 
 **Status**: ✅ Complete (January 2026)
 
-### Phase 2: Ray-Based Parallel Optimization 🚧 IN PROGRESS
-- Ray distributed architecture
-- Multi-start gradient descent
-- Process-level isolation for scene geometry
-- GPU memory management
-- Comprehensive documentation (800+ lines)
+### Phase 2: Ray-Based Parallel Optimization ✅ COMPLETE
+- Ray distributed architecture (ActorPool pattern)
+- Multi-start gradient descent (64 tasks → 4 workers)
+- True parallel grid search (441 single-point tasks)
+- DEAP genetic algorithm with Ray-parallel fitness evaluation
+- Inversion of Control (IoC) architecture: `deap_logic.py` + `ray_evaluator.py`
+- Ordered `pool.map` replacing `map_unordered` (prevents freezes)
+- GPU memory management with configurable fraction
+- Comprehensive documentation
 
-**Status**: 🚧 Implementation Complete, Testing In Progress  
-**Completed**: January 31, 2026  
-**Target for Testing**: February 2026
+**Status**: ✅ Complete (February 2026)
 
 ### Phase 3: Testing & Validation (Q1 2026) 🚧 ONGOING
 - [x] Core optimizer unit tests (62 tests) ✅
 - [x] Integration tests ✅
 - [x] Test documentation ✅
-- [ ] Ray parallel tests ⏳
+- [ ] Ray parallel tests
+- [ ] GA / DEAP tests
 - [ ] CLI tests
 - [ ] CI/CD pipeline
 - [ ] Performance benchmarks
-- [ ] Real-world validation
 
-**Status**: 🚧 Core Tests Complete, Ray Tests Pending  
+**Status**: 🚧 Core Tests Complete, Ray + GA Tests Pending  
 **Started**: January 2026  
 **Target**: February 2026
 
@@ -512,6 +548,7 @@ pytest
 - Multi-AP optimization
 - Adaptive learning rate
 - Coarse-to-fine Ray-based search
+- Hybrid GA+GD (seed GD from GA best solutions)
 
 **Status**: 📋 Planned  
 **Target**: March-April 2026

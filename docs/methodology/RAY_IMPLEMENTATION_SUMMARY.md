@@ -1,11 +1,13 @@
 # Ray Parallel Optimizer - Implementation Summary
 
-**Date**: January 31, 2026  
-**Status**: ✅ Complete
+**Date**: February 10, 2026  
+**Status**: ✅ Complete (GD + GS + GA)
 
 ## Overview
 
 Successfully implemented a comprehensive Ray-based distributed parallel optimization framework that enables running multiple independent optimization trajectories simultaneously. This architecture is specifically designed for optimizing physical scene geometry (reflector positions) where process-level isolation is required.
+
+The framework now supports **three optimization methods** — Gradient Descent, Grid Search, and Genetic Algorithm (DEAP) — all sharing the same Ray ActorPool infrastructure with an Inversion of Control (IoC) architecture.
 
 ## What Was Built
 
@@ -48,16 +50,54 @@ Successfully implemented a comprehensive Ray-based distributed parallel optimiza
 - Detailed workflow diagrams
 - Memory and resource management
 
+### 3. Genetic Algorithm (DEAP) — IoC Architecture ✅
+
+#### `RayActorPoolExecutor` Class
+**File**: `src/reflector_position/optimizers/ray_evaluator.py`
+
+- **Purpose**: Generic Ray execution engine providing an ordered `map` function
+- **Architecture**: ActorPool with persistent `OptimizationWorker` actors
+- **Features**:
+  - Workers load Scene once and reuse across evaluations
+  - Ordered `pool.map` prevents freeze issues from `map_unordered`
+  - Configurable GPU fraction per worker (0.25 = 4 workers/GPU)
+  - Clean `shutdown()` for resource cleanup
+
+#### `GeneticAlgorithmRunner` Class
+**File**: `src/reflector_position/optimizers/deap_logic.py`
+
+- **Purpose**: Pure DEAP GA logic — **no Ray imports**
+- **Dependency Injection**: Receives `executor_map` callable for fitness evaluation
+- **Features**:
+  - Population of (x, y) individuals with configurable bounds
+  - Blend crossover (`cxBlend`), Gaussian mutation, tournament selection
+  - Maximises minimum RSS (linear Watts) as fitness
+  - Hall of Fame, statistics logging, evolution plots
+  - `SinglePointGridSearchOptimizer` used internally for each fitness evaluation
+
+#### Modular Entry Point
+**File**: `examples/run_ga_modular.py`
+
+- Wires `RayActorPoolExecutor` + `GeneticAlgorithmRunner` together
+- Demonstrates IoC pattern: algorithm knows nothing about Ray
+- Includes convergence plots, trajectory visualization, and Hall of Fame display
+
 ### 3. Examples
 
 #### Demonstration Scripts
 **File**: `examples/ray_parallel_example.py`
 
-Four comprehensive examples:
-1. **Basic Parallel Optimization**: 8 workers with different starting positions
-2. **Parallel Grid Search**: Divide space into quadrants
-3. **Hyperparameter Search**: Test different learning rates in parallel
-4. **Production Workflow**: Complete pipeline with checkpointing and result persistence
+Three comprehensive examples:
+1. **Parallel Gradient Descent**: 64 multi-start optimization tasks via ActorPool
+2. **Parallel Grid Search**: 441 single-point evaluations distributed across workers
+3. **DEAP Genetic Algorithm**: Population-based evolutionary optimization with Ray-parallel fitness
+
+**File**: `examples/run_ga_modular.py`
+
+Modular GA entry point demonstrating the IoC pattern:
+- `RayActorPoolExecutor` provides the execution engine
+- `GeneticAlgorithmRunner` drives the DEAP logic
+- No Ray imports in the algorithm layer
 
 ### 4. Integration
 
@@ -222,17 +262,20 @@ def test_end_to_end_parallel_optimization():
 
 1. **Testing**: Create comprehensive test suite
    - Unit tests for RayParallelOptimizer
+   - Unit tests for RayActorPoolExecutor and GeneticAlgorithmRunner
    - Integration tests with real scenes
    - Performance benchmarks
 
 2. **Documentation**: Update main docs
-   - Add Ray guide to docs/README.md
+   - ✅ Add Ray guide to docs/README.md
+   - ✅ Add GA_DEAP_IMPLEMENTATION.md to methodology
+   - ✅ Update BASELINES.md (GA implemented)
    - Create quickstart notebook
-   - Add to USAGE.md
 
 ### Short-term (Priority 2)
 
 3. **Enhancements**: Additional features
+   - Hybrid GA+GD pipeline (seed GD from GA best solutions)
    - Resume from checkpoint
    - Live progress monitoring (Ray Dashboard integration)
    - Automatic hyperparameter tuning (Ray Tune integration)
@@ -252,28 +295,38 @@ def test_end_to_end_parallel_optimization():
 6. **Advanced Algorithms**:
    - Population-based training (PBT)
    - Bayesian optimization with Ray Tune
-   - Genetic algorithms on Ray
+   - ✅ Genetic algorithms on Ray (DEAP — COMPLETE)
+   - Particle Swarm Optimization on Ray
 
 ## File Structure
 
 ```
 src/reflector_position/optimizers/
-├── ray_parallel_optimizer.py      # New: 600+ lines, Ray wrapper
+├── ray_parallel_optimizer.py      # Ray ActorPool orchestrator + OptimizationWorker
+├── ray_evaluator.py               # New: Generic Ray execution engine (IoC)
+├── deap_logic.py                  # New: Pure DEAP GA logic (no Ray imports)
+├── ray_deap_optimizer.py          # Legacy: Monolithic DEAP+Ray (deprecated)
 ├── base_optimizer.py              # Existing: Base interface
 ├── gradient_descent.py            # Existing: Works with Ray
-├── grid_search.py                 # Existing: Works with Ray
+├── grid_search.py                 # Existing: GridSearch + SinglePointGridSearch
 ├── optimizer_factory.py           # Existing: Creates optimizers
-└── __init__.py                    # Updated: Exports Ray classes
+└── __init__.py                    # Updated: Exports all classes
 
 docs/methodology/
-├── RAY_PARALLEL_GUIDE.md          # New: 800+ lines, comprehensive guide
-├── RAY_ARCHITECTURE.md            # Existing: Why Ray?
-└── OPTIMIZATION_WORKFLOW.md       # Existing: High-level workflow
+├── RAY_PARALLEL_GUIDE.md          # Comprehensive Ray parallel guide
+├── RAY_ARCHITECTURE.md            # Why Ray vs vectorization
+├── RAY_IMPLEMENTATION_SUMMARY.md  # This file
+├── GA_DEAP_IMPLEMENTATION.md      # New: DEAP GA detailed implementation
+├── OPTIMIZATION_WORKFLOW.md       # High-level workflow
+├── BASELINES.md                   # Baseline comparison methods
+└── FUTURE_ROADMAP.md              # Planned features
 
 examples/
-└── ray_parallel_example.py        # New: 500+ lines, 4 examples
+├── ray_parallel_example.py        # Parallel GD + GS + GA via ActorPool
+├── run_ga_modular.py              # Modular GA entry point (IoC)
+└── ...                            # Other examples
 
-requirements.txt                   # Updated: Added ray[default]>=2.9.0
+requirements.txt                   # Updated: ray[default]>=2.9.0, deap>=1.4.0
 ```
 
 ## Success Metrics
@@ -290,6 +343,9 @@ requirements.txt                   # Updated: Added ray[default]>=2.9.0
 - Automatic result aggregation
 - Performance monitoring (speedup calculation)
 - Extensible architecture (works with any BaseAPOptimizer)
+- **DEAP genetic algorithm with Ray-parallel fitness evaluation**
+- **Inversion of Control (IoC) architecture** — algorithm logic separated from execution engine
+- **Ordered `pool.map`** replacing `map_unordered` (prevents freezes)
 
 ✅ **Documentation Quality**:
 - Complete API reference

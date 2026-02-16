@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document describes the **Ray-based distributed parallel optimization workflow** used in the Reflector Position Optimization framework. The approach implements **Distributed Multi-Start Gradient Descent** using Ray for exploring the non-convex optimization landscape when optimizing physical reflector positions.
+This document describes the **Ray-based distributed parallel optimization workflow** used in the Reflector Position Optimization framework. The approach implements **three optimization methods** — Distributed Multi-Start Gradient Descent, True Parallel Grid Search, and DEAP Genetic Algorithm — all sharing the same Ray ActorPool infrastructure for exploring the non-convex optimization landscape when optimizing physical reflector positions.
 
 ### Why Ray Instead of Vectorized Batching?
 
@@ -340,6 +340,53 @@ def run_distributed_optimization():
 
 ## Future Enhancements
 
+### Genetic Algorithm (DEAP) — Evolutionary Optimization ✅ COMPLETE
+
+In addition to gradient-based multi-start and exhaustive grid search, the framework now includes a **population-based evolutionary optimizer** using the DEAP library.
+
+#### IoC Architecture (Inversion of Control)
+
+The GA implementation uses a clean separation of concerns:
+
+```text
++─────────────────────────────────────────────────────────+
+│  GeneticAlgorithmRunner (deap_logic.py)              │
+│  • Pure DEAP — NO Ray imports                        │
+│  • Population of (x, y) individuals                   │
+│  • Blend crossover, Gaussian mutation, tournament sel  │
+│  • toolbox.register("map", executor_map)  ← Injected   │
++─────────────────────────┬───────────────────────────────+
+                          │
+                          │ executor_map (Dependency Injection)
+                          │
++─────────────────────────┼───────────────────────────────+
+│  RayActorPoolExecutor (ray_evaluator.py)              │
+│  • pool.map (ordered, synchronous)                    │
+│  • Persistent OptimizationWorker actors               │
+│  • Scene loaded once per worker                       │
++─────────────────────────────────────────────────────────+
+          │              │             │            │
+        Worker0       Worker1      Worker2     Worker3
+        (Scene)       (Scene)      (Scene)     (Scene)
+        GPU 0.25      GPU 0.25     GPU 0.25    GPU 0.25
+```
+
+#### GA Workflow
+
+1. **Initialisation**: Random population of 50–100 (x, y) positions
+2. **Evaluation**: Each individual evaluated via `SinglePointGridSearchOptimizer` on Ray ActorPool
+3. **Selection**: Tournament selection (k=3)
+4. **Crossover**: Blend crossover (`cxBlend`, α=0.5)
+5. **Mutation**: Gaussian mutation (σ=2.0, probability=0.2) with bounds enforcement
+6. **Repeat**: For N generations, tracking Hall of Fame and statistics
+7. **Result**: Best (x, y) position with minimum RSS in dBm
+
+#### Key Advantage
+
+The GA explores the search space globally via an evolving population, complementing gradient-based methods that may get trapped in local minima. When combined with the Ray ActorPool, each fitness evaluation runs on a persistent worker with its own Scene instance, enabling true parallel evaluation.
+
+**For complete GA implementation details**, see [GA_DEAP_IMPLEMENTATION.md](GA_DEAP_IMPLEMENTATION.md).
+
 ### Staged Optimization (Pruning)
 1. Run all 32 workers for first 5 iterations
 2. Rank workers by current RSS
@@ -376,3 +423,10 @@ To add PSO-style social behavior while maintaining Ray architecture:
 4. Tune social parameters (inertia, cognitive, social coefficients)
 
 **Note**: This hybrid approach may reduce exploration benefits but could accelerate convergence if the landscape is not too non-convex.
+
+### Hybrid GA+GD Pipeline (Planned)
+Seed gradient descent from the best solutions found by the genetic algorithm:
+1. Run GA (20 generations, pop=50) to identify promising regions
+2. Extract top-k individuals from Hall of Fame
+3. Run multi-start GD from those positions for fine-tuning
+4. Combines global exploration (GA) with local convergence (GD)
