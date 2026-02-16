@@ -35,8 +35,6 @@ from reflector_position.optimizers.ray_parallel_optimizer import (
     generate_random_initial_positions,
 )
 from reflector_position.optimizers.grid_search import generate_grid_positions
-from reflector_position.optimizers.ray_evaluator import RayActorPoolExecutor
-from reflector_position.optimizers.deap_logic import GeneticAlgorithmRunner
 
 # -- Configuration -------------------------------------------------------------
 
@@ -68,27 +66,6 @@ GPU_FRACTION = 0.25         # 4 workers per GPU
 # Unified Min RSS scale (dBm) for all plots — enables visual comparison
 # between GD and GS results. Set to None for auto-scaling.
 RSS_RANGE_DBM = (-130.0, -90.0)  # (min_dbm, max_dbm)
-
-# Shared ray-tracing parameters (used by GD, GS, and GA)
-OPTIMIZATION_PARAMS = {
-    "samples_per_tx": 1_000_000,
-    "max_depth": 13,
-    "verbose": False,
-}
-
-# GA-specific evolutionary parameters
-GA_PARAMS = {
-    "pop_size": 100,
-    "n_gen": 20,
-    "cxpb": 0.7,
-    "mutpb": 0.3,
-    "tournsize": 10,
-    "cx_alpha": 0.5,
-    "mut_mu": 0.0,
-    "mut_sigma": 2.0,
-    "mut_indpb": 0.2,
-    "hof_size": 5,
-}
 
 
 # -- Example 1: Parallel Gradient Descent (many tasks, small pool) -------------
@@ -144,11 +121,13 @@ def example_parallel_gradient_descent(parallel_opt: RayParallelOptimizer):
     # Optimization parameters — passed to optimizer.optimize()
     # Same parameters as in full_comparison.py
     optimization_params = {
-        **OPTIMIZATION_PARAMS,
         "num_iterations": 10,
         "learning_rate": 0.5,
+        "samples_per_tx": 1_000_000,
+        "max_depth": 13,
         "use_soft_min": True,
         "temperature": 0.2,
+        "verbose": False,
     }
 
     # Run all tasks through the pool
@@ -233,7 +212,11 @@ def example_parallel_grid_search(parallel_opt: RayParallelOptimizer):
     ]
 
     # Optimization parameters — passed to optimizer.optimize()
-    optimization_params = OPTIMIZATION_PARAMS
+    optimization_params = {
+        "samples_per_tx": 1_000_000,
+        "max_depth": 13,
+        "verbose": False,
+    }
 
     # Run — pool is reused from GD example (no Scene reload!)
     results = parallel_opt.run(
@@ -253,53 +236,6 @@ def example_parallel_grid_search(parallel_opt: RayParallelOptimizer):
         results,
         save_path=os.path.join(OUTPUT_DIR, "gs_parallel_results.png"),
         metric_name="Min RSS",
-        position_bounds=POSITION_BOUNDS,
-        rss_range_dbm=RSS_RANGE_DBM,
-    )
-
-    return results
-
-
-# -- Example 3: DEAP Genetic Algorithm (modular IoC, Ray-parallel evaluation) --
-
-def example_deap_ga(ga_runner: GeneticAlgorithmRunner):
-    """
-    Run a Genetic Algorithm using DEAP with Ray-parallel fitness evaluation.
-
-    The GA logic (selection, crossover, mutation) runs on the driver via
-    ``GeneticAlgorithmRunner`` (pure DEAP, no Ray imports).  Fitness
-    evaluation is delegated to ``RayActorPoolExecutor.map()`` which
-    distributes ``SinglePointGridSearchOptimizer`` tasks across the
-    Ray ActorPool.
-
-    Architecture (IoC pattern)::
-
-        GeneticAlgorithmRunner  ── executor_map ──▶  RayActorPoolExecutor
-        (algorithm logic)         (dependency          (Ray ActorPool)
-                                   injection)
-    """
-    print("\n" + "=" * 80)
-    print("EXAMPLE 3: DEAP Genetic Algorithm (Modular IoC, Ray-parallel evaluation)")
-    print("=" * 80)
-
-    print(f"\nGA params: pop={GA_PARAMS['pop_size']}, gen={GA_PARAMS['n_gen']}")
-    print(f"Pool: {NUM_POOL_WORKERS} workers | GPU fraction: {GPU_FRACTION}")
-
-    results = ga_runner.run(
-        optimization_params=OPTIMIZATION_PARAMS,
-        ga_params=GA_PARAMS,
-        seed=42,
-        verbose=True,
-    )
-
-    # Save results
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    _save_ga_results(results, os.path.join(OUTPUT_DIR, "ga_results.json"))
-
-    # Save evolution plot
-    ga_runner.save_evolution_plot(
-        results,
-        save_path=os.path.join(OUTPUT_DIR, "ga_evolution.png"),
         position_bounds=POSITION_BOUNDS,
         rss_range_dbm=RSS_RANGE_DBM,
     )
@@ -334,33 +270,12 @@ def _save_results(results: dict, path: str) -> None:
     print(f"Results saved to: {path}")
 
 
-def _save_ga_results(results: dict, path: str) -> None:
-    """Save GA results dict to JSON."""
-    serializable = {
-        "best_individual": results["best_individual"],
-        "best_fitness": results["best_fitness"],
-        "best_fitness_dbm": results["best_fitness_dbm"],
-        "best_position": results["best_position"],
-        "hall_of_fame": results["hall_of_fame"],
-        "total_time": results["total_time"],
-        "total_evaluations": results["total_evaluations"],
-        "ga_params": results["ga_params"],
-        "generation_details": results["generation_details"],
-    }
-    with open(path, "w") as f:
-        json.dump(serializable, f, indent=2, default=str)
-    print(f"GA results saved to: {path}")
-
-
 # -- Main ----------------------------------------------------------------------
 
 if __name__ == "__main__":
     # Initialize Ray once (all examples share the same cluster)
     ray.init(ignore_reinit_error=True)
-    
-    # ---------------------------------------------------------
-    # PART 1: Run Gradient Descent & Grid Search (Pool A)
-    # ---------------------------------------------------------
+
     # Create a single orchestrator with a fixed pool size.
     # The pool is shared across both GD and GS examples — workers persist
     # and the Scene is loaded only once per worker (not once per task).
@@ -368,45 +283,18 @@ if __name__ == "__main__":
         num_workers=NUM_POOL_WORKERS,
         gpu_fraction=GPU_FRACTION,
     )
-    
+
     try:
-        # Run GD and GS
+        # Example 1: 16 GD trajectories -> 4-worker pool
         gd_results = example_parallel_gradient_descent(parallel_opt)
+
+        # Example 2: parallel grid search -> same 4-worker pool (reused!)
         gs_results = example_parallel_grid_search(parallel_opt)
 
-        print("\nGradient Descent & Grid Search Complete.")
-        
-    finally:
-        # CRITICAL: Shut down Pool A to release GPUs/CPUs
-        parallel_opt.shutdown()
-        print("Parallel Optimizer pool shut down. Resources released.")
-        
-    # ---------------------------------------------------------
-    # PART 2: Run Genetic Algorithm (Pool B)
-    # ---------------------------------------------------------
-    # Now that resources are free, we can create the GA pool
-
-    # Modular GA: separate execution engine + algorithm runner (IoC pattern)
-    ga_executor = RayActorPoolExecutor(
-        scene_config=SCENE_CONFIG,
-        num_workers=NUM_POOL_WORKERS,
-        gpu_fraction=GPU_FRACTION,
-        verbose=True,
-    )
-    ga_runner = GeneticAlgorithmRunner(
-        position_bounds=POSITION_BOUNDS,
-        fixed_z=3.8,
-        executor_map=ga_executor.map,  # Dependency Injection
-    )
-    
-    try:
-        ga_results = example_deap_ga(ga_runner)
-        
         # -- Summary -----------------------------------------------------------
         print("\n" + "=" * 80)
         print("OVERALL SUMMARY")
         print("=" * 80)
-        
         print(f"\nPool: {NUM_POOL_WORKERS} workers (Scene loaded once per worker)")
         print(f"\nGradient Descent ({len(gd_results['all_results'])} tasks):")
         print(f"  Best task:     #{gd_results['best_task_id']}")
@@ -421,54 +309,8 @@ if __name__ == "__main__":
         print(f"  Best Min RSS:  {gs_results['best_result']['best_metric_dbm']:.2f} dBm")
         print(f"  Wall-clock:    {gs_results['total_time']:.2f}s")
         print(f"  Speedup:       {gs_results['aggregate_stats']['speedup']:.2f}x")
-        print(f"\nGenetic Algorithm ({ga_results['ga_params']['pop_size']} pop, "
-              f"{ga_results['ga_params']['n_gen']} gen):")
-        print(f"  Best position: {ga_results['best_position']}")
-        print(f"  Best Min RSS:  {ga_results['best_fitness_dbm']:.2f} dBm")
-        print(f"  Total evals:   {ga_results['total_evaluations']}")
-        print(f"  Wall-clock:    {ga_results['total_time']:.2f}s")
+
     finally:
-        # Shut down Pool B
-        ga_executor.shutdown()
+        # Explicitly kill pool actors and shutdown Ray
+        parallel_opt.shutdown()
         ray.shutdown()
-
-    # try:
-    #     # Example 1: 64 GD trajectories -> 4-worker pool
-    #     gd_results = example_parallel_gradient_descent(parallel_opt)
-
-    #     # Example 2: parallel grid search -> same 4-worker pool (reused!)
-    #     gs_results = example_parallel_grid_search(parallel_opt)
-
-    #     # Example 3: DEAP Genetic Algorithm -> modular IoC (separate pool)
-    #     ga_results = example_deap_ga(ga_runner)
-
-    #     # -- Summary -----------------------------------------------------------
-    #     print("\n" + "=" * 80)
-    #     print("OVERALL SUMMARY")
-    #     print("=" * 80)
-    #     print(f"\nPool: {NUM_POOL_WORKERS} workers (Scene loaded once per worker)")
-    #     print(f"\nGradient Descent ({len(gd_results['all_results'])} tasks):")
-    #     print(f"  Best task:     #{gd_results['best_task_id']}")
-    #     print(f"  Best iteration: {gd_results['best_result'].get('best_iteration', -1) + 1}")
-    #     print(f"  Best position: {gd_results['best_result']['best_position']}")
-    #     print(f"  Best Min RSS:  {gd_results['best_result']['best_metric_dbm']:.2f} dBm")
-    #     print(f"  Wall-clock:    {gd_results['total_time']:.2f}s")
-    #     print(f"  Speedup:       {gd_results['aggregate_stats']['speedup']:.2f}x")
-    #     print(f"\nGrid Search ({len(gs_results['all_results'])} grid points):")
-    #     print(f"  Best task:     #{gs_results['best_task_id']}")
-    #     print(f"  Best position: {gs_results['best_result']['best_position']}")
-    #     print(f"  Best Min RSS:  {gs_results['best_result']['best_metric_dbm']:.2f} dBm")
-    #     print(f"  Wall-clock:    {gs_results['total_time']:.2f}s")
-    #     print(f"  Speedup:       {gs_results['aggregate_stats']['speedup']:.2f}x")
-    #     print(f"\nGenetic Algorithm ({ga_results['ga_params']['pop_size']} pop, "
-    #           f"{ga_results['ga_params']['n_gen']} gen):")
-    #     print(f"  Best position: {ga_results['best_position']}")
-    #     print(f"  Best Min RSS:  {ga_results['best_fitness_dbm']:.2f} dBm")
-    #     print(f"  Total evals:   {ga_results['total_evaluations']}")
-    #     print(f"  Wall-clock:    {ga_results['total_time']:.2f}s")
-
-    # finally:
-    #     # Explicitly kill pool actors and shutdown Ray
-    #     parallel_opt.shutdown()
-    #     ga_executor.shutdown()
-    #     ray.shutdown()

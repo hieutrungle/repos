@@ -32,9 +32,11 @@ import numpy as np
 import ray
 from ray.actor import ActorHandle
 
+from reflector_position.metrics import POWER_EPSILON
+
 def _rss_watts_to_dbm(rss_watt: float) -> float:
     """Convert RSS from Watts (linear) to dBm. Mirrors metrics.rss_to_dbm."""
-    return 10.0 * np.log10(max(rss_watt, 1e-16)) + 30.0
+    return 10.0 * np.log10(max(rss_watt, POWER_EPSILON)) + 30.0
 
 
 @ray.remote

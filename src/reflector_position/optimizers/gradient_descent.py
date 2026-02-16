@@ -18,8 +18,10 @@ import copy
 
 from .base_optimizer import BaseAPOptimizer
 from ..metrics import (
+    POWER_EPSILON,
     compute_min_rss_metric,
     compute_soft_min_rss_metric,
+    normalized_softmin_loss,
     compute_coverage_metric,
     rss_to_dbm,
 )
@@ -89,22 +91,30 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
         max_depth: int = 10,
         use_soft_min: bool = True,
         temperature: float = 0.1,
-    ) -> Tuple[torch.Tensor, sionna.rt.RadioMap]:
+    ) -> torch.Tensor:
         """
         Compute loss for current AP position with differentiable ray tracing.
 
         This uses @dr.wrap to bridge PyTorch and DrJit for gradient computation through
         the RadioMapSolver.
 
+        When ``use_soft_min=True`` (default), uses ``normalized_softmin_loss``
+        which converts Watts → dBm → [0, 1] scores → logsumexp SoftMin.
+        This eliminates the manual dBm-scaling heuristic and produces
+        well-bounded gradients regardless of absolute power level.
+
+        When ``use_soft_min=False``, falls back to the legacy hard-min loss
+        (``-min_rss_dbm / 100``), which can produce sparse gradients.
+
         Args:
             samples_per_tx: Number of ray tracing samples
             max_depth: Maximum ray tracing depth
-            use_soft_min: Use soft minimum (better gradients) vs hard minimum
-            temperature: Temperature for soft minimum (lower = closer to hard min)
+            use_soft_min: Use normalized SoftMin loss (recommended) vs hard minimum
+            temperature: Temperature for SoftMin (lower = closer to hard min).
+                Typical values: 0.05 (sharp), 0.1 (balanced), 0.5 (smooth).
 
         Returns:
-            loss: Negative of min RSS (we minimize loss = maximize min RSS)
-            rm: Radio map object (computed outside of gradient tape)
+            loss: Scalar tensor to minimise (lower ⇒ higher worst-case RSS)
         """
 
         # Wrap the radio map computation for gradient flow
@@ -126,19 +136,21 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
 
             return rm.rss
 
-        # Compute metric with gradient tracking
+        # Compute RSS tensor with gradient tracking
         rss = compute_rss(self.tx_x, self.tx_y)
+
         if use_soft_min:
-            min_rss = compute_soft_min_rss_metric(rss, temperature=temperature)
+            # --- Normalized SoftMin loss (new, numerically stable) ---------
+            # Flatten the radio map to (1, num_cells) for normalized_softmin_loss
+            loss = normalized_softmin_loss(
+                rss.flatten().unsqueeze(0),
+                temperature=temperature,
+            )
         else:
+            # --- Legacy hard-min loss (kept for comparison) ----------------
             min_rss = compute_min_rss_metric(rss)
-
-        # Convert to dBm scale for better loss landscape
-        log_min_rss = rss_to_dbm(min_rss)
-        average_rss_dbm = torch.mean(rss_to_dbm(rss))
-
-        # Loss is negative of min RSS (minimize loss = maximize min RSS)
-        loss = -(log_min_rss + average_rss_dbm) / 100.0  # Scale down for stability
+            log_min_rss = rss_to_dbm(min_rss)
+            loss = -log_min_rss / 100.0  # Scale down for stability
 
         return loss
 

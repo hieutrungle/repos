@@ -16,10 +16,13 @@ from .optimizers import (
 )
 from .scene_setup import setup_building_floor_scene, create_camera
 from .metrics import (
+    POWER_EPSILON,
     compute_min_rss_metric,
     compute_soft_min_rss_metric,
+    normalized_softmin_loss,
     compute_coverage_metric,
     rss_to_dbm,
+    dbm_to_rss,
 )
 from .utils import compute_radio_map_with_tx_position
 from .config import (
@@ -41,10 +44,13 @@ __all__ = [
     "setup_building_floor_scene",
     "create_camera",
     # Metrics
+    "POWER_EPSILON",
     "compute_min_rss_metric",
     "compute_soft_min_rss_metric",
+    "normalized_softmin_loss",
     "compute_coverage_metric",
     "rss_to_dbm",
+    "dbm_to_rss",
     # Utils
     "compute_radio_map_with_tx_position",
     # Config

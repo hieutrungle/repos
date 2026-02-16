@@ -15,6 +15,8 @@ from .ray_parallel_optimizer import (
     OptimizationWorker,
     generate_random_initial_positions,
 )
+from .ray_evaluator import RayActorPoolExecutor
+from .deap_logic import GeneticAlgorithmRunner
 
 __all__ = [
     "BaseAPOptimizer",
@@ -28,4 +30,7 @@ __all__ = [
     "RayParallelOptimizer",
     "OptimizationWorker",
     "generate_random_initial_positions",
+    # DEAP GA (modular IoC pattern)
+    "RayActorPoolExecutor",
+    "GeneticAlgorithmRunner",
 ]

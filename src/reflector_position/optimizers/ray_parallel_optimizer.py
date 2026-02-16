@@ -34,11 +34,12 @@ import ray
 from ray.util.actor_pool import ActorPool
 # Create optimizer for this specific task (fresh each time)
 from reflector_position.optimizers.optimizer_factory import OptimizerFactory
+from reflector_position.metrics import POWER_EPSILON
 
 
 def _rss_watts_to_dbm(rss_watt: float) -> float:
     """Convert RSS from Watts (linear) to dBm. Mirrors metrics.rss_to_dbm."""
-    return 10.0 * np.log10(max(rss_watt, 1e-16)) + 30.0
+    return 10.0 * np.log10(max(rss_watt, POWER_EPSILON)) + 30.0
 
 
 @ray.remote

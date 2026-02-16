@@ -2,10 +2,25 @@
 Metrics for evaluating radio map quality and coverage.
 
 This module provides functions for computing various metrics from radio maps,
-including minimum RSS, soft minimum RSS, and coverage area calculations.
+including minimum RSS, soft minimum RSS, normalized SoftMin loss, and coverage
+area calculations.
+
+Constants:
+    POWER_EPSILON: Minimum power floor (Watts) used throughout the module to
+        guard against log(0) and to mask dead/invalid cells.  Every function
+        that touches linear-Watt values uses this single constant so the
+        masking and numerical-safety behaviour is consistent.
 """
 
 import torch
+
+# ---------------------------------------------------------------------------
+# Global epsilon — single source of truth for all power-floor comparisons
+# ---------------------------------------------------------------------------
+POWER_EPSILON: float = 1e-15
+"""Minimum receivable power (Watts).  Values below this are treated as
+numerical noise and excluded from optimisation metrics.  Also added inside
+``log10`` / ``log`` calls to prevent ``-inf``."""
 
 
 def compute_min_rss_metric(rss_map: torch.Tensor) -> torch.Tensor:
@@ -22,7 +37,7 @@ def compute_min_rss_metric(rss_map: torch.Tensor) -> torch.Tensor:
         Minimum RSS value (scalar tensor)
     """
     # Filter out invalid values (zeros or very small values)
-    valid_mask = rss_map > 1e-15
+    valid_mask = rss_map > POWER_EPSILON
     valid_rss = rss_map[valid_mask]
 
     if valid_rss.numel() == 0:
@@ -52,7 +67,7 @@ def compute_soft_min_rss_metric(
     rss_flat = rss_map.flatten()
 
     # Filter out invalid values (zeros or very small values) to avoid log issues
-    valid_mask = rss_flat > 1e-15
+    valid_mask = rss_flat > POWER_EPSILON
     valid_rss = rss_flat[valid_mask]
 
     if valid_rss.numel() == 0:
@@ -104,7 +119,8 @@ def rss_to_dbm(rss_watt: torch.Tensor) -> torch.Tensor:
     Returns:
         RSS value(s) in dBm (torch tensor)
     """
-    return 10 * torch.log10(rss_watt + 1e-16) + 30.0
+    return 10 * torch.log10(rss_watt + POWER_EPSILON) + 30.0
+
 
 def dbm_to_rss(rss_dbm: torch.Tensor) -> torch.Tensor:
     """
@@ -113,6 +129,91 @@ def dbm_to_rss(rss_dbm: torch.Tensor) -> torch.Tensor:
     Args:
         rss_dbm: RSS value(s) in dBm (torch tensor)
     Returns:
-        RSS value(s) in Watts (torch tensor)    
+        RSS value(s) in Watts (torch tensor)
     """
     return 10 ** ((rss_dbm - 30.0) / 10)
+
+
+# ---------------------------------------------------------------------------
+# Normalized SoftMin Loss
+# ---------------------------------------------------------------------------
+
+def normalized_softmin_loss(
+    rssi_watts: torch.Tensor,
+    temperature: float = 0.1,
+    floor_dbm: float = -120.0,
+    ceil_dbm: float = -60.0,
+) -> torch.Tensor:
+    """
+    Numerically stable *Normalized SoftMin* loss for AP placement.
+
+    Converts raw linear-Watt RSSI values into a bounded [0, 1] score space
+    (via dBm normalisation) and then computes a differentiable soft minimum
+    using ``torch.logsumexp``.  Minimising this loss is equivalent to
+    *maximising the weakest-link user RSSI* while keeping gradients smooth.
+
+    **Pipeline**::
+
+        Watts ──► dBm ──► [0, 1] scores ──► SoftMin (logsumexp) ──► loss
+
+    Args:
+        rssi_watts: Tensor of shape ``(batch_size, num_users)`` or
+            ``(num_users,)`` containing received power **in linear Watts**.
+            Values in the range 1e-15 … 1e-8 are typical.
+        temperature: Positive float controlling the sharpness of the soft
+            minimum.  Low values (0.05) approximate ``min()``; high values
+            (1.0) approximate ``mean()``.  Default 0.1 is a good starting
+            point for AP-placement.
+        floor_dbm: dBm value mapped to score 0.0 ("dead zone").
+            Default -120 dBm.
+        ceil_dbm: dBm value mapped to score 1.0 ("strong signal").
+            Default -60 dBm.
+
+    Returns:
+        Scalar loss (mean over batch).  Range is approximately [0, 1].
+        **Lower is better** (lower loss ⇒ higher worst-case RSSI).
+
+    Example::
+
+        >>> rssi = torch.tensor([[1e-11, 1e-12, 1e-13]])
+        >>> loss = normalized_softmin_loss(rssi, temperature=0.1)
+        >>> loss.backward()          # gradients flow cleanly
+
+    Notes:
+        * Uses the module-level ``POWER_EPSILON`` constant for all numerical
+          safety guards, keeping behaviour consistent with
+          ``rss_to_dbm`` / ``compute_min_rss_metric``.
+        * ``torch.logsumexp`` is used instead of manual ``log(sum(exp(...)))``
+          to avoid overflow/underflow at extreme temperatures.
+    """
+    # -- Ensure 2-D input (batch_size, num_users) --------------------------
+    if rssi_watts.dim() == 1:
+        rssi_watts = rssi_watts.unsqueeze(0)  # (1, num_users)
+
+    # -- Step 1: Watts → dBm with epsilon safety ---------------------------
+    # P_dbm = 10 * log10(P_watts + ε) + 30
+    rssi_dbm = 10.0 * torch.log10(rssi_watts + POWER_EPSILON) + 30.0
+
+    # -- Step 2: Normalise dBm → [0, 1] scores ----------------------------
+    # Linear map:  floor_dbm → 0.0,  ceil_dbm → 1.0
+    #   score = (dBm - floor) / (ceil - floor)
+    span = ceil_dbm - floor_dbm  # e.g. -60 - (-120) = 60
+    scores = (rssi_dbm - floor_dbm) / span
+
+    # Clamp so that out-of-window values do not produce unbounded gradients
+    scores = torch.clamp(scores, min=0.0, max=1.0)
+
+    # -- Step 3: SoftMin via logsumexp -------------------------------------
+    # We want to MAXIMISE the minimum score.
+    #   softmin(s) = -τ · logsumexp(-s / τ)
+    # This is always ≤ min(s), and equals min(s) as τ → 0.
+    #
+    # To turn it into a LOSS to MINIMISE:
+    #   loss = τ · logsumexp(-s / τ)      (positive quantity)
+    # Lower loss ⟹ higher worst-case score ⟹ better coverage.
+    loss_per_sample = temperature * torch.logsumexp(
+        -scores / temperature, dim=-1
+    )  # shape: (batch_size,)
+
+    # -- Step 4: Mean over batch -------------------------------------------
+    return loss_per_sample.mean()
