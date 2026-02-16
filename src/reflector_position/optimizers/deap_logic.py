@@ -582,11 +582,11 @@ class GeneticAlgorithmRunner:
             f"{results['best_position'][1]:.2f}, "
             f"{results['best_position'][2]:.2f})\n"
             f"Best Min RSS:  {results['best_fitness_dbm']:.2f} dBm\n"
-            f"\n"
-            f"Total evaluations: {results['total_evaluations']}\n"
-            f"Wall-clock time:   {results['total_time']:.2f}s\n"
-            f"Avg time/gen:      "
-            f"{results['total_time'] / (ga_p['n_gen'] + 1):.2f}s\n"
+            # f"\n"
+            # f"Total evaluations: {results['total_evaluations']}\n"
+            # f"Wall-clock time:   {results['total_time']:.2f}s\n"
+            # f"Avg time/gen:      "
+            # f"{results['total_time'] / (ga_p['n_gen'] + 1):.2f}s\n"
         )
         ax.text(
             0.1, 0.5, summary,

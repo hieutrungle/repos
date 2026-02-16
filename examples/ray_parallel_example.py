@@ -114,7 +114,7 @@ def example_parallel_gradient_descent(parallel_opt: RayParallelOptimizer):
     print("EXAMPLE 1: Parallel Gradient Descent (ActorPool)")
     print("=" * 80)
 
-    NUM_TASKS = 64  # Tasks >> pool workers -> queuing
+    NUM_TASKS = 80  # Tasks >> pool workers -> queuing
 
     # Generate diverse starting positions for all tasks
     initial_positions = generate_random_initial_positions(
@@ -145,7 +145,7 @@ def example_parallel_gradient_descent(parallel_opt: RayParallelOptimizer):
     # Same parameters as in full_comparison.py
     optimization_params = {
         **OPTIMIZATION_PARAMS,
-        "num_iterations": 10,
+        "num_iterations": 30,
         "learning_rate": 0.5,
         "use_soft_min": True,
         "temperature": 0.2,

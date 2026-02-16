@@ -87,8 +87,8 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
 
     def compute_loss(
         self,
-        samples_per_tx: int = 100_000,
-        max_depth: int = 10,
+        samples_per_tx: int = 1_000_000,
+        max_depth: int = 13,
         use_soft_min: bool = True,
         temperature: float = 0.1,
     ) -> torch.Tensor:

@@ -878,12 +878,12 @@ class RayParallelOptimizer:
             f"Min RSS Statistics (dBm):\n"
             f"  Mean: {stats['mean_metric_dbm']:.2f} +/- {stats['std_metric_dbm']:.2f}\n"
             f"  Range: [{stats['min_metric_dbm']:.2f}, {stats['max_metric_dbm']:.2f}]\n"
-            f"\n"
-            f"Performance:\n"
-            f"  Avg time/task: {stats['mean_time_per_task']:.2f}s\n"
-            f"  Sequential: {stats['total_sequential_time']:.2f}s\n"
-            f"  Wall-clock: {stats['total_wall_clock_time']:.2f}s\n"
-            f"  Speedup: {stats['speedup']:.2f}x"
+            # f"\n"
+            # f"Performance:\n"
+            # f"  Avg time/task: {stats['mean_time_per_task']:.2f}s\n"
+            # f"  Sequential: {stats['total_sequential_time']:.2f}s\n"
+            # f"  Wall-clock: {stats['total_wall_clock_time']:.2f}s\n"
+            # f"  Speedup: {stats['speedup']:.2f}x"
         )
         ax.text(
             0.1,
