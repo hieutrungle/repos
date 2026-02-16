@@ -180,6 +180,28 @@ class OptimizationWorker:
                 best_position = positions[best_iter_idx]
                 best_iteration = best_iter_idx
 
+        # Extract orientation (direction + look_at) from history if available
+        best_direction = None
+        final_direction = None
+        best_look_at = None
+        final_look_at = None
+
+        if hasattr(optimizer, "history"):
+            directions = optimizer.history.get("directions", [])
+            look_at_targets = optimizer.history.get("look_at_targets", [])
+            if directions:
+                final_direction = np.asarray(directions[-1]).tolist()
+                if 0 <= best_iteration < len(directions):
+                    best_direction = np.asarray(directions[best_iteration]).tolist()
+                else:
+                    best_direction = final_direction
+            if look_at_targets:
+                final_look_at = np.asarray(look_at_targets[-1]).tolist()
+                if 0 <= best_iteration < len(look_at_targets):
+                    best_look_at = np.asarray(look_at_targets[best_iteration]).tolist()
+                else:
+                    best_look_at = final_look_at
+
         # Convert to serializable types
         if best_position is not None:
             best_position = np.asarray(best_position).tolist()
@@ -203,6 +225,10 @@ class OptimizationWorker:
             "best_metric_dbm": metric_dbm,
             "best_iteration": best_iteration,
             "final_position": final_position,
+            "best_direction": best_direction,
+            "final_direction": final_direction,
+            "best_look_at": best_look_at,
+            "final_look_at": final_look_at,
             "time_elapsed": elapsed_time,
         }
 
@@ -640,12 +666,36 @@ class RayParallelOptimizer:
             if best_iter < 0 and min_rss_dbm_values:
                 best_iter = int(np.argmax(min_rss_dbm_values))
 
-            fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+            # Build orientation subtitle lines if available
+            orientation_lines = ""
+            best_dir = task_result.get("best_direction")
+            final_dir = task_result.get("final_direction")
+            best_la = task_result.get("best_look_at")
+            final_la = task_result.get("final_look_at")
+            if best_dir:
+                orientation_lines += (
+                    f"\nBest Dir: ({best_dir[0]:.3f}, {best_dir[1]:.3f}, {best_dir[2]:.3f})"
+                )
+            if best_la:
+                orientation_lines += (
+                    f"  LookAt: ({best_la[0]:.2f}, {best_la[1]:.2f}, {best_la[2]:.2f})"
+                )
+            if final_dir:
+                orientation_lines += (
+                    f"\nFinal Dir: ({final_dir[0]:.3f}, {final_dir[1]:.3f}, {final_dir[2]:.3f})"
+                )
+            if final_la:
+                orientation_lines += (
+                    f"  LookAt: ({final_la[0]:.2f}, {final_la[1]:.2f}, {final_la[2]:.2f})"
+                )
+
+            fig, axes = plt.subplots(2, 2, figsize=(14, 11))
             fig.suptitle(
                 f"Task #{task_id} — Gradient Descent Trajectory\n"
                 f"Best Min RSS: {task_result['best_metric_dbm']:.2f} dBm "
-                f"at iteration {best_iter + 1}",
-                fontsize=13,
+                f"at iteration {best_iter + 1}"
+                f"{orientation_lines}",
+                fontsize=11,
                 fontweight="bold",
             )
 
@@ -669,12 +719,40 @@ class RayParallelOptimizer:
                     "r*", markersize=18, label=f"Best (iter {best_iter + 1})",
                     zorder=6,
                 )
+            # Draw direction arrows at start, best, and end positions
+            directions = history.get("directions", [])
+            arrow_scale = 2.0  # arrow length in metres
+            if directions and len(directions) == len(positions):
+                dirs_arr = np.array(directions)
+                # Start arrow (green)
+                ax.annotate(
+                    "", xy=(positions[0, 0] + dirs_arr[0, 0] * arrow_scale,
+                            positions[0, 1] + dirs_arr[0, 1] * arrow_scale),
+                    xytext=(positions[0, 0], positions[0, 1]),
+                    arrowprops=dict(arrowstyle="->", color="green", lw=2),
+                )
+                # End arrow (red)
+                ax.annotate(
+                    "", xy=(positions[-1, 0] + dirs_arr[-1, 0] * arrow_scale,
+                            positions[-1, 1] + dirs_arr[-1, 1] * arrow_scale),
+                    xytext=(positions[-1, 0], positions[-1, 1]),
+                    arrowprops=dict(arrowstyle="->", color="red", lw=2),
+                )
+                # Best arrow (gold)
+                if 0 <= best_iter < len(dirs_arr):
+                    ax.annotate(
+                        "", xy=(positions[best_iter, 0] + dirs_arr[best_iter, 0] * arrow_scale,
+                                positions[best_iter, 1] + dirs_arr[best_iter, 1] * arrow_scale),
+                        xytext=(positions[best_iter, 0], positions[best_iter, 1]),
+                        arrowprops=dict(arrowstyle="->", color="gold", lw=2.5),
+                    )
+
             if position_bounds:
                 ax.set_xlim(position_bounds["x_min"], position_bounds["x_max"])
                 ax.set_ylim(position_bounds["y_min"], position_bounds["y_max"])
             ax.set_xlabel("X Position (m)")
             ax.set_ylabel("Y Position (m)")
-            ax.set_title("AP Position Trajectory")
+            ax.set_title("AP Position Trajectory + Direction")
             ax.legend(fontsize=9)
             ax.grid(True, alpha=0.3)
             ax.set_aspect("equal", adjustable="box")
