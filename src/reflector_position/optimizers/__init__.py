@@ -7,6 +7,7 @@ from .grid_search import (
     GridSearchAPOptimizer,
     SinglePointGridSearchOptimizer,
     generate_grid_positions,
+    CARDINAL_DIRECTIONS,
 )
 from .gradient_descent import GradientDescentAPOptimizer
 from .optimizer_factory import OptimizerFactory, create_optimizer
@@ -23,6 +24,7 @@ __all__ = [
     "GridSearchAPOptimizer",
     "SinglePointGridSearchOptimizer",
     "generate_grid_positions",
+    "CARDINAL_DIRECTIONS",
     "GradientDescentAPOptimizer",
     "OptimizerFactory",
     "create_optimizer",

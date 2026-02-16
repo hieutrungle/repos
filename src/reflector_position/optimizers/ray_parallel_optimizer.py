@@ -42,6 +42,13 @@ def _rss_watts_to_dbm(rss_watt: float) -> float:
     return 10.0 * np.log10(max(rss_watt, POWER_EPSILON)) + 30.0
 
 
+def _fmt_dir(direction) -> str:
+    """Format a direction vector for display. Returns 'N/A' when missing."""
+    if direction is None:
+        return "N/A"
+    return f"({direction[0]:+.4f}, {direction[1]:+.4f}, {direction[2]:+.4f})"
+
+
 @ray.remote
 class OptimizationWorker:
     """
@@ -157,8 +164,13 @@ class OptimizationWorker:
         result = optimizer.optimize(**optimization_params)
         elapsed_time = time.time() - start_time
 
-        # Unpack result tuple (final position/metric from optimizer)
-        if isinstance(result, tuple) and len(result) == 2:
+        # Unpack result tuple.
+        # GD returns (position, metric).
+        # SinglePointGridSearch returns (position, orientation, metric).
+        result_orientation = None
+        if isinstance(result, tuple) and len(result) == 3:
+            final_position, result_orientation, final_metric = result
+        elif isinstance(result, tuple) and len(result) == 2:
             final_position, final_metric = result
         else:
             final_position = None
@@ -186,7 +198,18 @@ class OptimizationWorker:
         best_look_at = None
         final_look_at = None
 
-        if hasattr(optimizer, "history"):
+        # Case 1: Orientation returned directly from optimizer (grid_search_point 8-dir sweep)
+        if result_orientation is not None:
+            best_direction = np.asarray(result_orientation).tolist()
+            final_direction = best_direction  # same for single-point eval
+            if best_position is not None:
+                pos_arr = np.asarray(best_position)
+                dir_arr = np.asarray(result_orientation)
+                best_look_at = (pos_arr + dir_arr).tolist()
+                final_look_at = best_look_at
+
+        # Case 2: Orientation stored in GD history
+        elif hasattr(optimizer, "history"):
             directions = optimizer.history.get("directions", [])
             look_at_targets = optimizer.history.get("look_at_targets", [])
             if directions:
@@ -576,6 +599,12 @@ class RayParallelOptimizer:
                   f"(processed by Worker #{best_result['worker_id']})")
             print(f"  Position: {best_result['best_position']}")
             print(f"  Min RSS: {best_result['best_metric_dbm']:.2f} dBm")
+            _bd = best_result.get("best_direction")
+            if _bd:
+                print(f"  Direction: ({_bd[0]:+.4f}, {_bd[1]:+.4f}, {_bd[2]:+.4f})")
+            _bla = best_result.get("best_look_at")
+            if _bla:
+                print(f"  Look-at:  ({_bla[0]:.2f}, {_bla[1]:.2f}, {_bla[2]:.2f})")
             print()
             print("  Aggregate Statistics:")
             print(
@@ -951,6 +980,7 @@ class RayParallelOptimizer:
             f"Best Position: [{best_result['best_position'][0]:.2f}, "
             f"{best_result['best_position'][1]:.2f}, "
             f"{best_result['best_position'][2]:.2f}]\n"
+            f"Best Direction: {_fmt_dir(best_result.get('best_direction'))}\n"
             f"Best Min RSS: {best_dbm_val:.2f} dBm\n"
             f"\n"
             f"Min RSS Statistics (dBm):\n"

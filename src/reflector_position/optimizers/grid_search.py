@@ -279,18 +279,39 @@ class GridSearchAPOptimizer(BaseAPOptimizer):
         plt.show()
 
 
+# 8 cardinal / intercardinal direction unit vectors on the XY plane.
+# Used by SinglePointGridSearchOptimizer to sweep orientations.
+_SQRT2_2 = np.sqrt(2.0) / 2.0
+CARDINAL_DIRECTIONS: List[Tuple[str, np.ndarray]] = [
+    ("N",  np.array([0.0,  1.0,  0.0])),
+    ("NE", np.array([_SQRT2_2,  _SQRT2_2, 0.0])),
+    ("E",  np.array([1.0,  0.0,  0.0])),
+    ("SE", np.array([_SQRT2_2, -_SQRT2_2, 0.0])),
+    ("S",  np.array([0.0, -1.0,  0.0])),
+    ("SW", np.array([-_SQRT2_2, -_SQRT2_2, 0.0])),
+    ("W",  np.array([-1.0,  0.0,  0.0])),
+    ("NW", np.array([-_SQRT2_2,  _SQRT2_2, 0.0])),
+]
+
+
 class SinglePointGridSearchOptimizer(BaseAPOptimizer):
     """
-    Evaluates a single grid point's radio map and computes metrics.
+    Evaluates a single grid point with an 8-direction orientation sweep.
+
+    For every spatial position the optimizer iterates over 8 discrete
+    cardinal / intercardinal directions (N, NE, E, SE, S, SW, W, NW),
+    applies ``tx.look_at(position + direction)`` for each, computes the
+    radio map, and keeps the orientation that maximises Min RSS.
 
     Designed for Ray-parallel grid search: the orchestrator generates all
-    grid points via generate_grid_positions(), then each point is submitted
-    as a separate task. Each task creates one SinglePointGridSearchOptimizer
-    that evaluates exactly one position.
+    grid points via ``generate_grid_positions()``, then each point is
+    submitted as a separate task.  Each task creates one
+    ``SinglePointGridSearchOptimizer`` that evaluates exactly one position
+    across all 8 orientations.
 
     This is the Ray-parallel counterpart of GridSearchAPOptimizer:
     - GridSearchAPOptimizer: evaluates ALL grid points sequentially (standalone)
-    - SinglePointGridSearchOptimizer: evaluates ONE point (Ray-parallel)
+    - SinglePointGridSearchOptimizer: evaluates ONE point × 8 dirs (Ray-parallel)
     """
 
     def __init__(
@@ -319,6 +340,9 @@ class SinglePointGridSearchOptimizer(BaseAPOptimizer):
             "min_rss_values": [],
             "min_rss_dbm_values": [],
             "coverage_values": [],
+            "best_orientation": None,
+            "best_orientation_name": None,
+            "direction_sweep": [],  # per-direction metrics
         }
 
     def optimize(
@@ -327,12 +351,13 @@ class SinglePointGridSearchOptimizer(BaseAPOptimizer):
         max_depth: int = 13,
         coverage_threshold_dbm: float = -100.0,
         verbose: bool = False,
-    ) -> Tuple[np.ndarray, float]:
+    ) -> Tuple[np.ndarray, np.ndarray, float]:
         """
-        Evaluate the single grid point.
+        Evaluate the single grid point across 8 cardinal orientations.
 
-        Computes the radio map for the configured position and returns
-        the min RSS metric.
+        For each of the 8 directions the transmitter antenna is pointed
+        via ``tx.look_at(position + direction)`` and a full radio map is
+        computed.  The orientation yielding the highest Min RSS is kept.
 
         Args:
             samples_per_tx: Number of ray tracing samples.
@@ -342,44 +367,97 @@ class SinglePointGridSearchOptimizer(BaseAPOptimizer):
 
         Returns:
             position: [x, y, z] of evaluated position.
-            min_rss: Minimum RSS value (linear Watts).
+            best_orientation: Best direction unit-vector [dx, dy, dz].
+            min_rss: Best minimum RSS value (linear Watts).
         """
         x, y = self.evaluation_position
+        position = np.array([x, y, self.fixed_z])
         tx_position = [float(x), float(y), float(self.fixed_z)]
 
         start_time = time.time()
 
-        rm = compute_radio_map_with_tx_position(
-            self.scene,
-            tx_position,
-            samples_per_tx=samples_per_tx,
-            max_depth=max_depth,
-        )
+        best_min_rss = -float("inf")
+        best_orientation = CARDINAL_DIRECTIONS[0][1]  # default N
+        best_orientation_name = CARDINAL_DIRECTIONS[0][0]
+        best_coverage = 0.0
+        best_min_rss_dbm_val = -float("inf")
 
-        rss_tensor = torch.from_numpy(np.array(rm.rss)).to(self.device)
-        min_rss = compute_min_rss_metric(rss_tensor)
-        min_rss_dbm = rss_to_dbm(min_rss)
-        coverage = compute_coverage_metric(rss_tensor, coverage_threshold_dbm)
+        from sionna.rt import RadioMapSolver
+        solver = RadioMapSolver()
 
-        position = np.array([x, y, self.fixed_z])
+        for dir_name, dir_vec in CARDINAL_DIRECTIONS:
+            # Set TX position and orientation
+            target = [
+                float(x) + float(dir_vec[0]),
+                float(y) + float(dir_vec[1]),
+                float(self.fixed_z) + float(dir_vec[2]),
+            ]
+            for tx in self.scene.transmitters.values():
+                tx.position = tx_position
+                tx.look_at(target)
 
-        # Store results
+            # Compute radio map
+            rm = solver(
+                self.scene,
+                cell_size=(1.0, 1.0),
+                samples_per_tx=samples_per_tx,
+                max_depth=max_depth,
+                refraction=True,
+                diffraction=True,
+            )
+
+            rss_tensor = torch.from_numpy(np.array(rm.rss)).to(self.device)
+            min_rss = compute_min_rss_metric(rss_tensor)
+            min_rss_dbm = rss_to_dbm(min_rss)
+            coverage = compute_coverage_metric(rss_tensor, coverage_threshold_dbm)
+
+            rss_val = min_rss.cpu().item()
+            dbm_val = min_rss_dbm.cpu().item()
+            cov_val = coverage.cpu().item()
+
+            self.results["direction_sweep"].append({
+                "direction_name": dir_name,
+                "direction": dir_vec.tolist(),
+                "min_rss": rss_val,
+                "min_rss_dbm": dbm_val,
+                "coverage": cov_val,
+            })
+
+            if rss_val > best_min_rss:
+                best_min_rss = rss_val
+                best_min_rss_dbm_val = dbm_val
+                best_orientation = dir_vec.copy()
+                best_orientation_name = dir_name
+                best_coverage = cov_val
+
+            if verbose:
+                print(
+                    f"    Dir {dir_name:2s} ({dir_vec[0]:+.3f}, {dir_vec[1]:+.3f}, {dir_vec[2]:+.3f}): "
+                    f"Min RSS = {dbm_val:.2f} dBm, "
+                    f"Coverage = {cov_val:.1f}%"
+                )
+
+        # Store best results
         self.results["positions"].append(position)
-        self.results["min_rss_values"].append(min_rss.cpu().item())
-        self.results["min_rss_dbm_values"].append(min_rss_dbm.cpu().item())
-        self.results["coverage_values"].append(coverage.cpu().item())
+        self.results["min_rss_values"].append(best_min_rss)
+        self.results["min_rss_dbm_values"].append(best_min_rss_dbm_val)
+        self.results["coverage_values"].append(best_coverage)
+        self.results["best_orientation"] = best_orientation.tolist()
+        self.results["best_orientation_name"] = best_orientation_name
 
         elapsed = time.time() - start_time
 
         if verbose:
             print(
                 f"  Grid point ({x:.2f}, {y:.2f}, {self.fixed_z:.2f}): "
-                f"Min RSS = {min_rss_dbm.item():.2f} dBm, "
-                f"Coverage = {coverage.item():.1f}%, "
-                f"Time = {elapsed:.2f}s"
+                f"Best Dir = {best_orientation_name} "
+                f"({best_orientation[0]:+.3f}, {best_orientation[1]:+.3f}, {best_orientation[2]:+.3f}), "
+                f"Min RSS = {best_min_rss_dbm_val:.2f} dBm, "
+                f"Coverage = {best_coverage:.1f}%, "
+                f"Time = {elapsed:.2f}s (8 dirs)"
             )
 
-        return position, min_rss.cpu().item()
+        return position, best_orientation, best_min_rss
 
     def plot_results(self, **kwargs) -> None:
         """No-op for single point evaluation."""

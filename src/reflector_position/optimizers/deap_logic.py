@@ -63,6 +63,14 @@ def _rss_watts_to_dbm(rss_watt: float) -> float:
     return 10.0 * np.log10(max(rss_watt, POWER_EPSILON)) + 30.0
 
 
+def _fmt_dir_summary(direction, name=None) -> str:
+    """Format a direction vector for summary text (plots / terminal)."""
+    if direction is None:
+        return "N/A"
+    tag = f" ({name})" if name else ""
+    return f"({direction[0]:+.4f}, {direction[1]:+.4f}, {direction[2]:+.4f}){tag}"
+
+
 class GeneticAlgorithmRunner:
     """
     Pure DEAP implementation of a Genetic Algorithm for AP positioning.
@@ -165,6 +173,12 @@ class GeneticAlgorithmRunner:
         for ind, res in zip(invalid_ind, results):
             # Fitness is a tuple for DEAP — higher RSS is better
             ind.fitness.values = (res["best_metric"],)
+            # Preserve orientation data from the 8-dir sweep so that
+            # HoF entries (which are deepcopied) carry the info.
+            ind.best_direction = res.get("best_direction")
+            ind.best_look_at = res.get("best_look_at")
+            gs = res.get("grid_results", {})
+            ind.best_orientation_name = gs.get("best_orientation_name")
 
         return len(invalid_ind)
 
@@ -331,6 +345,7 @@ class GeneticAlgorithmRunner:
         record["best_pos"] = f"({best_ind[0]:.2f}, {best_ind[1]:.2f})"
         logbook.record(gen=0, nevals=nevals, **record)
 
+        _best_dir_name = getattr(best_ind, "best_orientation_name", None)
         generation_details.append({
             "gen": 0,
             "nevals": nevals,
@@ -339,15 +354,19 @@ class GeneticAlgorithmRunner:
             "std": record["std"],
             "best_x": float(best_ind[0]),
             "best_y": float(best_ind[1]),
+            "best_direction": getattr(best_ind, "best_direction", None),
+            "best_orientation_name": _best_dir_name,
             "time": gen_time,
         })
 
         if verbose:
+            _dir_tag = f" | dir={_best_dir_name}" if _best_dir_name else ""
             print(
                 f"  Gen  0 | evals={nevals:>3d} | "
                 f"best={record['max_dbm']:.2f} dBm | "
                 f"mean={record['mean_dbm']:.2f} dBm | "
-                f"pos=({best_ind[0]:.2f}, {best_ind[1]:.2f}) | "
+                f"pos=({best_ind[0]:.2f}, {best_ind[1]:.2f})"
+                f"{_dir_tag} | "
                 f"time={gen_time:.1f}s"
             )
 
@@ -395,6 +414,7 @@ class GeneticAlgorithmRunner:
             logbook.record(gen=gen, nevals=nevals, **record)
             gen_time = time.time() - gen_start
 
+            _best_dir_name = getattr(best_ind, "best_orientation_name", None)
             generation_details.append({
                 "gen": gen,
                 "nevals": nevals,
@@ -403,15 +423,19 @@ class GeneticAlgorithmRunner:
                 "std": record["std"],
                 "best_x": float(best_ind[0]),
                 "best_y": float(best_ind[1]),
+                "best_direction": getattr(best_ind, "best_direction", None),
+                "best_orientation_name": _best_dir_name,
                 "time": gen_time,
             })
 
             if verbose:
+                _dir_tag = f" | dir={_best_dir_name}" if _best_dir_name else ""
                 print(
                     f"  Gen {gen:>2d} | evals={nevals:>3d} | "
                     f"best={record['max_dbm']:.2f} dBm | "
                     f"mean={record['mean_dbm']:.2f} dBm | "
-                    f"pos=({best_ind[0]:.2f}, {best_ind[1]:.2f}) | "
+                    f"pos=({best_ind[0]:.2f}, {best_ind[1]:.2f})"
+                    f"{_dir_tag} | "
                     f"time={gen_time:.1f}s"
                 )
 
@@ -427,6 +451,9 @@ class GeneticAlgorithmRunner:
                 "position": [float(ind[0]), float(ind[1]), self.fixed_z],
                 "fitness": float(ind.fitness.values[0]),
                 "fitness_dbm": _rss_watts_to_dbm(ind.fitness.values[0]),
+                "direction": getattr(ind, "best_direction", None),
+                "look_at": getattr(ind, "best_look_at", None),
+                "orientation_name": getattr(ind, "best_orientation_name", None),
             })
 
         results = {
@@ -434,6 +461,9 @@ class GeneticAlgorithmRunner:
             "best_fitness": float(best_fitness),
             "best_fitness_dbm": _rss_watts_to_dbm(best_fitness),
             "best_position": [float(best[0]), float(best[1]), self.fixed_z],
+            "best_direction": getattr(best, "best_direction", None),
+            "best_look_at": getattr(best, "best_look_at", None),
+            "best_orientation_name": getattr(best, "best_orientation_name", None),
             "hall_of_fame": hall_of_fame_list,
             "logbook": logbook,
             "total_time": total_time,
@@ -459,6 +489,14 @@ class GeneticAlgorithmRunner:
             print("GA COMPLETE")
             print(f"  Best position: ({best[0]:.2f}, {best[1]:.2f}, "
                   f"{self.fixed_z})")
+            _bd = results.get("best_direction")
+            _bn = results.get("best_orientation_name")
+            if _bd:
+                print(f"  Best direction: ({_bd[0]:+.4f}, {_bd[1]:+.4f}, {_bd[2]:+.4f})"
+                      f"{f'  ({_bn})' if _bn else ''}")
+            _bla = results.get("best_look_at")
+            if _bla:
+                print(f"  Best look_at:  ({_bla[0]:.2f}, {_bla[1]:.2f}, {_bla[2]:.2f})")
             print(f"  Best Min RSS:  {results['best_fitness_dbm']:.2f} dBm")
             print(f"  Total evals:   {total_evaluations}")
             print(f"  Wall-clock:    {total_time:.2f}s")
@@ -581,6 +619,8 @@ class GeneticAlgorithmRunner:
             f"Best Position: ({results['best_position'][0]:.2f}, "
             f"{results['best_position'][1]:.2f}, "
             f"{results['best_position'][2]:.2f})\n"
+            f"Best Direction: {_fmt_dir_summary(results.get('best_direction'),
+                                                results.get('best_orientation_name'))}\n"
             f"Best Min RSS:  {results['best_fitness_dbm']:.2f} dBm\n"
             # f"\n"
             # f"Total evaluations: {results['total_evaluations']}\n"
