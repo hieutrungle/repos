@@ -9,7 +9,8 @@ __version__ = "0.1.0"
 
 from .optimizers import (
     BaseAPOptimizer,
-    GridSearchAPOptimizer,
+    SinglePointGridSearchOptimizer,
+    generate_alternating_grid_tasks,
     GradientDescentAPOptimizer,
     OptimizerFactory,
     create_optimizer,
@@ -36,7 +37,8 @@ __all__ = [
     "__version__",
     # Optimizers
     "BaseAPOptimizer",
-    "GridSearchAPOptimizer",
+    "SinglePointGridSearchOptimizer",
+    "generate_alternating_grid_tasks",
     "GradientDescentAPOptimizer",
     "OptimizerFactory",
     "create_optimizer",
