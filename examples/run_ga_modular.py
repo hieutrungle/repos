@@ -1,28 +1,42 @@
 """
-Entry point: Run Genetic Algorithm with modular Ray evaluation.
+Entry point: Run Genetic Algorithm with modular evaluation.
 
-Wires together:
-    - ``RayActorPoolExecutor`` (execution engine — manages Ray ActorPool)
-    - ``GeneticAlgorithmRunner``  (algorithm logic — pure DEAP, no Ray imports)
+Supports two execution modes via ``--mode``:
 
-The executor's ``map`` method is injected into the GA runner via DEAP's
-``toolbox.register("map", executor.map)``.  This Inversion of Control (IoC)
-pattern strictly separates the execution engine from the algorithm logic,
-preventing freeze issues caused by ``map_unordered`` and resource contention.
+``local`` (default)
+    Single-process evaluation.  Loads the Scene once and evaluates all
+    individuals sequentially.  No Ray dependency — ideal for debugging,
+    profiling, and quick smoke tests.
+
+``ray``
+    Distributed evaluation via ``RayActorPoolExecutor``.  Spawns a pool
+    of persistent actors, each holding its own Scene, and distributes
+    fitness evaluations across workers automatically.
+
+In both modes the ``GeneticAlgorithmRunner`` (pure DEAP, no Ray imports)
+is identical — only the injected ``executor_map`` changes.
 
 Usage::
 
-    python examples/run_ga_modular.py
+    # Quick local test (small pop, few generations)
+    python examples/run_ga_modular.py --mode local
+
+    # Full distributed run
+    python examples/run_ga_modular.py --mode ray
+
+    # Custom parameters
+    python examples/run_ga_modular.py --mode local --pop-size 20 --n-gen 5
 """
 
+import argparse
 import json
 import os
+import time
 from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Tuple
 
-import ray
-
-from reflector_position.optimizers.ray_evaluator import RayActorPoolExecutor
 from reflector_position.optimizers.deap_logic import GeneticAlgorithmRunner
+
 
 # ===========================================================================
 # Configuration (matches ray_parallel_example.py Example 3)
@@ -36,7 +50,6 @@ SCENE_CONFIG = {
     "scene_path": str(SCENE_PATH),
     "frequency": 5.18e9,
     "tx_power_dbm": 5.0,
-    # tx_positions and rx_position use defaults from setup_building_floor_scene
 }
 
 POSITION_BOUNDS = {
@@ -62,6 +75,8 @@ GA_PARAMS = {
     "cx_alpha": 0.5,
     "mut_mu": 0.0,
     "mut_sigma": 2.0,
+    "mut_sigma_pos": 2.0,
+    "mut_sigma_dir": 0.3,
     "mut_indpb": 0.2,
     "hof_size": 5,
 }
@@ -71,6 +86,110 @@ OPTIMIZATION_PARAMS = {
     "max_depth": 13,
     "verbose": False,
 }
+
+
+# ===========================================================================
+# Local (single-process) executor
+# ===========================================================================
+
+
+class LocalExecutor:
+    """
+    Single-process executor that mimics the ``RayActorPoolExecutor`` interface.
+
+    Loads the Scene once, then evaluates individuals sequentially using
+    ``OptimizerFactory``.  Compatible with DEAP's ``toolbox.register("map", ...)``
+    pattern via the :meth:`map` method.
+    """
+
+    def __init__(
+        self,
+        scene_config: Dict[str, Any],
+        verbose: bool = True,
+    ):
+        from reflector_position.scene_setup import setup_building_floor_scene
+
+        if verbose:
+            print("  Loading scene (single-process mode) ...")
+
+        self.scene = setup_building_floor_scene(
+            scene_path=str(scene_config["scene_path"]),
+            frequency=scene_config.get("frequency", 5.18e9),
+            tx_positions=scene_config.get("tx_positions", None),
+            tx_power_dbm=scene_config.get("tx_power_dbm", 5.0),
+            rx_position=scene_config.get("rx_position", (16.0, 6.5, 1.5)),
+        )
+        if verbose:
+            print("  Scene loaded.")
+
+    def map(
+        self,
+        func: Callable,
+        iterable: Iterable,
+    ) -> List[Dict[str, Any]]:
+        """Evaluate items sequentially — drop-in replacement for Ray pool.map."""
+        from reflector_position.optimizers.optimizer_factory import OptimizerFactory
+
+        import numpy as np
+
+        items = list(iterable)
+        if not items:
+            return []
+
+        task_args = [func(item) for item in items]
+        results: List[Dict[str, Any]] = []
+
+        for task_id, method, kwargs, opt_params in task_args:
+            optimizer = OptimizerFactory.create(
+                method=method,
+                scene=self.scene,
+                **kwargs,
+            )
+            start = time.time()
+            result_tuple = optimizer.optimize(**opt_params)
+            elapsed = time.time() - start
+
+            # Unpack — matches OptimizationWorker.optimize() output format.
+            result_orientation = None
+            if isinstance(result_tuple, tuple) and len(result_tuple) == 3:
+                final_position, result_orientation, final_metric = result_tuple
+            elif isinstance(result_tuple, tuple) and len(result_tuple) == 2:
+                final_position, final_metric = result_tuple
+            else:
+                final_position = None
+                final_metric = float("-inf")
+
+            best_position = (
+                np.asarray(final_position).tolist()
+                if final_position is not None
+                else [0.0, 0.0, 0.0]
+            )
+            best_direction = (
+                np.asarray(result_orientation).tolist()
+                if result_orientation is not None
+                else None
+            )
+            metric_linear = float(final_metric) if final_metric is not None else 0.0
+
+            results.append({
+                "task_id": task_id,
+                "worker_id": 0,
+                "best_position": best_position,
+                "best_metric": metric_linear,
+                "best_direction": best_direction,
+                "time_elapsed": elapsed,
+                "grid_results": (
+                    {k: v for k, v in optimizer.results.items() if k != "radio_maps"}
+                    if hasattr(optimizer, "results")
+                    else {}
+                ),
+            })
+
+        return results
+
+    def shutdown(self) -> None:
+        """No-op for single-process mode."""
+        print("  Local executor shut down (no-op).")
 
 
 # ===========================================================================
@@ -85,6 +204,8 @@ def _save_ga_results(results: dict, path: str) -> None:
         "best_fitness": results["best_fitness"],
         "best_fitness_dbm": results["best_fitness_dbm"],
         "best_position": results["best_position"],
+        "best_direction": results.get("best_direction"),
+        "optimize_orientation": results.get("optimize_orientation"),
         "hall_of_fame": results["hall_of_fame"],
         "total_time": results["total_time"],
         "total_evaluations": results["total_evaluations"],
@@ -96,64 +217,115 @@ def _save_ga_results(results: dict, path: str) -> None:
     print(f"GA results saved to: {path}")
 
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run GA for AP position & orientation optimization.",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["local", "ray"],
+        default="local",
+        help="Execution mode: 'local' (single-process) or 'ray' (distributed). "
+             "Default: local.",
+    )
+    parser.add_argument("--pop-size", type=int, default=None, help="Population size.")
+    parser.add_argument("--n-gen", type=int, default=None, help="Number of generations.")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed.")
+    parser.add_argument(
+        "--no-orientation",
+        action="store_true",
+        help="Disable orientation optimization (legacy 2-gene mode).",
+    )
+    return parser.parse_args()
+
+
 # ===========================================================================
 # Main
 # ===========================================================================
 
 
 if __name__ == "__main__":
-    # Initialize Ray once
-    ray.init(ignore_reinit_error=True)
+    args = _parse_args()
+
+    # Override GA params from CLI if provided
+    ga_params = dict(GA_PARAMS)
+    if args.pop_size is not None:
+        ga_params["pop_size"] = args.pop_size
+    if args.n_gen is not None:
+        ga_params["n_gen"] = args.n_gen
+
+    optimize_orientation = not args.no_orientation
 
     print("=" * 80)
-    print("MODULAR GA: RayActorPoolExecutor + GeneticAlgorithmRunner (IoC)")
+    mode_label = "LOCAL (single-process)" if args.mode == "local" else "RAY (distributed)"
+    orient_label = "4D [x,y,dx,dy]" if optimize_orientation else "2D [x,y]"
+    print(f"MODULAR GA: {mode_label} | Chromosome: {orient_label}")
     print("=" * 80)
 
-    # 1. Create the execution engine (Ray ActorPool)
-    executor = RayActorPoolExecutor(
-        scene_config=SCENE_CONFIG,
-        num_workers=NUM_POOL_WORKERS,
-        gpu_fraction=GPU_FRACTION,
-        verbose=True,
-    )
+    # -- Create executor ------------------------------------------------
+    executor: Any  # LocalExecutor or RayActorPoolExecutor
+    if args.mode == "local":
+        executor = LocalExecutor(
+            scene_config=SCENE_CONFIG,
+            verbose=True,
+        )
+    else:
+        import ray
+        from reflector_position.optimizers.ray_evaluator import RayActorPoolExecutor
 
-    # 2. Create the algorithm runner, injecting executor.map
-    ga = GeneticAlgorithmRunner(
-        position_bounds=POSITION_BOUNDS,
-        fixed_z=3.8,
-        executor_map=executor.map,  # <--- Dependency Injection
-    )
-
-    try:
-        # 3. Run the GA
-        results = ga.run(
-            optimization_params=OPTIMIZATION_PARAMS,
-            ga_params=GA_PARAMS,
-            seed=42,
+        ray.init(ignore_reinit_error=True)
+        executor = RayActorPoolExecutor(
+            scene_config=SCENE_CONFIG,
+            num_workers=NUM_POOL_WORKERS,
+            gpu_fraction=GPU_FRACTION,
             verbose=True,
         )
 
-        # 4. Save results
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
-        _save_ga_results(results, os.path.join(OUTPUT_DIR, "ga_modular_results.json"))
+    # -- Create GA runner -----------------------------------------------
+    ga = GeneticAlgorithmRunner(
+        position_bounds=POSITION_BOUNDS,
+        fixed_z=3.8,
+        executor_map=executor.map,
+        optimize_orientation=optimize_orientation,
+    )
 
-        # 5. Save evolution plot
+    try:
+        # -- Run GA -----------------------------------------------------
+        results = ga.run(
+            optimization_params=OPTIMIZATION_PARAMS,
+            ga_params=ga_params,
+            seed=args.seed,
+            verbose=True,
+        )
+
+        # -- Save results -----------------------------------------------
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        suffix = "local" if args.mode == "local" else "ray"
+        _save_ga_results(
+            results,
+            os.path.join(OUTPUT_DIR, f"ga_modular_{suffix}_results.json"),
+        )
+
+        # -- Save evolution plot ----------------------------------------
         ga.save_evolution_plot(
             results,
-            save_path=os.path.join(OUTPUT_DIR, "ga_modular_evolution.png"),
+            save_path=os.path.join(OUTPUT_DIR, f"ga_modular_{suffix}_evolution.png"),
             position_bounds=POSITION_BOUNDS,
             rss_range_dbm=RSS_RANGE_DBM,
         )
 
-        # 6. Summary
-        print(f"\nGenetic Algorithm ({GA_PARAMS['pop_size']} pop, "
-              f"{GA_PARAMS['n_gen']} gen):")
-        print(f"  Best position: {results['best_position']}")
-        print(f"  Best Min RSS:  {results['best_fitness_dbm']:.2f} dBm")
-        print(f"  Total evals:   {results['total_evaluations']}")
-        print(f"  Wall-clock:    {results['total_time']:.2f}s")
+        # -- Summary ----------------------------------------------------
+        print(f"\nGenetic Algorithm ({ga_params['pop_size']} pop, "
+              f"{ga_params['n_gen']} gen, mode={args.mode}):")
+        print(f"  Best position:  {results['best_position']}")
+        bd = results.get("best_direction")
+        if bd:
+            print(f"  Best direction: ({bd[0]:+.4f}, {bd[1]:+.4f}, {bd[2]:+.4f})")
+        print(f"  Best Min RSS:   {results['best_fitness_dbm']:.2f} dBm")
+        print(f"  Total evals:    {results['total_evaluations']}")
+        print(f"  Wall-clock:     {results['total_time']:.2f}s")
 
     finally:
-        # 7. Clean up
         executor.shutdown()
-        ray.shutdown()
+        if args.mode == "ray":
+            ray.shutdown()
