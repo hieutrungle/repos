@@ -4,9 +4,9 @@ Optimizers package for AP position optimization.
 
 from .base_optimizer import BaseAPOptimizer
 from .grid_search import (
-    GridSearchAPOptimizer,
     SinglePointGridSearchOptimizer,
     generate_grid_positions,
+    generate_alternating_grid_tasks,
     CARDINAL_DIRECTIONS,
 )
 from .gradient_descent import GradientDescentAPOptimizer
@@ -21,9 +21,9 @@ from .deap_logic import GeneticAlgorithmRunner
 
 __all__ = [
     "BaseAPOptimizer",
-    "GridSearchAPOptimizer",
     "SinglePointGridSearchOptimizer",
     "generate_grid_positions",
+    "generate_alternating_grid_tasks",
     "CARDINAL_DIRECTIONS",
     "GradientDescentAPOptimizer",
     "OptimizerFactory",
