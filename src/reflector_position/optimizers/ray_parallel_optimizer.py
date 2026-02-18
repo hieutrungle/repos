@@ -46,7 +46,28 @@ def _fmt_dir(direction) -> str:
     """Format a direction vector for display. Returns 'N/A' when missing."""
     if direction is None:
         return "N/A"
+    # Multi-AP: nested list [[dx0,dy0,dz0],[dx1,dy1,dz1]]
+    if isinstance(direction, (list, np.ndarray)) and len(direction) > 0:
+        if isinstance(direction[0], (list, np.ndarray)):
+            parts = [f"({d[0]:+.4f}, {d[1]:+.4f}, {d[2]:+.4f})" for d in direction]
+            return " | ".join(parts)
     return f"({direction[0]:+.4f}, {direction[1]:+.4f}, {direction[2]:+.4f})"
+
+
+def _fmt_pos(position) -> str:
+    """Format a position for display. Handles multi-AP nested lists."""
+    if position is None:
+        return "N/A"
+    if isinstance(position, (list, np.ndarray)) and len(position) > 0:
+        if isinstance(position[0], (list, np.ndarray)):
+            parts = [f"({p[0]:.2f}, {p[1]:.2f}, {p[2]:.2f})" for p in position]
+            return " | ".join(parts)
+    return f"({position[0]:.2f}, {position[1]:.2f}, {position[2]:.2f})"
+
+
+# Per-AP colours and markers for trajectory plots
+_AP_COLORS = ["#1f77b4", "#d62728", "#2ca02c", "#ff7f0e", "#9467bd", "#8c564b"]
+_AP_MARKERS = ["o", "s", "^", "D", "v", "P"]
 
 
 @ray.remote
@@ -159,6 +180,9 @@ class OptimizationWorker:
             **optimizer_kwargs,
         )
 
+        # Detect multi-AP configuration
+        num_aps = getattr(optimizer, "num_aps", 1)
+
         # Run optimization (same call pattern as full_comparison.py)
         start_time = time.time()
         result = optimizer.optimize(**optimization_params)
@@ -243,6 +267,7 @@ class OptimizationWorker:
         output = {
             "task_id": task_id,
             "worker_id": self.worker_id,
+            "num_aps": num_aps,
             "best_position": best_position,
             "best_metric": metric_linear,
             "best_metric_dbm": metric_dbm,
@@ -597,14 +622,17 @@ class RayParallelOptimizer:
         if verbose:
             print(f"  Best task: #{best_result['task_id']} "
                   f"(processed by Worker #{best_result['worker_id']})")
-            print(f"  Position: {best_result['best_position']}")
+            _n_aps = best_result.get("num_aps", 1)
+            if _n_aps > 1:
+                print(f"  Num APs: {_n_aps}")
+            print(f"  Position: {_fmt_pos(best_result['best_position'])}")
             print(f"  Min RSS: {best_result['best_metric_dbm']:.2f} dBm")
             _bd = best_result.get("best_direction")
             if _bd:
-                print(f"  Direction: ({_bd[0]:+.4f}, {_bd[1]:+.4f}, {_bd[2]:+.4f})")
+                print(f"  Direction: {_fmt_dir(_bd)}")
             _bla = best_result.get("best_look_at")
             if _bla:
-                print(f"  Look-at:  ({_bla[0]:.2f}, {_bla[1]:.2f}, {_bla[2]:.2f})")
+                print(f"  Look-at:  {_fmt_pos(_bla)}")
             print()
             print("  Aggregate Statistics:")
             print(
@@ -682,6 +710,7 @@ class RayParallelOptimizer:
                 continue  # Skip non-GD tasks
 
             task_id = task_result["task_id"]
+            num_aps_task = task_result.get("num_aps", 1)
             positions = np.array(history["positions"])
             min_rss_dbm_values = history.get("min_rss_dbm_values", [])
             coverage_values = history.get("coverage_values", [])
@@ -689,6 +718,11 @@ class RayParallelOptimizer:
 
             if len(positions) == 0:
                 continue
+
+            # Normalize to [num_iter, num_aps, 3]
+            if positions.ndim == 2:
+                positions = positions[:, np.newaxis, :]  # [iter, 1, 3]
+            num_aps_task = positions.shape[1]
 
             # Find the best iteration (highest min RSS dBm)
             best_iter = task_result.get("best_iteration", -1)
@@ -702,21 +736,13 @@ class RayParallelOptimizer:
             best_la = task_result.get("best_look_at")
             final_la = task_result.get("final_look_at")
             if best_dir:
-                orientation_lines += (
-                    f"\nBest Dir: ({best_dir[0]:.3f}, {best_dir[1]:.3f}, {best_dir[2]:.3f})"
-                )
+                orientation_lines += f"\nBest Dir: {_fmt_dir(best_dir)}"
             if best_la:
-                orientation_lines += (
-                    f"  LookAt: ({best_la[0]:.2f}, {best_la[1]:.2f}, {best_la[2]:.2f})"
-                )
+                orientation_lines += f"  LookAt: {_fmt_pos(best_la)}"
             if final_dir:
-                orientation_lines += (
-                    f"\nFinal Dir: ({final_dir[0]:.3f}, {final_dir[1]:.3f}, {final_dir[2]:.3f})"
-                )
+                orientation_lines += f"\nFinal Dir: {_fmt_dir(final_dir)}"
             if final_la:
-                orientation_lines += (
-                    f"  LookAt: ({final_la[0]:.2f}, {final_la[1]:.2f}, {final_la[2]:.2f})"
-                )
+                orientation_lines += f"  LookAt: {_fmt_pos(final_la)}"
 
             fig, axes = plt.subplots(2, 2, figsize=(14, 11))
             fig.suptitle(
@@ -728,52 +754,55 @@ class RayParallelOptimizer:
                 fontweight="bold",
             )
 
-            # 1. Position trajectory
+            # 1. Position trajectory (per-AP)
             ax = axes[0, 0]
-            ax.plot(
-                positions[:, 0], positions[:, 1],
-                "b-o", markersize=4, linewidth=1.5, alpha=0.6,
-            )
-            ax.plot(
-                positions[0, 0], positions[0, 1],
-                "go", markersize=12, label="Start", zorder=5,
-            )
-            ax.plot(
-                positions[-1, 0], positions[-1, 1],
-                "rs", markersize=12, label="End", zorder=5,
-            )
-            if 0 <= best_iter < len(positions):
-                ax.plot(
-                    positions[best_iter, 0], positions[best_iter, 1],
-                    "r*", markersize=18, label=f"Best (iter {best_iter + 1})",
-                    zorder=6,
-                )
-            # Draw direction arrows at start, best, and end positions
             directions = history.get("directions", [])
-            arrow_scale = 2.0  # arrow length in metres
-            if directions and len(directions) == len(positions):
-                dirs_arr = np.array(directions)
-                # Start arrow (green)
-                ax.annotate(
-                    "", xy=(positions[0, 0] + dirs_arr[0, 0] * arrow_scale,
-                            positions[0, 1] + dirs_arr[0, 1] * arrow_scale),
-                    xytext=(positions[0, 0], positions[0, 1]),
-                    arrowprops=dict(arrowstyle="->", color="green", lw=2),
+            dirs_arr = np.array(directions) if directions else None
+            if dirs_arr is not None and dirs_arr.ndim == 2:
+                dirs_arr = dirs_arr[:, np.newaxis, :]  # [iter, 1, 3]
+            arrow_scale = 2.0
+
+            for k in range(num_aps_task):
+                color = _AP_COLORS[k % len(_AP_COLORS)]
+                marker = _AP_MARKERS[k % len(_AP_MARKERS)]
+                lbl = f"AP{k} " if num_aps_task > 1 else ""
+                ap_pos = positions[:, k, :]  # [iter, 3]
+                ax.plot(
+                    ap_pos[:, 0], ap_pos[:, 1],
+                    f"-{marker}", color=color,
+                    markersize=4, linewidth=1.5, alpha=0.6,
+                    label=f"{lbl}path",
                 )
-                # End arrow (red)
-                ax.annotate(
-                    "", xy=(positions[-1, 0] + dirs_arr[-1, 0] * arrow_scale,
-                            positions[-1, 1] + dirs_arr[-1, 1] * arrow_scale),
-                    xytext=(positions[-1, 0], positions[-1, 1]),
-                    arrowprops=dict(arrowstyle="->", color="red", lw=2),
+                ax.plot(
+                    ap_pos[0, 0], ap_pos[0, 1],
+                    marker, color="green", markersize=12, zorder=5,
+                    label=f"{lbl}Start" if k == 0 else None,
                 )
-                # Best arrow (gold)
-                if 0 <= best_iter < len(dirs_arr):
+                ax.plot(
+                    ap_pos[-1, 0], ap_pos[-1, 1],
+                    "s", color=color, markersize=12, zorder=5,
+                    label=f"{lbl}End",
+                )
+                if 0 <= best_iter < len(ap_pos):
+                    ax.plot(
+                        ap_pos[best_iter, 0], ap_pos[best_iter, 1],
+                        "*", color=color, markersize=18, zorder=6,
+                        label=f"{lbl}Best (iter {best_iter + 1})" if k == 0 else None,
+                    )
+                # Direction arrows
+                if dirs_arr is not None and len(dirs_arr) == len(positions):
+                    ap_dir = dirs_arr[:, k, :]  # [iter, 3]
                     ax.annotate(
-                        "", xy=(positions[best_iter, 0] + dirs_arr[best_iter, 0] * arrow_scale,
-                                positions[best_iter, 1] + dirs_arr[best_iter, 1] * arrow_scale),
-                        xytext=(positions[best_iter, 0], positions[best_iter, 1]),
-                        arrowprops=dict(arrowstyle="->", color="gold", lw=2.5),
+                        "", xy=(ap_pos[0, 0] + ap_dir[0, 0] * arrow_scale,
+                                ap_pos[0, 1] + ap_dir[0, 1] * arrow_scale),
+                        xytext=(ap_pos[0, 0], ap_pos[0, 1]),
+                        arrowprops=dict(arrowstyle="->", color="green", lw=2),
+                    )
+                    ax.annotate(
+                        "", xy=(ap_pos[-1, 0] + ap_dir[-1, 0] * arrow_scale,
+                                ap_pos[-1, 1] + ap_dir[-1, 1] * arrow_scale),
+                        xytext=(ap_pos[-1, 0], ap_pos[-1, 1]),
+                        arrowprops=dict(arrowstyle="->", color=color, lw=2),
                     )
 
             if position_bounds:
@@ -781,8 +810,9 @@ class RayParallelOptimizer:
                 ax.set_ylim(position_bounds["y_min"], position_bounds["y_max"])
             ax.set_xlabel("X Position (m)")
             ax.set_ylabel("Y Position (m)")
-            ax.set_title("AP Position Trajectory + Direction")
-            ax.legend(fontsize=9)
+            title = "AP Position Trajectories" if num_aps_task > 1 else "AP Position Trajectory + Direction"
+            ax.set_title(title)
+            ax.legend(fontsize=8)
             ax.grid(True, alpha=0.3)
             ax.set_aspect("equal", adjustable="box")
 
@@ -827,9 +857,17 @@ class RayParallelOptimizer:
             # 4. Gradient norm (log scale)
             ax = axes[1, 1]
             if gradients:
-                grad_norms = [
-                    np.sqrt(g[0] ** 2 + g[1] ** 2) for g in gradients
-                ]
+                grad_arr = np.array(gradients)
+                if grad_arr.ndim == 3:
+                    # Multi-AP: [iter, num_aps, 2] -> total norm
+                    grad_norms = [
+                        float(np.sqrt(np.sum(np.array(g) ** 2)))
+                        for g in gradients
+                    ]
+                else:
+                    grad_norms = [
+                        np.sqrt(g[0] ** 2 + g[1] ** 2) for g in gradients
+                    ]
                 iters = list(range(1, len(grad_norms) + 1))
                 ax.semilogy(iters, grad_norms, "r-", linewidth=2)
                 if 0 <= best_iter < len(grad_norms):
@@ -920,25 +958,95 @@ class RayParallelOptimizer:
 
         # 2. Final positions scatter (color = Min RSS dBm)
         ax = axes[0, 1]
-        positions = np.array([r["best_position"] for r in all_results])
-        scatter = ax.scatter(
-            positions[:, 0],
-            positions[:, 1],
-            c=metrics_dbm,
-            s=100,
-            cmap="viridis",
-            edgecolor="black",
-            alpha=0.7,
-            vmin=rss_range_dbm[0] if rss_range_dbm else None,
-            vmax=rss_range_dbm[1] if rss_range_dbm else None,
+        sample_pos = all_results[0]["best_position"]
+        _is_multi_ap = (
+            isinstance(sample_pos, (list, np.ndarray))
+            and len(sample_pos) > 0
+            and isinstance(sample_pos[0], (list, np.ndarray))
         )
-        ax.plot(
-            best_result["best_position"][0],
-            best_result["best_position"][1],
-            "r*",
-            markersize=20,
-            label="Best",
-        )
+        if _is_multi_ap:
+            n_aps = len(sample_pos)
+            for k in range(n_aps):
+                ap_positions = np.array([r["best_position"][k] for r in all_results])
+                scatter = ax.scatter(
+                    ap_positions[:, 0],
+                    ap_positions[:, 1],
+                    c=metrics_dbm,
+                    s=80,
+                    cmap="viridis",
+                    edgecolor="black",
+                    alpha=0.7,
+                    marker=_AP_MARKERS[k % len(_AP_MARKERS)],
+                    label=f"AP{k}",
+                    vmin=rss_range_dbm[0] if rss_range_dbm else None,
+                    vmax=rss_range_dbm[1] if rss_range_dbm else None,
+                )
+            # Connect APs of the same task with thin lines
+            for r in all_results:
+                pos = np.array(r["best_position"])
+                ax.plot(pos[:, 0], pos[:, 1], "k-", alpha=0.15, linewidth=0.5)
+            # Mark best task's APs
+            best_pos = np.array(best_result["best_position"])
+            for k in range(n_aps):
+                ax.plot(best_pos[k, 0], best_pos[k, 1], "r*", markersize=18, zorder=6)
+            # Draw orientation arrows for best result
+            _best_dir = best_result.get("best_direction")
+            if _best_dir is not None:
+                _arrow_sc = 2.5
+                _best_dir_arr = np.array(_best_dir)
+                if _best_dir_arr.ndim == 2:
+                    for k in range(min(n_aps, len(_best_dir_arr))):
+                        ax.annotate(
+                            "",
+                            xy=(best_pos[k, 0] + _best_dir_arr[k, 0] * _arrow_sc,
+                                best_pos[k, 1] + _best_dir_arr[k, 1] * _arrow_sc),
+                            xytext=(best_pos[k, 0], best_pos[k, 1]),
+                            arrowprops=dict(arrowstyle="->", color="red", lw=2.5),
+                            zorder=7,
+                        )
+                else:
+                    ax.annotate(
+                        "",
+                        xy=(best_pos[0, 0] + _best_dir_arr[0] * _arrow_sc,
+                            best_pos[0, 1] + _best_dir_arr[1] * _arrow_sc),
+                        xytext=(best_pos[0, 0], best_pos[0, 1]),
+                        arrowprops=dict(arrowstyle="->", color="red", lw=2.5),
+                        zorder=7,
+                    )
+        else:
+            positions = np.array([r["best_position"] for r in all_results])
+            scatter = ax.scatter(
+                positions[:, 0],
+                positions[:, 1],
+                c=metrics_dbm,
+                s=100,
+                cmap="viridis",
+                edgecolor="black",
+                alpha=0.7,
+                vmin=rss_range_dbm[0] if rss_range_dbm else None,
+                vmax=rss_range_dbm[1] if rss_range_dbm else None,
+            )
+            ax.plot(
+                best_result["best_position"][0],
+                best_result["best_position"][1],
+                "r*",
+                markersize=20,
+                label="Best",
+            )
+            # Draw orientation arrow for best result
+            _best_dir = best_result.get("best_direction")
+            if _best_dir is not None:
+                _arrow_sc = 2.5
+                _bd = np.array(_best_dir)
+                _bp = best_result["best_position"]
+                ax.annotate(
+                    "",
+                    xy=(_bp[0] + _bd[0] * _arrow_sc,
+                        _bp[1] + _bd[1] * _arrow_sc),
+                    xytext=(_bp[0], _bp[1]),
+                    arrowprops=dict(arrowstyle="->", color="red", lw=2.5),
+                    zorder=7,
+                )
         if position_bounds:
             ax.set_xlim(position_bounds["x_min"], position_bounds["x_max"])
             ax.set_ylim(position_bounds["y_min"], position_bounds["y_max"])
@@ -977,9 +1085,7 @@ class RayParallelOptimizer:
             f"\n"
             f"Best Task: #{best_result['task_id']} "
             f"(Worker #{best_result['worker_id']})\n"
-            f"Best Position: [{best_result['best_position'][0]:.2f}, "
-            f"{best_result['best_position'][1]:.2f}, "
-            f"{best_result['best_position'][2]:.2f}]\n"
+            f"Best Position: {_fmt_pos(best_result['best_position'])}\n"
             f"Best Direction: {_fmt_dir(best_result.get('best_direction'))}\n"
             f"Best Min RSS: {best_dbm_val:.2f} dBm\n"
             f"\n"
