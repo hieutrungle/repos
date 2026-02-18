@@ -54,7 +54,8 @@ def setup_building_floor_scene(
     if tx_positions is None:
         tx_positions = [(10.0, 20.0, 3.8)]
 
-    n_txs = len(tx_positions)
+    n_txs = 1
+    # n_txs = len(tx_positions)
     power_per_tx = tx_power_dbm / n_txs
 
     # Add transmitters
