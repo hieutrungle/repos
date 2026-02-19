@@ -90,7 +90,7 @@ RSS_RANGE_DBM = (-130.0, -80.0)  # (min_dbm, max_dbm)
 # Shared ray-tracing parameters (used by GD, GS, and GA)
 OPTIMIZATION_PARAMS = {
     "samples_per_tx": 1_000_000,
-    "max_depth": 10,
+    "max_depth": 13,
     "verbose": False,
 }
 
@@ -109,6 +109,8 @@ GA_PARAMS = {
     "mut_indpb": 0.2,
     "hof_size": 5,
 }
+
+RANDOM_SEED = 1
 
 
 # -- Example 1: Parallel Gradient Descent (many tasks, small pool) -------------
@@ -136,7 +138,7 @@ def example_parallel_gradient_descent(
     print(f"Parallel Gradient Descent — {num_aps} AP(s), {num_tasks} tasks")
     print("=" * 80)
 
-    rng = np.random.default_rng(42)
+    rng = np.random.default_rng(RANDOM_SEED)
 
     if num_aps == 1:
         # Single-AP: one random starting position per task
@@ -144,7 +146,7 @@ def example_parallel_gradient_descent(
             num_positions=num_tasks,
             bounds=POSITION_BOUNDS,
             fixed_z=3.8,
-            seed=10,
+            seed=RANDOM_SEED,
         )
         print(f"\nPool: {parallel_opt.num_workers} workers | Tasks: {num_tasks}")
         print(f"\nGenerated {num_tasks} initial positions:")
@@ -453,54 +455,118 @@ def example_parallel_grid_search_2ap(
     return best_overall_results
 
 
-# -- Example 3: DEAP Genetic Algorithm (modular IoC, Ray-parallel evaluation) --
+# -- Example 3a: DEAP GA — 1 AP -----------------------------------------------
 
-def example_deap_ga(ga_runner: GeneticAlgorithmRunner):
+def example_deap_ga_1ap(
+    ga_executor: RayActorPoolExecutor,
+    ga_params: dict = None,
+    output_dir: str = OUTPUT_DIR,
+) -> dict:
     """
-    Run a Genetic Algorithm using DEAP with Ray-parallel fitness evaluation.
+    Run a 1-AP Genetic Algorithm (4-gene chromosome ``[x, y, dx, dy]``).
 
-    The GA logic (selection, crossover, mutation) runs on the driver via
-    ``GeneticAlgorithmRunner`` (pure DEAP, no Ray imports).  Fitness
-    evaluation is delegated to ``RayActorPoolExecutor.map()`` which
-    distributes ``SinglePointGridSearchOptimizer`` tasks across the
-    Ray ActorPool.
+    Creates a ``GeneticAlgorithmRunner`` with ``num_aps=1``, injects the
+    ``RayActorPoolExecutor.map`` as the evaluation engine, runs the GA,
+    saves results and an evolution plot.
 
-    When ``optimize_orientation=True`` (default), each individual is a
-    4-gene chromosome ``[x, y, dir_x, dir_y]``.  The direction is
-    L2-normalised with a fixed ``dir_z = -0.5`` before evaluation.
-    Split mutation applies ``sigma_pos`` to position genes and
-    ``sigma_dir`` to direction genes.
+    Args:
+        ga_executor: ``RayActorPoolExecutor`` bound to a *1-TX* scene.
+        ga_params: Override for evolutionary hyper-parameters.
+        output_dir: Directory for output files.
 
-    Architecture (IoC pattern)::
-
-        GeneticAlgorithmRunner  ── executor_map ──▶  RayActorPoolExecutor
-        (algorithm logic)         (dependency          (Ray ActorPool)
-                                   injection)
+    Returns:
+        GA results dict.
     """
+    if ga_params is None:
+        ga_params = GA_PARAMS
+
     print("\n" + "=" * 80)
-    print("EXAMPLE 3: DEAP Genetic Algorithm (Modular IoC, Ray-parallel evaluation)")
+    print("DEAP Genetic Algorithm — 1 AP (4D [x, y, dx, dy])")
     print("=" * 80)
 
-    orient_mode = "4D [x,y,dx,dy]" if ga_runner.optimize_orientation else "2D [x,y]"
-    print(f"\nGA params: pop={GA_PARAMS['pop_size']}, gen={GA_PARAMS['n_gen']}")
-    print(f"Chromosome: {orient_mode}")
-    print(f"Pool: {NUM_POOL_WORKERS} workers | GPU fraction: {GPU_FRACTION}")
+    ga_runner = GeneticAlgorithmRunner(
+        position_bounds=POSITION_BOUNDS,
+        fixed_z=FIXED_Z,
+        executor_map=ga_executor.map,
+        optimize_orientation=True,
+        num_aps=1,
+    )
 
     results = ga_runner.run(
         optimization_params=OPTIMIZATION_PARAMS,
-        ga_params=GA_PARAMS,
-        seed=42,
+        ga_params=ga_params,
+        seed=RANDOM_SEED,
         verbose=True,
     )
 
-    # Save results
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    _save_ga_results(results, os.path.join(OUTPUT_DIR, "ga_results.json"))
+    os.makedirs(output_dir, exist_ok=True)
+    _save_ga_results(results, os.path.join(output_dir, "ga_1ap_results.json"))
 
-    # Save evolution plot
     ga_runner.save_evolution_plot(
         results,
-        save_path=os.path.join(OUTPUT_DIR, "ga_evolution.png"),
+        save_path=os.path.join(output_dir, "ga_1ap_evolution.png"),
+        position_bounds=POSITION_BOUNDS,
+        rss_range_dbm=RSS_RANGE_DBM,
+    )
+
+    return results
+
+
+# -- Example 3b: DEAP GA — 2 APs ----------------------------------------------
+
+def example_deap_ga_2ap(
+    ga_executor: RayActorPoolExecutor,
+    ga_params: dict = None,
+    min_ap_separation: float = 5.0,
+    output_dir: str = OUTPUT_DIR,
+) -> dict:
+    """
+    Run a 2-AP Genetic Algorithm (8-gene chromosome
+    ``[x1, y1, x2, y2, dx1, dy1, dx2, dy2]``).
+
+    Creates a ``GeneticAlgorithmRunner`` with ``num_aps=2`` and a
+    separation constraint.  Fitness evaluation is delegated to the
+    injected ``RayActorPoolExecutor``.
+
+    Args:
+        ga_executor: ``RayActorPoolExecutor`` bound to a *2-TX* scene.
+        ga_params: Override for evolutionary hyper-parameters.
+        min_ap_separation: Minimum allowed AP distance (metres).
+        output_dir: Directory for output files.
+
+    Returns:
+        GA results dict.
+    """
+    if ga_params is None:
+        ga_params = GA_PARAMS
+
+    print("\n" + "=" * 80)
+    print("DEAP Genetic Algorithm — 2 APs (8D [x1,y1,x2,y2,dx1,dy1,dx2,dy2])")
+    print("=" * 80)
+    print(f"  min_ap_separation = {min_ap_separation}m")
+
+    ga_runner = GeneticAlgorithmRunner(
+        position_bounds=POSITION_BOUNDS,
+        fixed_z=FIXED_Z,
+        executor_map=ga_executor.map,
+        optimize_orientation=True,
+        num_aps=2,
+        min_ap_separation=min_ap_separation,
+    )
+
+    results = ga_runner.run(
+        optimization_params=OPTIMIZATION_PARAMS,
+        ga_params=ga_params,
+        seed=RANDOM_SEED,
+        verbose=True,
+    )
+
+    os.makedirs(output_dir, exist_ok=True)
+    _save_ga_results(results, os.path.join(output_dir, "ga_2ap_results.json"))
+
+    ga_runner.save_evolution_plot(
+        results,
+        save_path=os.path.join(output_dir, "ga_2ap_evolution.png"),
         position_bounds=POSITION_BOUNDS,
         rss_range_dbm=RSS_RANGE_DBM,
     )
@@ -567,22 +633,28 @@ def _save_results(results: dict, path: str) -> None:
 
 
 def _save_ga_results(results: dict, path: str) -> None:
-    """Save GA results dict to JSON."""
+    """Save GA results dict to JSON (supports 1-AP and multi-AP)."""
     serializable = {
         "best_individual": results["best_individual"],
         "best_fitness": results["best_fitness"],
         "best_fitness_dbm": results["best_fitness_dbm"],
-        "best_position": results["best_position"],
-        "best_direction": results.get("best_direction"),
         "optimize_orientation": results.get("optimize_orientation"),
-        "best_look_at": results.get("best_look_at"),
-        "best_orientation_name": results.get("best_orientation_name"),
+        "num_aps": results.get("num_aps", 1),
         "hall_of_fame": results["hall_of_fame"],
         "total_time": results["total_time"],
         "total_evaluations": results["total_evaluations"],
         "ga_params": results["ga_params"],
         "generation_details": results["generation_details"],
     }
+    # 1-AP fields
+    if "best_position" in results:
+        serializable["best_position"] = results["best_position"]
+        serializable["best_direction"] = results.get("best_direction")
+    # Multi-AP fields
+    if "best_positions" in results:
+        serializable["best_positions"] = results["best_positions"]
+        serializable["best_directions"] = results.get("best_directions")
+        serializable["best_ap_separation"] = results.get("best_ap_separation")
     with open(path, "w") as f:
         json.dump(serializable, f, indent=2, default=str)
     print(f"GA results saved to: {path}")
@@ -617,97 +689,181 @@ def _print_gs_summary(label: str, results: dict) -> None:
     print(f"  Speedup:        {stats['speedup']:.2f}x")
 
 
+def _print_ga_summary(label: str, results: dict) -> None:
+    """Print a detailed GA summary block (1-AP or multi-AP)."""
+    num_aps = results.get("num_aps", 1)
+    print(f"\n{label} (pop={results['ga_params']['pop_size']}, "
+          f"gen={results['ga_params']['n_gen']}, APs={num_aps}):")
+    if num_aps == 1:
+        print(f"  Best position:  {_fmt_pos(results['best_position'])}")
+        print(f"  Best direction: {_fmt_dir(results.get('best_direction'))}")
+    else:
+        for i in range(num_aps):
+            pos = results['best_positions'][i]
+            print(f"  AP{i} position:  ({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f})")
+            dirs = results.get('best_directions')
+            if dirs and dirs[i]:
+                d = dirs[i]
+                print(f"  AP{i} direction: ({d[0]:+.4f}, {d[1]:+.4f}, {d[2]:+.4f})")
+        sep = results.get('best_ap_separation', 0)
+        print(f"  AP separation:  {sep:.2f}m")
+    print(f"  Best Min RSS:   {results['best_fitness_dbm']:.2f} dBm")
+    print(f"  Total evals:    {results['total_evaluations']}")
+    print(f"  Wall-clock:     {results['total_time']:.2f}s")
+
+
 # -- Wrapper functions for 1-AP and 2-AP experiments ---------------------------
 
 def run_all_1ap(
-    parallel_opt: RayParallelOptimizer,
     output_dir: str = OUTPUT_DIR,
+    num_pool_workers: int = NUM_POOL_WORKERS,
+    gpu_fraction: float = GPU_FRACTION,
 ) -> dict:
     """
-    Run all 1-AP experiments: Gradient Descent + Grid Search.
+    Run all 1-AP experiments: Gradient Descent + Grid Search + GA.
 
-    Pool workers load a 1-TX scene.  Results are saved under *output_dir*.
+    Executors are created and destroyed **sequentially** to avoid
+    deadlocks from concurrent Ray actor pools on the same GPU.
+
+    Lifecycle::
+
+        parallel_opt  (GD + GS)  →  shutdown  →  ga_executor (GA)  →  shutdown
 
     Args:
-        parallel_opt: RayParallelOptimizer instance.
         output_dir: Directory for output files.
+        num_pool_workers: Number of Ray workers per pool.
+        gpu_fraction: GPU fraction per worker.
 
     Returns:
-        Dict with ``gd_1ap`` and ``gs_1ap`` result dicts.
+        Dict with ``gd_1ap``, ``gs_1ap``, and ``ga_1ap`` result dicts.
     """
     print("\n" + "#" * 80)
-    print("#  ALL 1-AP EXPERIMENTS")
+    print("#  ALL 1-AP EXPERIMENTS (GD + GS + GA)")
     print("#" * 80)
 
     all_results = {}
 
-    # 1-AP Gradient Descent
-    all_results["gd_1ap"] = example_parallel_gradient_descent(
-        parallel_opt,
-        num_aps=1,
-        num_tasks=64,
-        num_iterations=50,
-        output_dir=output_dir,
-        scene_config=SCENE_CONFIG,
+    # --- Phase 1: GD + GS via RayParallelOptimizer -----------------------
+    parallel_opt = RayParallelOptimizer(
+        num_workers=num_pool_workers,
+        gpu_fraction=gpu_fraction,
     )
+    try:
+        all_results["gd_1ap"] = example_parallel_gradient_descent(
+            parallel_opt,
+            num_aps=1,
+            num_tasks=80,
+            num_iterations=50,
+            output_dir=output_dir,
+            scene_config=SCENE_CONFIG,
+        )
 
-    # 1-AP Grid Search
-    all_results["gs_1ap"] = example_parallel_grid_search(
-        parallel_opt,
-        grid_resolution=1.0,
-        output_dir=output_dir,
+        all_results["gs_1ap"] = example_parallel_grid_search(
+            parallel_opt,
+            grid_resolution=1.0,
+            output_dir=output_dir,
+            scene_config=SCENE_CONFIG,
+        )
+    finally:
+        parallel_opt.shutdown()
+        print("1-AP GD+GS pool shut down.")
+
+    # --- Phase 2: GA via RayActorPoolExecutor ----------------------------
+    ga_executor = RayActorPoolExecutor(
         scene_config=SCENE_CONFIG,
+        num_workers=num_pool_workers,
+        gpu_fraction=gpu_fraction,
+        verbose=True,
     )
+    try:
+        all_results["ga_1ap"] = example_deap_ga_1ap(
+            ga_executor,
+            output_dir=output_dir,
+        )
+    finally:
+        ga_executor.shutdown()
+        print("1-AP GA pool shut down.")
 
-    print("\nGradient Descent & Grid Search (1-AP) Complete.")
+    print("\nAll 1-AP experiments (GD + GS + GA) complete.")
 
     return all_results
 
 
 def run_all_2ap(
-    parallel_opt: RayParallelOptimizer,
     output_dir: str = OUTPUT_DIR,
+    num_pool_workers: int = NUM_POOL_WORKERS,
+    gpu_fraction: float = GPU_FRACTION,
 ) -> dict:
     """
-    Run all 2-AP experiments: Gradient Descent + Grid Search (alternating).
+    Run all 2-AP experiments: Gradient Descent + Grid Search (alternating) + GA.
 
-    Pool workers load a 2-TX scene.  Results are saved under *output_dir*.
+    Executors are created and destroyed **sequentially** to avoid
+    deadlocks from concurrent Ray actor pools on the same GPU.
+
+    Lifecycle::
+
+        parallel_opt  (GD + GS)  →  shutdown  →  ga_executor (GA)  →  shutdown
 
     Args:
-        parallel_opt: RayParallelOptimizer instance.
         output_dir: Directory for output files.
+        num_pool_workers: Number of Ray workers per pool.
+        gpu_fraction: GPU fraction per worker.
 
     Returns:
-        Dict with ``gd_2ap`` and ``gs_2ap`` result dicts.
+        Dict with ``gd_2ap``, ``gs_2ap``, and ``ga_2ap`` result dicts.
     """
     print("\n" + "#" * 80)
-    print("#  ALL 2-AP EXPERIMENTS")
+    print("#  ALL 2-AP EXPERIMENTS (GD + GS + GA)")
     print("#" * 80)
 
     all_results = {}
 
-    # 2-AP Gradient Descent
-    all_results["gd_2ap"] = example_parallel_gradient_descent(
-        parallel_opt,
-        num_aps=2,
-        num_tasks=64,
-        num_iterations=50,
-        repulsion_weight=0.5,
-        samples_per_tx=1_000_000,
-        output_dir=output_dir,
-        scene_config=SCENE_CONFIG_2AP,
+    # --- Phase 1: GD + GS via RayParallelOptimizer -----------------------
+    parallel_opt = RayParallelOptimizer(
+        num_workers=num_pool_workers,
+        gpu_fraction=gpu_fraction,
     )
+    try:
+        all_results["gd_2ap"] = example_parallel_gradient_descent(
+            parallel_opt,
+            num_aps=2,
+            num_tasks=80,
+            num_iterations=50,
+            repulsion_weight=0.3,
+            samples_per_tx=1_000_000,
+            output_dir=output_dir,
+            scene_config=SCENE_CONFIG_2AP,
+        )
 
-    # 2-AP Grid Search (alternating optimisation)
-    all_results["gs_2ap"] = example_parallel_grid_search_2ap(
-        parallel_opt,
-        grid_resolution=1.0,
-        num_rounds=ALTERNATING_ROUNDS,
-        output_dir=output_dir,
+        all_results["gs_2ap"] = example_parallel_grid_search_2ap(
+            parallel_opt,
+            grid_resolution=1.0,
+            num_rounds=ALTERNATING_ROUNDS,
+            output_dir=output_dir,
+            scene_config=SCENE_CONFIG_2AP,
+        )
+    finally:
+        parallel_opt.shutdown()
+        print("2-AP GD+GS pool shut down.")
+
+    # --- Phase 2: GA via RayActorPoolExecutor ----------------------------
+    ga_executor_2ap = RayActorPoolExecutor(
         scene_config=SCENE_CONFIG_2AP,
+        num_workers=num_pool_workers,
+        gpu_fraction=gpu_fraction,
+        verbose=True,
     )
+    try:
+        all_results["ga_2ap"] = example_deap_ga_2ap(
+            ga_executor_2ap,
+            min_ap_separation=5.0,
+            output_dir=output_dir,
+        )
+    finally:
+        ga_executor_2ap.shutdown()
+        print("2-AP GA pool shut down.")
 
-    print("\nGradient Descent & Grid Search (2-AP) Complete.")
+    print("\nAll 2-AP experiments (GD + GS + GA) complete.")
 
     return all_results
 
@@ -718,63 +874,26 @@ if __name__ == "__main__":
     # Initialize Ray once (all examples share the same cluster)
     ray.init(ignore_reinit_error=True)
 
-    # ---------------------------------------------------------
-    # PART 1: Run all 1-AP experiments (GD + GS) — Pool A
-    # ---------------------------------------------------------
-    parallel_opt = RayParallelOptimizer(
-        num_workers=NUM_POOL_WORKERS,
-        gpu_fraction=GPU_FRACTION,
-    )
+    # ==========================================================
+    # PART 1: All 1-AP experiments (GD + GS → shutdown → GA)
+    # ==========================================================
+    results_1ap = run_all_1ap(output_dir=OUTPUT_DIR)
 
-    # try:
-    #     results_1ap = run_all_1ap(parallel_opt, output_dir=OUTPUT_DIR)
-    # finally:
-    #     parallel_opt.shutdown()
-    #     print("Pool A (1-AP) shut down. Resources released.")
+    # ==========================================================
+    # PART 2: All 2-AP experiments (GD + GS → shutdown → GA)
+    # ==========================================================
+    results_2ap = run_all_2ap(output_dir=OUTPUT_DIR)
 
-    # ---------------------------------------------------------
-    # PART 2: Run all 2-AP experiments (GD + GS alt.) — Pool B
-    # ---------------------------------------------------------
-    parallel_opt_2ap = RayParallelOptimizer(
-        num_workers=NUM_POOL_WORKERS,
-        gpu_fraction=GPU_FRACTION,
-    )
-
-    try:
-        results_2ap = run_all_2ap(parallel_opt_2ap, output_dir=OUTPUT_DIR)
-    finally:
-        parallel_opt_2ap.shutdown()
-        print("Pool B (2-AP) shut down. Resources released.")
-
-    # ---------------------------------------------------------
-    # PART 3: Genetic Algorithm (commented out — will modify later)
-    # ---------------------------------------------------------
-    # ga_executor = RayActorPoolExecutor(
-    #     scene_config=SCENE_CONFIG,
-    #     num_workers=NUM_POOL_WORKERS,
-    #     gpu_fraction=GPU_FRACTION,
-    #     verbose=True,
-    # )
-    # ga_runner = GeneticAlgorithmRunner(
-    #     position_bounds=POSITION_BOUNDS,
-    #     fixed_z=FIXED_Z,
-    #     executor_map=ga_executor.map,  # Dependency Injection
-    # )
-    #
-    # try:
-    #     ga_results = example_deap_ga(ga_runner)
-    # finally:
-    #     ga_executor.shutdown()
-
-    # ---------------------------------------------------------
+    # ==========================================================
     # SUMMARY
-    # ---------------------------------------------------------
-    # print("\n" + "=" * 80)
-    # print("1-AP SUMMARY")
-    # print("=" * 80)
-    # print(f"\nPool: {NUM_POOL_WORKERS} workers (Scene loaded once per worker)")
-    # _print_gd_summary("Gradient Descent", results_1ap["gd_1ap"])
-    # _print_gs_summary("Grid Search", results_1ap["gs_1ap"])
+    # ==========================================================
+    print("\n" + "=" * 80)
+    print("1-AP SUMMARY")
+    print("=" * 80)
+    print(f"\nPool: {NUM_POOL_WORKERS} workers (Scene loaded once per worker)")
+    _print_gd_summary("Gradient Descent", results_1ap["gd_1ap"])
+    _print_gs_summary("Grid Search", results_1ap["gs_1ap"])
+    _print_ga_summary("Genetic Algorithm", results_1ap["ga_1ap"])
 
     print("\n" + "=" * 80)
     print("2-AP SUMMARY")
@@ -782,14 +901,6 @@ if __name__ == "__main__":
     print(f"\nPool: {NUM_POOL_WORKERS} workers (Scene loaded once per worker)")
     _print_gd_summary("Gradient Descent", results_2ap["gd_2ap"])
     _print_gs_summary("Grid Search (alternating)", results_2ap["gs_2ap"])
-
-    # # Genetic Algorithm
-    # print(f"\nGenetic Algorithm ({ga_results['ga_params']['pop_size']} pop, "
-    #       f"{ga_results['ga_params']['n_gen']} gen):")
-    # print(f"  Best position:  {_fmt_pos(ga_results['best_position'])}")
-    # print(f"  Best direction: {_fmt_dir(ga_results.get('best_direction'))}")
-    # print(f"  Best Min RSS:   {ga_results['best_fitness_dbm']:.2f} dBm")
-    # print(f"  Total evals:    {ga_results['total_evaluations']}")
-    # print(f"  Wall-clock:     {ga_results['total_time']:.2f}s")
+    _print_ga_summary("Genetic Algorithm", results_2ap["ga_2ap"])
 
     ray.shutdown()

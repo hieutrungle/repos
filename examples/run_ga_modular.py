@@ -46,11 +46,23 @@ SCENE_PATH = (
     Path.home() / "blender" / "models" / "building_floor" / "building_floor.xml"
 )
 
-SCENE_CONFIG = {
+SCENE_CONFIG_1AP = {
     "scene_path": str(SCENE_PATH),
     "frequency": 5.18e9,
     "tx_power_dbm": 5.0,
 }
+
+FIXED_Z = 3.8
+INITIAL_AP_POSITIONS_2AP = [(7.0, 7.0), (23.0, 23.0)]
+
+SCENE_CONFIG_2AP = {
+    **SCENE_CONFIG_1AP,
+    "tx_positions": [
+        (pos[0], pos[1], FIXED_Z) for pos in INITIAL_AP_POSITIONS_2AP
+    ],
+}
+
+MIN_AP_SEPARATION = 5.0
 
 POSITION_BOUNDS = {
     "x_min": 5.0,
@@ -203,15 +215,23 @@ def _save_ga_results(results: dict, path: str) -> None:
         "best_individual": results["best_individual"],
         "best_fitness": results["best_fitness"],
         "best_fitness_dbm": results["best_fitness_dbm"],
-        "best_position": results["best_position"],
-        "best_direction": results.get("best_direction"),
         "optimize_orientation": results.get("optimize_orientation"),
+        "num_aps": results.get("num_aps", 1),
         "hall_of_fame": results["hall_of_fame"],
         "total_time": results["total_time"],
         "total_evaluations": results["total_evaluations"],
         "ga_params": results["ga_params"],
         "generation_details": results["generation_details"],
     }
+    # 1-AP fields
+    if "best_position" in results:
+        serializable["best_position"] = results["best_position"]
+        serializable["best_direction"] = results.get("best_direction")
+    # Multi-AP fields
+    if "best_positions" in results:
+        serializable["best_positions"] = results["best_positions"]
+        serializable["best_directions"] = results.get("best_directions")
+        serializable["best_ap_separation"] = results.get("best_ap_separation")
     with open(path, "w") as f:
         json.dump(serializable, f, indent=2, default=str)
     print(f"GA results saved to: {path}")
@@ -236,6 +256,20 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable orientation optimization (legacy 2-gene mode).",
     )
+    parser.add_argument(
+        "--num-aps",
+        type=int,
+        default=1,
+        choices=[1, 2],
+        help="Number of Access Points to optimise (1 or 2). Default: 1.",
+    )
+    parser.add_argument(
+        "--min-sep",
+        type=float,
+        default=None,
+        help="Minimum AP separation in metres (only for num_aps>=2). "
+             "Default: 2.0.",
+    )
     return parser.parse_args()
 
 
@@ -255,18 +289,29 @@ if __name__ == "__main__":
         ga_params["n_gen"] = args.n_gen
 
     optimize_orientation = not args.no_orientation
+    num_aps = args.num_aps
+    min_ap_separation = args.min_sep if args.min_sep is not None else MIN_AP_SEPARATION
+
+    # Select scene config based on num_aps
+    scene_config = SCENE_CONFIG_2AP if num_aps >= 2 else SCENE_CONFIG_1AP
 
     print("=" * 80)
     mode_label = "LOCAL (single-process)" if args.mode == "local" else "RAY (distributed)"
-    orient_label = "4D [x,y,dx,dy]" if optimize_orientation else "2D [x,y]"
-    print(f"MODULAR GA: {mode_label} | Chromosome: {orient_label}")
+    if num_aps == 1:
+        orient_label = "4D [x,y,dx,dy]" if optimize_orientation else "2D [x,y]"
+    else:
+        orient_label = (
+            f"{num_aps * 4}D [{num_aps}AP orient]" if optimize_orientation
+            else f"{num_aps * 2}D [{num_aps}AP pos-only]"
+        )
+    print(f"MODULAR GA: {mode_label} | Chromosome: {orient_label} | APs: {num_aps}")
     print("=" * 80)
 
     # -- Create executor ------------------------------------------------
     executor: Any  # LocalExecutor or RayActorPoolExecutor
     if args.mode == "local":
         executor = LocalExecutor(
-            scene_config=SCENE_CONFIG,
+            scene_config=scene_config,
             verbose=True,
         )
     else:
@@ -275,7 +320,7 @@ if __name__ == "__main__":
 
         ray.init(ignore_reinit_error=True)
         executor = RayActorPoolExecutor(
-            scene_config=SCENE_CONFIG,
+            scene_config=scene_config,
             num_workers=NUM_POOL_WORKERS,
             gpu_fraction=GPU_FRACTION,
             verbose=True,
@@ -284,9 +329,11 @@ if __name__ == "__main__":
     # -- Create GA runner -----------------------------------------------
     ga = GeneticAlgorithmRunner(
         position_bounds=POSITION_BOUNDS,
-        fixed_z=3.8,
+        fixed_z=FIXED_Z,
         executor_map=executor.map,
         optimize_orientation=optimize_orientation,
+        num_aps=num_aps,
+        min_ap_separation=min_ap_separation,
     )
 
     try:
@@ -316,11 +363,22 @@ if __name__ == "__main__":
 
         # -- Summary ----------------------------------------------------
         print(f"\nGenetic Algorithm ({ga_params['pop_size']} pop, "
-              f"{ga_params['n_gen']} gen, mode={args.mode}):")
-        print(f"  Best position:  {results['best_position']}")
-        bd = results.get("best_direction")
-        if bd:
-            print(f"  Best direction: ({bd[0]:+.4f}, {bd[1]:+.4f}, {bd[2]:+.4f})")
+              f"{ga_params['n_gen']} gen, mode={args.mode}, "
+              f"APs={num_aps}):")
+        if num_aps == 1:
+            print(f"  Best position:  {results['best_position']}")
+            bd = results.get("best_direction")
+            if bd:
+                print(f"  Best direction: ({bd[0]:+.4f}, {bd[1]:+.4f}, {bd[2]:+.4f})")
+        else:
+            for ap_idx in range(num_aps):
+                pos = results['best_positions'][ap_idx]
+                print(f"  AP{ap_idx} position:  ({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f})")
+                bd = results.get('best_directions')
+                if bd and bd[ap_idx]:
+                    d = bd[ap_idx]
+                    print(f"  AP{ap_idx} direction: ({d[0]:+.4f}, {d[1]:+.4f}, {d[2]:+.4f})")
+            print(f"  AP separation:  {results.get('best_ap_separation', 0):.2f}m")
         print(f"  Best Min RSS:   {results['best_fitness_dbm']:.2f} dBm")
         print(f"  Total evals:    {results['total_evaluations']}")
         print(f"  Wall-clock:     {results['total_time']:.2f}s")
