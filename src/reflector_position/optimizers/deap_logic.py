@@ -402,6 +402,7 @@ class GeneticAlgorithmRunner:
             for ind in penalised_inds:
                 ind.fitness.values = (PENALTY_FITNESS_LINEAR,)
                 ind.penalized = True
+                ind.best_coverage = 0.0
                 ind.best_directions = [None] * self.num_aps
                 ind.best_look_ats = [None] * self.num_aps
                 if not self.optimize_orientation:
@@ -417,6 +418,11 @@ class GeneticAlgorithmRunner:
             for ind, res in zip(valid_inds, results):
                 ind.fitness.values = (res["best_metric"],)
                 ind.penalized = False
+
+                # Extract coverage percentage from worker result
+                gs = res.get("grid_results", {})
+                cov_vals = gs.get("coverage_values", [])
+                ind.best_coverage = float(cov_vals[-1]) if cov_vals else 0.0
 
                 if self.num_aps == 1:
                     # ---- Single-AP attribute storage ------------------
@@ -579,6 +585,7 @@ class GeneticAlgorithmRunner:
             "max_dbm": record["max_dbm"],
             "mean_dbm": record["mean_dbm"],
             "std": record["std"],
+            "best_coverage": getattr(best_ind, "best_coverage", 0.0),
             "time": gen_time,
         }
         if self.num_aps == 1:
@@ -861,10 +868,12 @@ class GeneticAlgorithmRunner:
                     if getattr(ind, "penalized", False)
                 )
                 _sep_tag = f" | sep={sep:.1f}m pen={n_pen}"
+            _cov = getattr(best_ind, "best_coverage", 0.0)
             print(
                 f"  Gen  0 | evals={nevals:>3d} | "
                 f"best={record['max_dbm']:.2f} dBm | "
                 f"mean={record['mean_dbm']:.2f} dBm | "
+                f"cov={_cov:.1f}% | "
                 f"pos={self._fmt_best_pos(best_ind)}"
                 f"{_dir_tag}{_sep_tag} | "
                 f"time={gen_time:.1f}s"
@@ -930,10 +939,12 @@ class GeneticAlgorithmRunner:
                         if getattr(ind, "penalized", False)
                     )
                     _sep_tag = f" | sep={sep:.1f}m pen={n_pen}"
+                _cov = getattr(best_ind, "best_coverage", 0.0)
                 print(
                     f"  Gen {gen:>2d} | evals={nevals:>3d} | "
                     f"best={record['max_dbm']:.2f} dBm | "
                     f"mean={record['mean_dbm']:.2f} dBm | "
+                    f"cov={_cov:.1f}% | "
                     f"pos={self._fmt_best_pos(best_ind)}"
                     f"{_dir_tag}{_sep_tag} | "
                     f"time={gen_time:.1f}s"
@@ -950,6 +961,7 @@ class GeneticAlgorithmRunner:
             hof_entry: Dict[str, Any] = {
                 "fitness": float(ind.fitness.values[0]),
                 "fitness_dbm": _rss_watts_to_dbm(ind.fitness.values[0]),
+                "coverage": getattr(ind, "best_coverage", 0.0),
                 "chromosome": [float(g) for g in ind],
             }
             if self.num_aps == 1:
@@ -985,6 +997,7 @@ class GeneticAlgorithmRunner:
             "best_individual": _best_genes,
             "best_fitness": float(best_fitness),
             "best_fitness_dbm": _rss_watts_to_dbm(best_fitness),
+            "best_coverage": getattr(best, "best_coverage", 0.0),
             "optimize_orientation": self.optimize_orientation,
             "num_aps": self.num_aps,
             "hall_of_fame": hall_of_fame_list,
@@ -1081,6 +1094,7 @@ class GeneticAlgorithmRunner:
                     f"{results['best_ap_separation']:.2f}m"
                 )
             print(f"  Best Min RSS:  {results['best_fitness_dbm']:.2f} dBm")
+            print(f"  Coverage:      {results['best_coverage']:.1f}%")
             print(f"  Total evals:   {total_evaluations}")
             print(f"  Wall-clock:    {total_time:.2f}s")
             print("=" * 80)
@@ -1149,8 +1163,26 @@ class GeneticAlgorithmRunner:
             ax.set_ylim(rss_range_dbm[0], rss_range_dbm[1])
         ax.set_xlabel("Generation")
         ax.set_ylabel("Min RSS (dBm)")
+
+        # Coverage % on secondary y-axis
+        best_cov = [g.get("best_coverage", 0.0) for g in gen_details]
+        if any(c > 0 for c in best_cov):
+            ax2 = ax.twinx()
+            ax2.plot(
+                gens, best_cov, "g-s", markersize=2, linewidth=1.2,
+                alpha=0.8, label="Coverage %",
+            )
+            ax2.set_ylabel("Coverage (%)", color="green")
+            ax2.tick_params(axis="y", labelcolor="green")
+            ax2.set_ylim(0, 105)
+            # Combined legend
+            lines1, labels1 = ax.get_legend_handles_labels()
+            lines2, labels2 = ax2.get_legend_handles_labels()
+            ax.legend(lines1 + lines2, labels1 + labels2, loc="lower right")
+        else:
+            ax.legend()
+
         ax.set_title("Fitness Convergence")
-        ax.legend()
         ax.grid(True, alpha=0.3)
 
         # ---- Panel 2: Best position trajectory ------------------------
@@ -1411,6 +1443,7 @@ class GeneticAlgorithmRunner:
             f"\n"
             f"{pos_str}"
             f"Best Min RSS:  {results['best_fitness_dbm']:.2f} dBm\n"
+            f"Coverage:      {results.get('best_coverage', 0.0):.1f}%\n"
         )
         if num_aps >= 2:
             summary += (

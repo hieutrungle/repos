@@ -36,6 +36,7 @@ from ..metrics import (
     compute_min_rss_metric,
     compute_soft_min_rss_metric,
     normalized_softmin_loss,
+    differentiable_coverage_loss,
     compute_coverage_metric,
     rss_to_dbm,
 )
@@ -71,7 +72,7 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
         position_bounds: Optional[Dict[str, float]] = None,
         initial_directions_xy: Optional[List[Tuple[float, float]]] = None,
         initial_direction_xy: Optional[Tuple[float, float]] = None,
-        fixed_dir_z: float = -0.5,
+        fixed_dir_z: float = -0.3,
         optimize_orientation: bool = True,
         repulsion_weight: float = 1.0,
     ):
@@ -155,13 +156,17 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
         elif initial_direction_xy is not None:
             dir_inits = [initial_direction_xy] * self.num_aps
         else:
-            dir_inits = [(0.0, 0.0)] * self.num_aps
+            # Random initial direction per AP so each task explores differently
+            dir_inits = [
+                (np.random.uniform(-1.0, 1.0), np.random.uniform(-1.0, 1.0))
+                for _ in range(self.num_aps)
+            ]
 
         # Perturb near-zero directions to avoid NaN from atan2(0, 0)
         sanitised = []
         for dx0, dy0 in dir_inits:
             if abs(dx0) < 1e-6 and abs(dy0) < 1e-6:
-                dx0, dy0 = 1e-2, 1e-2
+                dx0, dy0 = np.random.uniform(-1.0, 1.0), np.random.uniform(-1.0, 1.0)
             sanitised.append([dx0, dy0])
 
         self.tx_dir_xy = torch.tensor(
@@ -183,7 +188,9 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
             "min_rss_dbm_values": [],   # scalar per iter
             "coverage_values": [],      # scalar per iter
             "losses": [],               # scalar per iter (total loss)
-            "coverage_losses": [],      # scalar per iter (coverage component)
+            "fairness_losses": [],      # scalar per iter (fairness/softmin component)
+            "coverage_obj_losses": [],  # scalar per iter (sigmoid coverage component)
+            "coverage_losses": [],      # scalar per iter (alpha*fairness + beta*coverage)
             "repulsion_losses": [],     # scalar per iter (repulsion component)
             "gradients": [],            # per-iter position gradients
             "direction_gradients": [],  # per-iter direction gradients
@@ -364,19 +371,35 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
         max_depth: int = 13,
         use_soft_min: bool = True,
         temperature: float = 0.1,
+        alpha: float = 0.6,
+        beta: float = 0.4,
+        coverage_threshold_dbm: float = -120.0,
+        coverage_temperature: float = 2.0,
     ) -> torch.Tensor:
         """
-        Compute the total loss for all APs (coverage + repulsion).
+        Compute the total loss for all APs (fairness + coverage + repulsion).
 
-        1. Positions and orientations of all ``num_aps`` transmitters are set
-           inside a ``@dr.wrap`` function so that DrJit traces the geometry
-           and gradients flow back to ``self.tx_x``, ``self.tx_y``, and
-           ``self.tx_dir_xy``.
-        2. ``RadioMapSolver`` computes a single sum-power radio map (Sionna
-           sums contributions from all active transmitters).
-        3. ``normalized_softmin_loss`` (or legacy hard-min) produces the
-           coverage loss from this combined map.
-        4. A pairwise repulsion loss is added (PyTorch-only, no DrJit).
+        The loss is a weighted composite of three terms:
+
+        1. **Fairness loss** (``alpha``): ``normalized_softmin_loss`` — maximises
+           the worst-case user RSSI via a differentiable soft-minimum.
+        2. **Coverage loss** (``beta``): ``differentiable_coverage_loss`` —
+           maximises the fraction of users above ``coverage_threshold_dbm``
+           using a smooth Sigmoid approximation.
+        3. **Repulsion loss** (multi-AP only): pairwise inverse-square penalty
+           to prevent APs from collapsing.
+
+        ``total_loss = alpha * fairness + beta * coverage + repulsion_weight * repulsion``
+
+        Args:
+            samples_per_tx: Number of ray samples per transmitter.
+            max_depth: Maximum ray tracing bounces.
+            use_soft_min: Use differentiable softmin for fairness (recommended).
+            temperature: Temperature for softmin fairness loss.
+            alpha: Weight for fairness loss.  Default 0.6.
+            beta: Weight for coverage loss.  Default 0.4.
+            coverage_threshold_dbm: Threshold for coverage objective (dBm).
+            coverage_temperature: Sigmoid sharpness for coverage loss.
 
         Returns:
             Scalar loss tensor to minimise.
@@ -438,16 +461,26 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
         # Cache for metric logging (avoids a second radio-map evaluation)
         self._last_rss = rss.detach().clone()
 
-        # ---- Coverage loss -----------------------------------------------
+        # ---- Fairness loss (soft-min of worst-case user) -----------------
         if use_soft_min:
-            coverage_loss = normalized_softmin_loss(
+            fairness_loss = normalized_softmin_loss(
                 rss.flatten().unsqueeze(0),
                 temperature=temperature,
             )
         else:
             min_rss = compute_min_rss_metric(rss)
             log_min_rss = rss_to_dbm(min_rss)
-            coverage_loss = -log_min_rss / 100.0
+            fairness_loss = -log_min_rss / 100.0
+
+        # ---- Coverage loss (sigmoid-smoothed coverage ratio) -------------
+        cov_loss = differentiable_coverage_loss(
+            rss,
+            threshold_dbm=coverage_threshold_dbm,
+            temperature=coverage_temperature,
+        )
+
+        # ---- Composite: alpha * fairness + beta * coverage ---------------
+        coverage_loss = alpha * fairness_loss + beta * cov_loss
 
         # ---- Repulsion loss (pure PyTorch, no DrJit) ---------------------
         if self.num_aps > 1 and self.repulsion_weight > 0:
@@ -458,6 +491,8 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
             total_loss = coverage_loss
 
         # Stash component values for logging
+        self._last_fairness_loss = float(fairness_loss.item())
+        self._last_coverage_obj_loss = float(cov_loss.item())
         self._last_coverage_loss = float(coverage_loss.item())
         self._last_repulsion_loss = float(repulsion_loss.item())
 
@@ -500,16 +535,30 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
         use_soft_min: bool = True,
         temperature: float = 0.2,
         coverage_threshold_dbm: float = -120.0,
+        alpha: float = 0.6,
+        beta: float = 0.4,
+        coverage_temperature: float = 2.0,
         verbose: bool = True,
     ) -> Tuple[np.ndarray, float]:
         """
         Run gradient descent optimisation for all APs simultaneously.
 
+        Args:
+            num_iterations: Number of gradient steps.
+            learning_rate: Base learning rate for position parameters.
+            samples_per_tx: Ray samples per transmitter per iteration.
+            max_depth: Maximum ray bounces.
+            use_soft_min: Use softmin for fairness loss (recommended).
+            temperature: Softmin temperature for fairness loss.
+            coverage_threshold_dbm: Coverage threshold in dBm.
+            alpha: Weight for fairness (softmin) loss.  Default 0.6.
+            beta: Weight for coverage (sigmoid) loss.  Default 0.4.
+            coverage_temperature: Sigmoid temperature for coverage loss.
+            verbose: Print per-iteration progress.
+
         Returns:
-            final_positions: ``[3]`` for single AP or ``[num_aps, 3]`` for
-                multi-AP.
-            final_min_rss: Best minimum RSS value (linear Watts) across all
-                iterations.
+            final_positions: ``[3]`` for single AP or ``[num_aps, 3]``.
+            final_min_rss: Best minimum RSS (linear Watts).
         """
         # ---- Parameter groups --------------------------------------------
         DIR_LR_MULTIPLIER = 10.0
@@ -550,7 +599,10 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
             print(f"  Samples per iteration: {samples_per_tx}")
             print(f"  Use soft minimum: {use_soft_min}")
             if use_soft_min:
-                print(f"  Temperature: {temperature}")
+                print(f"  Fairness temperature: {temperature}")
+            print(f"  Loss weights: alpha={alpha} (fairness), beta={beta} (coverage)")
+            print(f"  Coverage threshold: {coverage_threshold_dbm} dBm")
+            print(f"  Coverage temperature: {coverage_temperature}")
             print("-" * 80)
 
         start_time = time.time()
@@ -565,6 +617,10 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
                 max_depth=max_depth,
                 use_soft_min=use_soft_min,
                 temperature=temperature,
+                alpha=alpha,
+                beta=beta,
+                coverage_threshold_dbm=coverage_threshold_dbm,
+                coverage_temperature=coverage_temperature,
             )
 
             # ---- Detached radio-map for metrics --------------------------
@@ -692,6 +748,8 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
             self.history["min_rss_dbm_values"].append(min_rss_dbm.item())
             self.history["coverage_values"].append(coverage.item())
             self.history["losses"].append(loss.item())
+            self.history["fairness_losses"].append(self._last_fairness_loss)
+            self.history["coverage_obj_losses"].append(self._last_coverage_obj_loss)
             self.history["coverage_losses"].append(self._last_coverage_loss)
             self.history["repulsion_losses"].append(self._last_repulsion_loss)
             self.history["ap_distances"].append(ap_dists)
@@ -710,7 +768,11 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
                     parts.append(f"Dist:{dist_str}m")
                 parts.append(f"MinRSS:{min_rss_dbm:.2f}dBm")
                 parts.append(f"Cov:{coverage:.1f}%")
-                parts.append(f"Loss:{loss.item():.2e}")
+                parts.append(
+                    f"Loss:{loss.item():.2e}"
+                    f"(Fair:{self._last_fairness_loss:.2e},"
+                    f"Cov:{self._last_coverage_obj_loss:.2e})"
+                )
                 if self.num_aps > 1:
                     parts.append(f"Rep:{self._last_repulsion_loss:.2e}")
                 pos_grad_norm = float(np.sqrt(np.sum(grad_x ** 2 + grad_y ** 2)))

@@ -22,6 +22,7 @@ from .metrics import (
     compute_soft_min_rss_metric,
     normalized_softmin_loss,
     compute_coverage_metric,
+    differentiable_coverage_loss,
     rss_to_dbm,
     dbm_to_rss,
 )
@@ -51,6 +52,7 @@ __all__ = [
     "compute_soft_min_rss_metric",
     "normalized_softmin_loss",
     "compute_coverage_metric",
+    "differentiable_coverage_loss",
     "rss_to_dbm",
     "dbm_to_rss",
     # Utils

@@ -17,7 +17,7 @@ import torch
 # ---------------------------------------------------------------------------
 # Global epsilon — single source of truth for all power-floor comparisons
 # ---------------------------------------------------------------------------
-POWER_EPSILON: float = 1e-15
+POWER_EPSILON: float = 1e-16
 """Minimum receivable power (Watts).  Values below this are treated as
 numerical noise and excluded from optimisation metrics.  Also added inside
 ``log10`` / ``log`` calls to prevent ``-inf``."""
@@ -217,3 +217,66 @@ def normalized_softmin_loss(
 
     # -- Step 4: Mean over batch -------------------------------------------
     return loss_per_sample.mean()
+
+
+# ---------------------------------------------------------------------------
+# Differentiable Coverage Loss (Sigmoid approximation)
+# ---------------------------------------------------------------------------
+
+def differentiable_coverage_loss(
+    rssi_watts: torch.Tensor,
+    threshold_dbm: float = -120.0,
+    temperature: float = 2.0,
+) -> torch.Tensor:
+    """Smooth, differentiable loss for maximising coverage percentage.
+
+    Approximates the hard indicator ``1[RSSI > threshold]`` with a
+    **Sigmoid** function so that gradients are non-zero near the threshold.
+    This allows gradient-descent to *push* users whose signal strength is
+    just below the threshold over the line.
+
+    **Why not ``compute_coverage_metric``?**
+    That function uses a hard ``(rss > threshold).float()`` step whose
+    gradient is identically **zero** everywhere—useless for optimisation.
+
+    Pipeline::
+
+        Watts ──► dBm (ε-safe) ──► diff = dBm − threshold
+              ──► σ(diff / τ) ──► mean ──► 1 − mean  (loss)
+
+    Args:
+        rssi_watts: Tensor of received power **in linear Watts**.  Any shape;
+            will be flattened internally.  Values ≤ ``POWER_EPSILON`` are
+            kept (sigmoid maps them close to 0 automatically).
+        threshold_dbm: Target coverage threshold in dBm (default −120).
+        temperature: Sigmoid sharpness.  Low (0.1) ≈ hard step (vanishing
+            gradient); high (2–5) ≈ smooth slope (better for learning).
+            Default **2.0** is a good starting point.
+
+    Returns:
+        Scalar loss to **minimise** (``1.0 − soft_coverage_ratio``).
+        Range ≈ [0, 1].  Lower ⇒ more users above threshold.
+
+    Example::
+
+        >>> rssi = torch.tensor([1e-11, 1e-12, 1e-13, 1e-15])
+        >>> loss = differentiable_coverage_loss(rssi, threshold_dbm=-120.0)
+        >>> loss.backward()          # gradients flow cleanly
+    """
+    # Flatten to 1-D
+    rssi_flat = rssi_watts.flatten()
+
+    # Watts → dBm with epsilon safety
+    rssi_dbm = 10.0 * torch.log10(rssi_flat + POWER_EPSILON) + 30.0
+
+    # Distance from threshold (positive = covered)
+    diff = rssi_dbm - threshold_dbm
+
+    # Sigmoid soft-count: ≈1 if covered, ≈0 if not
+    soft_coverage_mask = torch.sigmoid(diff / temperature)
+
+    # Soft coverage ratio
+    soft_coverage_ratio = torch.mean(soft_coverage_mask)
+
+    # Return loss to minimise (1 − coverage)
+    return 1.0 - soft_coverage_ratio
