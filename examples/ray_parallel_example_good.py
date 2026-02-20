@@ -26,7 +26,6 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import ray
@@ -125,8 +124,6 @@ def example_parallel_gradient_descent(
     samples_per_tx: int = 1_000_000,
     output_dir: str = OUTPUT_DIR,
     scene_config: dict = None,
-    random_seed: int = RANDOM_SEED,
-    optimization_overrides: Optional[dict] = None,
 ):
     """
     Run gradient descent trajectories using a pool of reusable workers.
@@ -141,7 +138,7 @@ def example_parallel_gradient_descent(
     print(f"Parallel Gradient Descent — {num_aps} AP(s), {num_tasks} tasks")
     print("=" * 80)
 
-    rng = np.random.default_rng(random_seed)
+    rng = np.random.default_rng(RANDOM_SEED)
 
     if num_aps == 1:
         # Single-AP: one random starting position per task
@@ -149,7 +146,7 @@ def example_parallel_gradient_descent(
             num_positions=num_tasks,
             bounds=POSITION_BOUNDS,
             fixed_z=3.8,
-            seed=random_seed,
+            seed=RANDOM_SEED,
         )
         print(f"\nPool: {parallel_opt.num_workers} workers | Tasks: {num_tasks}")
         print(f"\nGenerated {num_tasks} initial positions:")
@@ -201,8 +198,6 @@ def example_parallel_gradient_descent(
         "alpha": 0.9,  # coverage loss weight
         "beta": 0.1,   # Sigmoid temperature for coverage loss.
     }
-    if optimization_overrides:
-        optimization_params.update(optimization_overrides)
 
     # Run all tasks through the pool
     results = parallel_opt.run(
@@ -468,7 +463,6 @@ def example_deap_ga_1ap(
     ga_executor: RayActorPoolExecutor,
     ga_params: dict = None,
     output_dir: str = OUTPUT_DIR,
-    random_seed: int = RANDOM_SEED,
 ) -> dict:
     """
     Run a 1-AP Genetic Algorithm (4-gene chromosome ``[x, y, dx, dy]``).
@@ -503,7 +497,7 @@ def example_deap_ga_1ap(
     results = ga_runner.run(
         optimization_params=OPTIMIZATION_PARAMS,
         ga_params=ga_params,
-        seed=random_seed,
+        seed=RANDOM_SEED,
         verbose=True,
     )
 
@@ -527,7 +521,6 @@ def example_deap_ga_2ap(
     ga_params: dict = None,
     min_ap_separation: float = 5.0,
     output_dir: str = OUTPUT_DIR,
-    random_seed: int = RANDOM_SEED,
 ) -> dict:
     """
     Run a 2-AP Genetic Algorithm (8-gene chromosome
@@ -566,7 +559,7 @@ def example_deap_ga_2ap(
     results = ga_runner.run(
         optimization_params=OPTIMIZATION_PARAMS,
         ga_params=ga_params,
-        seed=random_seed,
+        seed=RANDOM_SEED,
         verbose=True,
     )
 
@@ -727,11 +720,6 @@ def run_all_1ap(
     output_dir: str = OUTPUT_DIR,
     num_pool_workers: int = NUM_POOL_WORKERS,
     gpu_fraction: float = GPU_FRACTION,
-    random_seed: int = RANDOM_SEED,
-    gd_num_tasks: int = 100,
-    gd_num_iterations: int = 50,
-    gd_optimization_overrides: Optional[dict] = None,
-    ga_params: Optional[dict] = None,
 ) -> dict:
     """
     Run all 1-AP experiments: Gradient Descent + Grid Search + GA.
@@ -766,12 +754,10 @@ def run_all_1ap(
         all_results["gd_1ap"] = example_parallel_gradient_descent(
             parallel_opt,
             num_aps=1,
-            num_tasks=gd_num_tasks,
-            num_iterations=gd_num_iterations,
+            num_tasks=100,
+            num_iterations=50,
             output_dir=output_dir,
             scene_config=SCENE_CONFIG,
-            random_seed=random_seed,
-            optimization_overrides=gd_optimization_overrides,
         )
 
         all_results["gs_1ap"] = example_parallel_grid_search(
@@ -794,9 +780,7 @@ def run_all_1ap(
     try:
         all_results["ga_1ap"] = example_deap_ga_1ap(
             ga_executor,
-            ga_params=ga_params,
             output_dir=output_dir,
-            random_seed=random_seed,
         )
     finally:
         ga_executor.shutdown()
@@ -811,14 +795,6 @@ def run_all_2ap(
     output_dir: str = OUTPUT_DIR,
     num_pool_workers: int = NUM_POOL_WORKERS,
     gpu_fraction: float = GPU_FRACTION,
-    random_seed: int = RANDOM_SEED,
-    gd_num_tasks: int = 100,
-    gd_num_iterations: int = 50,
-    gd_repulsion_weight: float = 0.3,
-    gd_samples_per_tx: int = 1_000_000,
-    gd_optimization_overrides: Optional[dict] = None,
-    ga_params: Optional[dict] = None,
-    ga_min_ap_separation: float = 5.0,
 ) -> dict:
     """
     Run all 2-AP experiments: Gradient Descent + Grid Search (alternating) + GA.
@@ -853,14 +829,12 @@ def run_all_2ap(
         all_results["gd_2ap"] = example_parallel_gradient_descent(
             parallel_opt,
             num_aps=2,
-            num_tasks=gd_num_tasks,
-            num_iterations=gd_num_iterations,
-            repulsion_weight=gd_repulsion_weight,
-            samples_per_tx=gd_samples_per_tx,
+            num_tasks=100,
+            num_iterations=50,
+            repulsion_weight=0.3,
+            samples_per_tx=1_000_000,
             output_dir=output_dir,
             scene_config=SCENE_CONFIG_2AP,
-            random_seed=random_seed,
-            optimization_overrides=gd_optimization_overrides,
         )
 
         all_results["gs_2ap"] = example_parallel_grid_search_2ap(
@@ -884,10 +858,8 @@ def run_all_2ap(
     try:
         all_results["ga_2ap"] = example_deap_ga_2ap(
             ga_executor_2ap,
-            ga_params=ga_params,
-            min_ap_separation=ga_min_ap_separation,
+            min_ap_separation=5.0,
             output_dir=output_dir,
-            random_seed=random_seed,
         )
     finally:
         ga_executor_2ap.shutdown()
