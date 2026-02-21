@@ -1,0 +1,79 @@
+{
+  "shared": {
+    "num_pool_workers": 2,
+    "gpu_fraction": 0.5,
+    "gd_num_tasks": 100,
+    "gd_num_iterations": 50,
+    "gd_samples_per_tx": 1000000,
+    "gd_repulsion_weight": 0.2,
+    "ga_min_ap_separation": 4.0
+  },
+  "trials": [
+    {
+      "name": "gd_2ap_seed4_baseline",
+      "method": "gd",
+      "mode": "2ap",
+      "random_seed": 4,
+      "gd_optimization_overrides": {
+        "learning_rate": 0.5,
+        "temperature": 0.15,
+        "alpha": 0.9,
+        "beta": 0.1
+      }
+    },
+    {
+      "name": "ga_2ap_seed4_baseline",
+      "method": "ga",
+      "mode": "2ap",
+      "random_seed": 4,
+      "ga_params": {
+        "pop_size": 150,
+        "n_gen": 50,
+        "cxpb": 0.7,
+        "mutpb": 0.3,
+        "tournsize": 10,
+        "cx_alpha": 0.5,
+        "mut_mu": 0.0,
+        "mut_sigma": 2.0,
+        "mut_sigma_pos": 2.0,
+        "mut_sigma_dir": 0.3,
+        "mut_indpb": 0.2,
+        "hof_size": 5
+      }
+    }
+  ],
+  "sweep_groups": [
+    {
+      "name_prefix": "gd2ap_lr_temp",
+      "method": "gd",
+      "mode": "2ap",
+      "random_seed": [51, 52, 53, 54, 55],
+      "grid": {
+        "gd_optimization_overrides.learning_rate": [0.3, 0.5, 0.7],
+        "gd_optimization_overrides.temperature": [0.1, 0.15, 0.2],
+        "gd_optimization_overrides.alpha": [0.95],
+        "gd_optimization_overrides.beta": [0.05]
+      }
+    },
+    {
+      "name_prefix": "ga2ap_pop_mut",
+      "method": "ga",
+      "mode": "2ap",
+      "random_seed": [51, 52, 53, 54, 55],
+      "grid": {
+        "ga_params.pop_size": [150, 200],
+        "ga_params.n_gen": [50, 60],
+        "ga_params.mutpb": [0.3, 0.35]
+      }
+    },
+    {
+      "name_prefix": "gs1ap_resolution",
+      "method": "gs",
+      "mode": "1ap",
+      "random_seed": [51],
+      "grid": {
+        "gs_grid_resolution": [0.5, 1.0]
+      }
+    }
+  ]
+}

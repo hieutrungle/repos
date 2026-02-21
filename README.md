@@ -178,6 +178,7 @@ See the `examples/` directory for complete examples:
 - `examples/full_comparison.py`: Compare grid search vs gradient descent
 - `examples/ray_parallel_example.py`: Ray-parallel gradient descent (64 tasks) and grid search (441 points) via ActorPool
 - `examples/run_ga_modular.py`: **Modular GA** — DEAP genetic algorithm with Ray-parallel fitness evaluation (IoC pattern)
+- `examples/ray_experiment_runner.py`: Unified Ray runner for hyperparameter sweeps across GD / GS / GA (one method per trial)
 
 Run examples:
 
@@ -186,7 +187,51 @@ python examples/quick_test.py
 python examples/full_comparison.py
 python examples/ray_parallel_example.py
 python examples/run_ga_modular.py
+python examples/ray_experiment_runner.py --config examples/ray_experiment_runner_config.example.json
 ```
+
+## Ray Runner (Unified)
+
+`examples/ray_experiment_runner.py` is the single entrypoint for Ray-based hyperparameter automation.
+
+- Runs one method per trial (`gd`, `gs`, or `ga`), avoiding repeated execution of unrelated methods
+- Supports explicit trials and automatic hyperparameter sweeps via `sweep_groups`
+- Saves per-trial logs and consolidated summaries (`summary.csv`, `summary.json`, `all_trials_detailed.json`)
+
+### Step 1: Generate explicit trial config (recommended)
+
+```bash
+python examples/ray_experiment_runner.py \
+    --config examples/ray_experiment_runner_config.example.json \
+    --generate-only \
+    --generated-config results/generated_trials.json
+```
+
+### Step 2: Run hyperparameter optimization
+
+Using the original config:
+
+```bash
+python examples/ray_experiment_runner.py \
+    --config examples/ray_experiment_runner_config.example.json \
+    --output-root results/experiments
+```
+
+Using the generated explicit trial config:
+
+```bash
+python examples/ray_experiment_runner.py \
+    --config results/generated_trials.json \
+    --output-root results/experiments
+```
+
+### Output location
+
+Each run is stored under:
+
+- `results/experiments/ray_experiments_<timestamp>/`
+
+For full configuration details and tuning patterns, see [docs/guides/RAY_EXPERIMENT_RUNNER.md](docs/guides/RAY_EXPERIMENT_RUNNER.md).
 
 ## Project Structure
 
@@ -570,6 +615,7 @@ pytest
 - **Installation**: See [docs/guides/INSTALL.md](docs/guides/INSTALL.md)
 - **Usage Guide**: See [docs/guides/USAGE.md](docs/guides/USAGE.md)
 - **Quick Reference**: See [docs/guides/QUICKREF.md](docs/guides/QUICKREF.md)
+- **Ray Experiment Runner**: See [docs/guides/RAY_EXPERIMENT_RUNNER.md](docs/guides/RAY_EXPERIMENT_RUNNER.md)
 
 ### Architecture & Structure
 - **Project Structure**: See [docs/architecture/PROJECT_STRUCTURE.md](docs/architecture/PROJECT_STRUCTURE.md)

@@ -10,6 +10,7 @@ User-focused guides for installation, usage, and quick reference:
 - **[INSTALL.md](guides/INSTALL.md)** - Installation instructions and dependency setup
 - **[USAGE.md](guides/USAGE.md)** - Detailed usage guide with examples
 - **[QUICKREF.md](guides/QUICKREF.md)** - Quick reference for common tasks
+- **[RAY_EXPERIMENT_RUNNER.md](guides/RAY_EXPERIMENT_RUNNER.md)** - Unified Ray workflow for config generation and single-method hyperparameter tuning
 
 ### 🏗️ Architecture (Project Structure)
 Technical documentation about the codebase:
@@ -48,6 +49,7 @@ Comprehensive testing documentation and guides:
 - **Install the package** → [guides/INSTALL.md](guides/INSTALL.md)
 - **Run an optimization** → [guides/USAGE.md](guides/USAGE.md)
 - **Use parallel optimization (Ray)** → [methodology/RAY_PARALLEL_GUIDE.md](methodology/RAY_PARALLEL_GUIDE.md)
+- **Run unified Ray hyperparameter tuning** → [guides/RAY_EXPERIMENT_RUNNER.md](guides/RAY_EXPERIMENT_RUNNER.md)
 - **Run genetic algorithm (DEAP)** → [methodology/GA_DEAP_IMPLEMENTATION.md](methodology/GA_DEAP_IMPLEMENTATION.md)
 - **Test the code** → [tests/README.md](tests/README.md)
 - **Understand the code structure** → [architecture/PROJECT_STRUCTURE.md](architecture/PROJECT_STRUCTURE.md)
@@ -104,6 +106,7 @@ See the [examples/](../examples/) directory for:
 - `quick_test.py` - Fast gradient descent test
 - `full_comparison.py` - Compare grid search vs gradient descent
 - `ray_parallel_example.py` - Ray-parallel gradient descent (64 tasks) and grid search (441 points) via ActorPool
+- `ray_experiment_runner.py` - Unified runner for GD/GS/GA hyperparameter sweeps (one method per trial)
 - `run_ga_modular.py` - **Modular GA** — DEAP genetic algorithm with Ray-parallel fitness evaluation (IoC pattern)
 - `config_example.py` - Configuration template
 
