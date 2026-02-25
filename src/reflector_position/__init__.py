@@ -16,6 +16,7 @@ from .optimizers import (
     create_optimizer,
 )
 from .scene_setup import setup_building_floor_scene, create_camera
+from .reflector_model import ReflectorController, create_flat_reflector_mesh
 from .metrics import (
     POWER_EPSILON,
     compute_min_rss_metric,
@@ -46,6 +47,9 @@ __all__ = [
     # Scene setup
     "setup_building_floor_scene",
     "create_camera",
+    # Reflector
+    "ReflectorController",
+    "create_flat_reflector_mesh",
     # Metrics
     "POWER_EPSILON",
     "compute_min_rss_metric",
