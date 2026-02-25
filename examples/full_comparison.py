@@ -34,10 +34,14 @@ from pathlib import Path
 
 import numpy as np
 
+import sionna.rt
+from sionna.rt import RadioMapSolver
+
 from reflector_position import (
     setup_building_floor_scene,
     OptimizerFactory,
     rss_to_dbm,
+    ReflectorController,
 )
 from reflector_position.optimizers.grid_search import (
     generate_grid_positions,
@@ -66,6 +70,7 @@ RT_PARAMS = {
 }
 
 OUTPUT_DIR = "results/full_comparison"
+VERIFICATION_DIR = "results/verification"
 
 # 2-AP alternating optimisation defaults
 ALTERNATING_ROUNDS = 2  # number of full AP1→AP2 sweeps
@@ -458,6 +463,181 @@ def run_grid_search_2ap(
     return result_info
 
 
+# -- Reflector integration verification ----------------------------------------
+
+def run_reflector_verification(verbose: bool = True):
+    """Visual verification of reflector integration into the scene.
+
+    Creates two scenes (with and without the reflector), computes radio
+    maps for both, and renders four images:
+
+    1. ``scene_no_reflector.png``  — geometry only, baseline
+    2. ``scene_with_reflector.png`` — geometry with reflector visible
+    3. ``coverage_no_reflector.png``  — radio map overlay, baseline
+    4. ``coverage_with_reflector.png`` — radio map overlay with reflector
+
+    All outputs are written to ``VERIFICATION_DIR``.
+    """
+    os.makedirs(VERIFICATION_DIR, exist_ok=True)
+
+    # Camera -------------------------------------------------------------------
+    cam = sionna.rt.Camera(position=[20, 20, 60],
+                           look_at=[20, 20.1, 1.5])
+
+    # Reflector wall bounding box:
+    # Two corner points define the area the reflector can slide on.
+    # u ∈ [0,1] sweeps horizontally (left→right), v ∈ [0,1] vertically (bottom→top).
+    wall_top_left     = [15.0, 34.0, 3.0]   # (x1, y1, z_top)
+    wall_bottom_right = [34.0, 34.0, 1.0]   # (x2, y2, z_bottom)
+
+    # Radio-map solver parameters (lighter than optimisation runs)
+    rm_samples = 500_000
+    rm_depth   = 13
+
+    # ==================================================================
+    # A. Baseline scene — NO reflector
+    # ==================================================================
+    if verbose:
+        print("\n" + "=" * 80)
+        print("REFLECTOR VERIFICATION — setting up baseline scene (no reflector)")
+        print("=" * 80)
+
+    scene_base = setup_building_floor_scene(
+        scene_path=str(SCENE_PATH),
+        frequency=5.18e9,
+        tx_power_dbm=5.0,
+        reflector_enabled=False,
+    )
+
+    # Render geometry ----------------------------------------------------------
+    if verbose:
+        print("  Rendering baseline geometry ...")
+    scene_base.render_to_file(
+        camera=cam,
+        filename=os.path.join(VERIFICATION_DIR, "scene_no_reflector.png"),
+        resolution=(1280, 960),
+        num_samples=512,
+        show_devices=True,
+        show_orientations=True,
+    )
+    if verbose:
+        print("    -> saved scene_no_reflector.png")
+
+    # Compute radio map --------------------------------------------------------
+    if verbose:
+        print("  Computing baseline radio map ...")
+    rm_solver = RadioMapSolver()
+    rm_base = rm_solver(
+        scene_base,
+        cell_size=(1.0, 1.0),
+        samples_per_tx=rm_samples,
+        max_depth=rm_depth,
+        refraction=True,
+        diffraction=True,
+    )
+
+    # Render coverage ----------------------------------------------------------
+    if verbose:
+        print("  Rendering baseline coverage map ...")
+    scene_base.render_to_file(
+        camera=cam,
+        filename=os.path.join(VERIFICATION_DIR, "coverage_no_reflector.png"),
+        resolution=(1280, 960),
+        num_samples=512,
+        radio_map=rm_base,
+        rm_metric="rss",
+        rm_db_scale=True,
+        show_devices=True,
+        show_orientations=True,
+    )
+    if verbose:
+        print("    -> saved coverage_no_reflector.png")
+
+    # ==================================================================
+    # B. Scene WITH reflector
+    # ==================================================================
+    if verbose:
+        print("\n" + "=" * 80)
+        print("REFLECTOR VERIFICATION — setting up scene WITH reflector")
+        print("=" * 80)
+
+    scene_refl, reflector_ctrl = setup_building_floor_scene(
+        scene_path=str(SCENE_PATH),
+        frequency=5.18e9,
+        tx_power_dbm=5.0,
+        reflector_enabled=True,
+        reflector_size=(2.0, 2.0),
+        wall_top_left=wall_top_left,
+        wall_bottom_right=wall_bottom_right,
+        focal_point=[10.0, 20.0, 1.5],  # aim reflected energy toward the Rx
+        device="cpu",  # verification runs on CPU; no GPU optimiser needed
+    )
+
+    # Place reflector at u=0.5, v=0.5 (centre of wall patch) and orient it
+    reflector_ctrl.u = reflector_ctrl._to_tensor(np.array(1.0))
+    reflector_ctrl.v = reflector_ctrl._to_tensor(np.array(0.5))
+    reflector_ctrl.orient_to_target()   # orient toward focal_point using Tx
+    reflector_ctrl.apply_to_scene()     # push into Mitsuba scene graph
+
+    if verbose:
+        print(f"  Reflector state:\n{reflector_ctrl}")
+
+    # Render geometry ----------------------------------------------------------
+    if verbose:
+        print("  Rendering scene with reflector ...")
+    scene_refl.render_to_file(
+        camera=cam,
+        filename=os.path.join(VERIFICATION_DIR, "scene_with_reflector.png"),
+        resolution=(1280, 960),
+        num_samples=512,
+        show_devices=True,
+        show_orientations=True,
+    )
+    if verbose:
+        print("    -> saved scene_with_reflector.png")
+
+    # Compute radio map --------------------------------------------------------
+    if verbose:
+        print("  Computing radio map with reflector ...")
+    rm_refl = rm_solver(
+        scene_refl,
+        cell_size=(1.0, 1.0),
+        samples_per_tx=rm_samples,
+        max_depth=rm_depth,
+        refraction=True,
+        diffraction=True,
+    )
+
+    # Render coverage ----------------------------------------------------------
+    if verbose:
+        print("  Rendering coverage map with reflector ...")
+    scene_refl.render_to_file(
+        camera=cam,
+        filename=os.path.join(VERIFICATION_DIR, "coverage_with_reflector.png"),
+        resolution=(1280, 960),
+        num_samples=512,
+        radio_map=rm_refl,
+        rm_metric="rss",
+        rm_db_scale=True,
+        show_devices=True,
+        show_orientations=True,
+    )
+    if verbose:
+        print("    -> saved coverage_with_reflector.png")
+
+    # Summary ------------------------------------------------------------------
+    if verbose:
+        print("\n" + "-" * 80)
+        print(f"  Verification images saved to: {VERIFICATION_DIR}/")
+        print("    - scene_no_reflector.png")
+        print("    - scene_with_reflector.png")
+        print("    - coverage_no_reflector.png")
+        print("    - coverage_with_reflector.png")
+        print("-" * 80)
+
+    return scene_base, scene_refl, reflector_ctrl
+
+
 # -- Comparison and reporting --------------------------------------------------
 
 def _fmt_dir(d):
@@ -480,6 +660,11 @@ def _fmt_pos(p):
 
 
 def main():
+    # ==================================================================
+    # 0. REFLECTOR INTEGRATION VERIFICATION
+    # ==================================================================
+    run_reflector_verification(verbose=True)
+
     # ==================================================================
     # 1-AP RUNS (scene with 1 transmitter)
     # ==================================================================
