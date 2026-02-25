@@ -70,9 +70,9 @@ SCENE_CONFIG_2AP = {
 # Search space bounds (same as optimizer_factory_example.py)
 POSITION_BOUNDS = {
     "x_min": 5.5,
-    "x_max": 24.5,
+    "x_max": 34.5,
     "y_min": 5.5,
-    "y_max": 24.5,
+    "y_max": 34.5,
 }
 
 OUTPUT_DIR = "results/ray_parallel"
