@@ -34,6 +34,7 @@ from .base_optimizer import BaseAPOptimizer
 from ..metrics import (
     POWER_EPSILON,
     compute_min_rss_metric,
+    compute_p5_rss_metric,
     compute_soft_min_rss_metric,
     normalized_softmin_loss,
     differentiable_coverage_loss,
@@ -184,8 +185,8 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
             "positions": [],            # per-iter AP positions
             "directions": [],           # per-iter AP directions (normalised)
             "look_at_targets": [],      # per-iter AP look-at points
-            "min_rss_values": [],       # scalar per iter
-            "min_rss_dbm_values": [],   # scalar per iter
+            "min_rss_values": [],       # scalar per iter (5th-percentile RSS)
+            "min_rss_dbm_values": [],   # scalar per iter (5th-percentile RSS in dBm)
             "coverage_values": [],      # scalar per iter
             "losses": [],               # scalar per iter (total loss)
             "fairness_losses": [],      # scalar per iter (fairness/softmin component)
@@ -468,9 +469,9 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
                 temperature=temperature,
             )
         else:
-            min_rss = compute_min_rss_metric(rss)
-            log_min_rss = rss_to_dbm(min_rss)
-            fairness_loss = -log_min_rss / 100.0
+            p5_rss = compute_p5_rss_metric(rss)
+            log_p5_rss = rss_to_dbm(p5_rss)
+            fairness_loss = -log_p5_rss / 100.0
 
         # ---- Coverage loss (sigmoid-smoothed coverage ratio) -------------
         cov_loss = differentiable_coverage_loss(
@@ -558,7 +559,7 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
 
         Returns:
             final_positions: ``[3]`` for single AP or ``[num_aps, 3]``.
-            final_min_rss: Best minimum RSS (linear Watts).
+            final_min_rss: Best 5th-percentile RSS (linear Watts).
         """
         # ---- Parameter groups --------------------------------------------
         DIR_LR_MULTIPLIER = 10.0
@@ -718,7 +719,7 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
                         print(f"WARNING: NaN position at iteration {iteration + 1}, reset")
 
             # ---- Metrics -------------------------------------------------
-            min_rss = compute_min_rss_metric(rss.cpu())
+            min_rss = compute_p5_rss_metric(rss.cpu())
             min_rss_dbm = rss_to_dbm(min_rss)
             coverage = compute_coverage_metric(rss, coverage_threshold_dbm)
 
@@ -766,7 +767,7 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
                 if self.num_aps > 1 and ap_dists:
                     dist_str = ",".join(f"{d:.1f}" for d in ap_dists)
                     parts.append(f"Dist:{dist_str}m")
-                parts.append(f"MinRSS:{min_rss_dbm:.2f}dBm")
+                parts.append(f"P5RSS:{min_rss_dbm:.2f}dBm")
                 parts.append(f"Cov:{coverage:.1f}%")
                 parts.append(
                     f"Loss:{loss.item():.2e}"
@@ -822,10 +823,10 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
             if self.history["min_rss_values"]:
                 best_idx = int(np.argmax(self.history["min_rss_values"]))
                 print(f"  Best iteration: {best_idx + 1}")
-                print(f"  Best Min RSS: {self.history['min_rss_dbm_values'][best_idx]:.2f} dBm")
-            print(f"  Initial Min RSS: {self.history['min_rss_dbm_values'][0]:.2f} dBm")
+                print(f"  Best P5 RSS: {self.history['min_rss_dbm_values'][best_idx]:.2f} dBm")
+            print(f"  Initial P5 RSS: {self.history['min_rss_dbm_values'][0]:.2f} dBm")
             final_min_rss_dbm = rss_to_dbm(torch.tensor(final_min_rss)).item()
-            print(f"  Final Min RSS: {final_min_rss_dbm:.2f} dBm")
+            print(f"  Final P5 RSS: {final_min_rss_dbm:.2f} dBm")
             print(
                 f"  Improvement: "
                 f"{self.history['min_rss_dbm_values'][-1] - self.history['min_rss_dbm_values'][0]:.2f} dB"
@@ -894,12 +895,12 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
         ax.grid(True, alpha=0.3)
         ax.set_aspect("equal", adjustable="box")
 
-        # --- 2. Min RSS over iterations ---
+        # --- 2. P5 RSS over iterations ---
         ax = axes[1]
         ax.plot(self.history["min_rss_dbm_values"], "b-", linewidth=2)
         ax.set_xlabel("Iteration")
-        ax.set_ylabel("Min RSS (dBm)")
-        ax.set_title("Minimum RSS Evolution (Sum-Power)" if N > 1 else "Minimum RSS Evolution")
+        ax.set_ylabel("5th Percentile RSS (dBm)")
+        ax.set_title("5th Percentile RSS Evolution (Sum-Power)" if N > 1 else "5th Percentile RSS Evolution")
         ax.grid(True, alpha=0.3)
 
         # --- 3. Coverage ---

@@ -28,8 +28,10 @@ def compute_min_rss_metric(rss_map: torch.Tensor) -> torch.Tensor:
     """
     Compute the minimum RSS value in the radio map (in linear scale).
 
-    This is the optimization objective: we want to maximize the minimum RSS
-    to improve worst-case coverage.
+    .. deprecated::
+        Use :func:`compute_p5_rss_metric` instead.  The hard minimum is
+        dominated by dead-zone artefacts (e.g. reflector shadows) and is
+        no longer used as the primary optimisation objective.
 
     Args:
         rss_map: Radio map RSS tensor (in Watts) - PyTorch tensor
@@ -46,6 +48,34 @@ def compute_min_rss_metric(rss_map: torch.Tensor) -> torch.Tensor:
 
     # Return minimum RSS (we want to maximize this)
     return torch.min(valid_rss)
+
+
+def compute_p5_rss_metric(rss_map: torch.Tensor) -> torch.Tensor:
+    """
+    Compute the 5th-percentile RSS value in the radio map (linear Watts).
+
+    This is the **primary optimisation objective**: maximise the 5th-percentile
+    RSS to improve worst-case coverage while ignoring the small fraction of
+    grid cells that fall inside physical dead zones (e.g. reflector shadows).
+
+    The 5th percentile is robust against the ~2-5 % of cells typically
+    shadowed by a passive reflector, unlike the hard minimum which is
+    always trapped inside the dead zone.
+
+    Args:
+        rss_map: Radio map RSS tensor (in Watts) - PyTorch tensor.  Any
+            shape; will be flattened internally.
+
+    Returns:
+        5th-percentile RSS value (scalar tensor, linear Watts).
+    """
+    valid_mask = rss_map > POWER_EPSILON
+    valid_rss = rss_map[valid_mask]
+
+    if valid_rss.numel() == 0:
+        return torch.tensor(0.0, dtype=torch.float32)
+
+    return torch.quantile(valid_rss.float(), 0.05)
 
 
 def compute_soft_min_rss_metric(

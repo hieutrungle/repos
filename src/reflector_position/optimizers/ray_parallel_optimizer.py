@@ -175,8 +175,8 @@ class OptimizationWorker:
                 - task_id: Task identifier
                 - worker_id: Physical actor that processed this task
                 - best_position: Optimized position [x, y, z] as list
-                - best_metric: Best metric value (linear Watts)
-                - best_metric_dbm: Best metric value in dBm
+                - best_metric: Best 5th-percentile RSS value (linear Watts)
+                - best_metric_dbm: Best 5th-percentile RSS value in dBm
                 - time_elapsed: Optimization time in seconds
                 - history: Optimization history (gradient descent)
                 - grid_results: Grid search results (grid search)
@@ -231,7 +231,7 @@ class OptimizationWorker:
 
         # For gradient descent: find the BEST position across all iterations,
         # not just the final one, since the goal is to find the best
-        # possible min RSS value.
+        # possible 5th-percentile RSS value.
         best_position = final_position
         best_metric = final_metric
         best_iteration = -1  # -1 means "final" (no history or non-GD)
@@ -628,7 +628,7 @@ class RayParallelOptimizer:
         if verbose:
             print("Phase 3/3: Aggregating results and selecting winner...")
 
-        # Find best task (maximize metric - higher min_rss is better)
+        # Find best task (maximize metric - higher p5_rss is better)
         best_idx = int(np.argmax([r["best_metric"] for r in all_results]))
         best_result = all_results[best_idx]
 
@@ -691,7 +691,7 @@ class RayParallelOptimizer:
             if _n_aps > 1:
                 print(f"  Num APs: {_n_aps}")
             print(f"  Position: {_fmt_pos(best_result['best_position'])}")
-            print(f"  Min RSS: {best_result['best_metric_dbm']:.2f} dBm")
+            print(f"  P5 RSS: {best_result['best_metric_dbm']:.2f} dBm")
             _bd = best_result.get("best_direction")
             if _bd:
                 print(f"  Direction: {_fmt_dir(_bd)}")
@@ -701,11 +701,11 @@ class RayParallelOptimizer:
             print()
             print("  Aggregate Statistics:")
             print(
-                f"    Min RSS range: [{aggregate_stats['min_metric_dbm']:.2f}, "
+                f"    P5 RSS range: [{aggregate_stats['min_metric_dbm']:.2f}, "
                 f"{aggregate_stats['max_metric_dbm']:.2f}] dBm"
             )
             print(
-                f"    Mean Min RSS: {aggregate_stats['mean_metric_dbm']:.2f} "
+                f"    Mean P5 RSS: {aggregate_stats['mean_metric_dbm']:.2f} "
                 f"+/- {aggregate_stats['std_metric_dbm']:.2f} dBm"
             )
             if "mean_percentile_dbm" in aggregate_stats:
@@ -751,7 +751,7 @@ class RayParallelOptimizer:
 
         Creates a 2x2 figure for each task that has history data:
         1. Position trajectory (start, end, best marked)
-        2. Min RSS over iterations (best iteration highlighted)
+        2. P5 RSS over iterations (best iteration highlighted)
         3. Coverage over iterations
         4. Gradient norm (log scale)
 
@@ -765,7 +765,7 @@ class RayParallelOptimizer:
             position_bounds: Optional dict with 'x_min', 'x_max', 'y_min', 'y_max'
                 to set consistent axis limits on position plots across all tasks.
             rss_range_dbm: Optional tuple (min_dbm, max_dbm) to set consistent
-                y-axis limits on Min RSS plots across all tasks and methods.
+                y-axis limits on P5 RSS plots across all tasks and methods.
 
         Returns:
             List of saved file paths.
@@ -821,7 +821,7 @@ class RayParallelOptimizer:
             fig, axes = plt.subplots(2, 2, figsize=(14, 11))
             fig.suptitle(
                 f"Task #{task_id} — Gradient Descent Trajectory\n"
-                f"Best Min RSS: {task_result['best_metric_dbm']:.2f} dBm "
+                f"Best P5 RSS: {task_result['best_metric_dbm']:.2f} dBm "
                 f"at iteration {best_iter + 1}"
                 f"{orientation_lines}",
                 fontsize=11,
@@ -890,7 +890,7 @@ class RayParallelOptimizer:
             ax.grid(True, alpha=0.3)
             ax.set_aspect("equal", adjustable="box")
 
-            # 2. Min RSS over iterations
+            # 2. P5 RSS over iterations
             ax = axes[0, 1]
             if min_rss_dbm_values:
                 iters = list(range(1, len(min_rss_dbm_values) + 1))
@@ -907,8 +907,8 @@ class RayParallelOptimizer:
             if rss_range_dbm:
                 ax.set_ylim(rss_range_dbm[0], rss_range_dbm[1])
             ax.set_xlabel("Iteration")
-            ax.set_ylabel("Min RSS (dBm)")
-            ax.set_title("Minimum RSS Evolution")
+            ax.set_ylabel("5th Percentile RSS (dBm)")
+            ax.set_title("5th Percentile RSS Evolution")
             ax.legend(fontsize=9)
             ax.grid(True, alpha=0.3)
 
@@ -972,7 +972,7 @@ class RayParallelOptimizer:
         self,
         results: Dict[str, Any],
         save_path: str,
-        metric_name: str = "Min RSS",
+        metric_name: str = "P5 RSS",
         position_bounds: Optional[Dict[str, float]] = None,
         rss_range_dbm: Optional[tuple] = None,
     ) -> None:
@@ -980,8 +980,8 @@ class RayParallelOptimizer:
         Save visualization of parallel optimization results to a file.
 
         Creates a 2x2 figure:
-        1. Min RSS distribution across tasks (dBm)
-        2. Final positions scatter plot (color = Min RSS dBm)
+        1. P5 RSS distribution across tasks (dBm)
+        2. Final positions scatter plot (color = P5 RSS dBm)
         3. Time per task bar chart
         4. Summary statistics text
 
@@ -992,7 +992,7 @@ class RayParallelOptimizer:
             position_bounds: Optional dict with 'x_min', 'x_max', 'y_min', 'y_max'
                 to set consistent axis limits on the positions scatter plot.
             rss_range_dbm: Optional tuple (min_dbm, max_dbm) to set consistent
-                axis limits on Min RSS histogram and colorbar across methods.
+                axis limits on P5 RSS histogram and colorbar across methods.
         """
         import matplotlib
 
@@ -1025,7 +1025,7 @@ class RayParallelOptimizer:
             or best_result.get("grid_results", {}).get("reflector_target")
         )
 
-        # 1. Distribution of final Min RSS (dBm)
+        # 1. Distribution of final P5 RSS (dBm)
         ax = axes[0, 0]
         hist_range = rss_range_dbm if rss_range_dbm else None
         ax.hist(
@@ -1043,11 +1043,11 @@ class RayParallelOptimizer:
             ax.set_xlim(rss_range_dbm[0], rss_range_dbm[1])
         ax.set_xlabel(f"{metric_name} (dBm)")
         ax.set_ylabel("Number of Tasks")
-        ax.set_title("Distribution of Min RSS Across Tasks")
+        ax.set_title("Distribution of P5 RSS Across Tasks")
         ax.legend()
         ax.grid(True, alpha=0.3)
 
-        # 2. Final positions scatter (color = Min RSS dBm)
+        # 2. Final positions scatter (color = P5 RSS dBm)
         ax = axes[0, 1]
         sample_pos = all_results[0]["best_position"]
         _is_multi_ap = (
@@ -1182,7 +1182,7 @@ class RayParallelOptimizer:
             ax.set_ylim(position_bounds["y_min"], position_bounds["y_max"])
         ax.set_xlabel("X Position (m)")
         ax.set_ylabel("Y Position (m)")
-        ax.set_title("Final Positions (color = Min RSS dBm)")
+        ax.set_title("Final Positions (color = P5 RSS dBm)")
         plt.colorbar(scatter, ax=ax, label=f"{metric_name} (dBm)")
         ax.legend()
         ax.grid(True, alpha=0.3)
@@ -1219,13 +1219,13 @@ class RayParallelOptimizer:
             f"Best AP Direction(s): {_fmt_dir(best_result.get('best_direction'))}\n"
             f"Best Reflector Position: {_fmt_pos(best_reflector_pos)}\n"
             f"Best Reflector Focal Point: {_fmt_pos(best_reflector_target)}\n"
-            f"Best Min RSS: {best_dbm_val:.2f} dBm\n"
+            f"Best P5 RSS: {best_dbm_val:.2f} dBm\n"
         )
         if best_pct_dbm is not None:
             summary += f"Best 5th Percentile: {float(best_pct_dbm):.2f} dBm\n"
         summary += (
             f"\n"
-            f"Min RSS Statistics (dBm):\n"
+            f"P5 RSS Statistics (dBm):\n"
             f"  Mean: {stats['mean_metric_dbm']:.2f} +/- {stats['std_metric_dbm']:.2f}\n"
             f"  Range: [{stats['min_metric_dbm']:.2f}, {stats['max_metric_dbm']:.2f}]\n"
         )

@@ -21,6 +21,7 @@ from .reflector_model import ReflectorController, create_flat_reflector_mesh
 from .metrics import (
     POWER_EPSILON,
     compute_min_rss_metric,
+    compute_p5_rss_metric,
     compute_soft_min_rss_metric,
     normalized_softmin_loss,
     compute_coverage_metric,
@@ -56,6 +57,7 @@ __all__ = [
     # Metrics
     "POWER_EPSILON",
     "compute_min_rss_metric",
+    "compute_p5_rss_metric",
     "compute_soft_min_rss_metric",
     "normalized_softmin_loss",
     "compute_coverage_metric",

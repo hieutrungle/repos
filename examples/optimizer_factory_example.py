@@ -51,7 +51,7 @@ def main():
     
     print(f"\nGradient Descent Result:")
     print(f"  Position: {gd_position}")
-    print(f"  Min RSS: {gd_rss:.6f}")
+    print(f"  P5 RSS: {gd_rss:.6f}")
     
     # Method 2: Using the convenience function
     print("\n" + "=" * 70)
@@ -73,7 +73,7 @@ def main():
     
     print(f"\nGrid Search Result:")
     print(f"  Position: {gs_position}")
-    print(f"  Min RSS: {gs_rss:.6f}")
+    print(f"  P5 RSS: {gs_rss:.6f}")
     
     # Method 3: Switch methods easily with a parameter
     print("\n" + "=" * 70)
@@ -108,7 +108,7 @@ def main():
         position, rss = run_optimization(method)
         print(f"\n{method.replace('_', ' ').title()}:")
         print(f"  Position: {position}")
-        print(f"  Min RSS: {rss:.6f}")
+        print(f"  P5 RSS: {rss:.6f}")
     
     # Method 4: List available methods
     print("\n" + "=" * 70)

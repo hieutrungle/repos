@@ -259,7 +259,7 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
                 print(
                     f"Iter {iteration+1:3d}/{num_iterations} | "
                     f"Pos: ({current_pos[0]:.2f}, {current_pos[1]:.2f}) | "
-                    f"Min RSS: {min_rss_dbm:.2f} dBm | "
+                    f"P5 RSS: {min_rss_dbm:.2f} dBm | "
                     f"Coverage: {coverage:.1f}% | "
                     f"Loss: {loss.item():.2e} | "
                     f"Grad norm: {grad_norm:.2e} | "
@@ -321,11 +321,11 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
         ax.legend()
         ax.grid(True, alpha=0.3)
 
-        # 2. Min RSS over iterations
+        # 2. P5 RSS over iterations
         ax = axes[0, 1]
         ax.plot(self.history["min_rss_dbm_values"], "b-", linewidth=2)
         ax.set_xlabel("Iteration")
-        ax.set_ylabel("Min RSS (dBm)")
+        ax.set_ylabel("P5 RSS (dBm)")
         ax.set_title("Minimum RSS Evolution")
         ax.grid(True, alpha=0.3)
 

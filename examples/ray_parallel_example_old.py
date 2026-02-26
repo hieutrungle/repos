@@ -133,7 +133,7 @@ def example_parallel_gradient_descent():
     parallel_opt.save_results_plot(
         results,
         save_path=os.path.join(OUTPUT_DIR, "gd_parallel_results.png"),
-        metric_name="Min RSS",
+        metric_name="P5 RSS",
     )
 
     return results
@@ -223,7 +223,7 @@ def example_parallel_grid_search():
     parallel_opt.save_results_plot(
         results,
         save_path=os.path.join(OUTPUT_DIR, "gs_parallel_results.png"),
-        metric_name="Min RSS",
+        metric_name="P5 RSS",
     )
 
     return results

@@ -165,7 +165,7 @@ class GeneticAlgorithmRunner:
     statistics, plotting) lives here.  The expensive fitness evaluation is
     delegated to the injected ``executor_map``.
 
-    The GA maximises the **minimum RSS** (linear Watts) across transmitters,
+    The GA maximises the **5th-percentile RSS** (linear Watts) across transmitters,
     which is the ``best_metric`` field returned by workers.
 
     Supports ``num_aps=1`` (default) and ``num_aps=2``:
@@ -1093,7 +1093,7 @@ class GeneticAlgorithmRunner:
                     f"  AP separation: "
                     f"{results['best_ap_separation']:.2f}m"
                 )
-            print(f"  Best Min RSS:  {results['best_fitness_dbm']:.2f} dBm")
+            print(f"  Best P5 RSS:  {results['best_fitness_dbm']:.2f} dBm")
             print(f"  Coverage:      {results['best_coverage']:.1f}%")
             print(f"  Total evals:   {total_evaluations}")
             print(f"  Wall-clock:    {total_time:.2f}s")
@@ -1162,7 +1162,7 @@ class GeneticAlgorithmRunner:
         if rss_range_dbm:
             ax.set_ylim(rss_range_dbm[0], rss_range_dbm[1])
         ax.set_xlabel("Generation")
-        ax.set_ylabel("Min RSS (dBm)")
+        ax.set_ylabel("P5 RSS (dBm)")
 
         # Coverage % on secondary y-axis
         best_cov = [g.get("best_coverage", 0.0) for g in gen_details]
@@ -1313,7 +1313,7 @@ class GeneticAlgorithmRunner:
                         color="darkred", alpha=0.8, width=0.006,
                         headwidth=3, headlength=4,
                     )
-            plt.colorbar(sc, ax=ax, label="Min RSS (dBm)")
+            plt.colorbar(sc, ax=ax, label="P5 RSS (dBm)")
         else:
             # Multi-AP HoF: plot each AP per HoF entry
             for hof_idx, h in enumerate(hof):
@@ -1442,7 +1442,7 @@ class GeneticAlgorithmRunner:
             f"cx_alpha={ga_p['cx_alpha']}  {mut_line}\n"
             f"\n"
             f"{pos_str}"
-            f"Best Min RSS:  {results['best_fitness_dbm']:.2f} dBm\n"
+            f"Best P5 RSS:  {results['best_fitness_dbm']:.2f} dBm\n"
             f"Coverage:      {results.get('best_coverage', 0.0):.1f}%\n"
         )
         if num_aps >= 2:

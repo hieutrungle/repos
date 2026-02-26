@@ -431,7 +431,7 @@ def run_grid_search_2ap(
             if verbose:
                 print(
                     f"    → AP{active_idx} best: {current_positions[active_idx]}, "
-                    f"joint min RSS = {_rss_watts_to_dbm(round_best_metric):.2f} dBm"
+                    f"joint P5 RSS = {_rss_watts_to_dbm(round_best_metric):.2f} dBm"
                 )
 
     total_time = time.time() - start
@@ -1284,7 +1284,7 @@ def run_grid_search_physically_aware(
               f"v={best_reflector_v:.3f}")
         print(f"  Best reflector target: {best_reflector_target}")
     print(f"  Best {target_quantile*100:.0f}th-percentile: {best_pct_dbm:.2f} dBm")
-    print(f"  Min RSS at best config: {best_rss_dbm:.2f} dBm")
+    print(f"  P5 RSS at best config: {best_rss_dbm:.2f} dBm")
     print("=" * 80)
 
     return {
@@ -1422,12 +1422,12 @@ def main():
     # ==================================================================
     # 0b. REFLECTOR GRID SEARCH (sequential validation)
     # ==================================================================
-    refl_gs_info = run_reflector_grid_search(
-        verbose=True,
-        u_steps=3,
-        v_steps=3,
-        target_resolution=10.0,  # coarse grid for validation
-    )
+    # refl_gs_info = run_reflector_grid_search(
+    #     verbose=True,
+    #     u_steps=3,
+    #     v_steps=3,
+    #     target_resolution=10.0,  # coarse grid for validation
+    # )
 
     # # ==================================================================
     # # 1-AP RUNS (scene with 1 transmitter)
@@ -1615,7 +1615,7 @@ def main():
 
 #     # Quick summary line
 #     print("\n" + "-" * 80)
-#     print("  Summary (Min RSS in dBm):")
+#     print("  Summary (P5 RSS in dBm):")
 #     for label, info in configs:
 #         print(f"    {label}: {info['best_metric_dbm']:.2f} dBm  ({info['time_elapsed']:.1f}s)")
 

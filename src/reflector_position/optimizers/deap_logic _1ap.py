@@ -678,7 +678,7 @@ class GeneticAlgorithmRunner:
             _bla = results.get("best_look_at")
             if _bla:
                 print(f"  Best look_at:  ({_bla[0]:.2f}, {_bla[1]:.2f}, {_bla[2]:.2f})")
-            print(f"  Best Min RSS:  {results['best_fitness_dbm']:.2f} dBm")
+            print(f"  Best P5 RSS:  {results['best_fitness_dbm']:.2f} dBm")
             print(f"  Total evals:   {total_evaluations}")
             print(f"  Wall-clock:    {total_time:.2f}s")
             print("=" * 80)
@@ -741,7 +741,7 @@ class GeneticAlgorithmRunner:
         if rss_range_dbm:
             ax.set_ylim(rss_range_dbm[0], rss_range_dbm[1])
         ax.set_xlabel("Generation")
-        ax.set_ylabel("Min RSS (dBm)")
+        ax.set_ylabel("P5 RSS (dBm)")
         ax.set_title("Fitness Convergence")
         ax.legend()
         ax.grid(True, alpha=0.3)
@@ -810,7 +810,7 @@ class GeneticAlgorithmRunner:
         ax.set_xlabel("X Position (m)")
         ax.set_ylabel("Y Position (m)")
         ax.set_title("Hall of Fame (top solutions)")
-        plt.colorbar(sc, ax=ax, label="Min RSS (dBm)")
+        plt.colorbar(sc, ax=ax, label="P5 RSS (dBm)")
         ax.grid(True, alpha=0.3)
 
         # 4. Summary text
@@ -842,7 +842,7 @@ class GeneticAlgorithmRunner:
             f"{results['best_position'][2]:.2f})\n"
             f"Best Direction: {_fmt_dir_summary(results.get('best_direction'),
                                                 results.get('best_orientation_name'))}\n"
-            f"Best Min RSS:  {results['best_fitness_dbm']:.2f} dBm\n"
+            f"Best P5 RSS:  {results['best_fitness_dbm']:.2f} dBm\n"
         )
         ax.text(
             0.1, 0.5, summary,

@@ -46,6 +46,7 @@ from sionna.rt import RadioMapSolver
 from .base_optimizer import BaseAPOptimizer
 from ..metrics import (
     compute_min_rss_metric,
+    compute_p5_rss_metric,
     compute_coverage_metric,
     rss_to_dbm,
     PercentileCoverageObjective,
@@ -511,7 +512,7 @@ class SinglePointGridSearchOptimizer(BaseAPOptimizer):
         )
         rss_tensor = torch.from_numpy(np.array(rm.rss)).to(self.device)
 
-        min_rss = compute_min_rss_metric(rss_tensor)
+        min_rss = compute_p5_rss_metric(rss_tensor)
         min_rss_dbm = rss_to_dbm(min_rss)
         coverage = compute_coverage_metric(rss_tensor, coverage_threshold_dbm)
 
@@ -721,7 +722,7 @@ class SinglePointGridSearchOptimizer(BaseAPOptimizer):
                 )
                 print(
                     f"    [{combo_idx + 1}/{num_combos}] {dir_str}: "
-                    f"Min RSS = {metrics['rss_dbm']:.2f} dBm, "
+                    f"P5 RSS = {metrics['rss_dbm']:.2f} dBm, "
                     f"Coverage = {metrics['coverage']:.1f}%"
                 )
 
@@ -807,7 +808,7 @@ class SinglePointGridSearchOptimizer(BaseAPOptimizer):
         ap_summary = " | ".join(parts)
         print(
             f"  {ap_summary}: "
-            f"Min RSS = {rss_dbm:.2f} dBm, "
+            f"P5 RSS = {rss_dbm:.2f} dBm, "
             f"Coverage = {cov:.1f}%, "
             f"Time = {elapsed:.2f}s ({num_combos} combos)"
         )

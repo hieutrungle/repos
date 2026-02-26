@@ -307,7 +307,7 @@ def main():
     print(f"  Best position:  {_fmt_pos(gs_info['best_position'])}")
     print(f"  Best direction: {_fmt_dir(gs_info['best_direction'])}")
     print(f"  Best look_at:   {_fmt_pos(gs_info['best_look_at'])}")
-    print(f"  Min RSS:        {gs_info['best_metric_dbm']:.2f} dBm")
+    print(f"  P5 RSS:        {gs_info['best_metric_dbm']:.2f} dBm")
     print(f"  Evaluations:    {gs_info['num_evaluations']} points × 8 dirs")
     print(f"  Time:           {gs_info['time_elapsed']:.1f}s")
 
@@ -319,7 +319,7 @@ def main():
     print(f"  Final direction:{_fmt_dir(gd_info['final_direction'])}")
     print(f"  Final look_at:  {_fmt_pos(gd_info['final_look_at'])}")
     print(f"  Best iteration: {gd_info['best_iteration'] + 1}/{gd_info['num_iterations']}")
-    print(f"  Min RSS:        {gd_info['best_metric_dbm']:.2f} dBm")
+    print(f"  P5 RSS:        {gd_info['best_metric_dbm']:.2f} dBm")
     print(f"  Iterations:     {gd_info['num_iterations']}")
     print(f"  Time:           {gd_info['time_elapsed']:.1f}s")
 

@@ -83,7 +83,7 @@ ALTERNATING_ROUNDS = 3
 NUM_POOL_WORKERS = 2        # Fixed pool size (actors loading Scene)
 GPU_FRACTION = 0.5         # 4 workers per GPU
 
-# Unified Min RSS scale (dBm) for all plots — enables visual comparison
+# Unified P5 RSS scale (dBm) for all plots — enables visual comparison
 # between GD and GS results. Set to None for auto-scaling.
 RSS_RANGE_DBM = (-130.0, -80.0)  # (min_dbm, max_dbm)
 
@@ -217,7 +217,7 @@ def example_parallel_gradient_descent(
     parallel_opt.save_results_plot(
         results,
         save_path=os.path.join(output_dir, f"gd_{ap_tag}_parallel_results.png"),
-        metric_name="Min RSS",
+        metric_name="P5 RSS",
         position_bounds=POSITION_BOUNDS,
         rss_range_dbm=RSS_RANGE_DBM,
     )
@@ -307,7 +307,7 @@ def example_parallel_grid_search(
     parallel_opt.save_results_plot(
         results,
         save_path=os.path.join(output_dir, "gs_1ap_parallel_results.png"),
-        metric_name="Min RSS",
+        metric_name="P5 RSS",
         position_bounds=POSITION_BOUNDS,
         rss_range_dbm=RSS_RANGE_DBM,
     )
@@ -449,7 +449,7 @@ def example_parallel_grid_search_2ap(
     parallel_opt.save_results_plot(
         best_overall_results,
         save_path=os.path.join(output_dir, "gs_2ap_parallel_results.png"),
-        metric_name="Min RSS",
+        metric_name="P5 RSS",
         position_bounds=POSITION_BOUNDS,
         rss_range_dbm=RSS_RANGE_DBM,
     )
