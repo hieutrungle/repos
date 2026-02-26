@@ -1,12 +1,12 @@
 # Project Status
 
-**Last Updated**: February 10, 2026  
-**Version**: 0.2.0  
+**Last Updated**: February 25, 2026  
+**Version**: 0.2.1  
 **Status**: Alpha - Active Development
 
 ## Quick Summary
 
-Physics-aware AP position optimization package using differentiable ray tracing with Sionna. Features three Ray-parallel optimization methods: gradient descent, grid search, and genetic algorithm (DEAP). Uses Inversion of Control (IoC) architecture to cleanly separate algorithm logic from Ray execution engine.
+Physics-aware AP position optimization package using differentiable ray tracing with Sionna. Features three Ray-parallel optimization methods: gradient descent, grid search, and genetic algorithm (DEAP), plus integrated reflector initialization/control in the optimization pipeline. Uses Inversion of Control (IoC) architecture to cleanly separate algorithm logic from Ray execution engine, with validated runs in both non-Ray and Ray multi-GPU execution modes.
 
 ## Environment
 
@@ -29,6 +29,7 @@ Physics-aware AP position optimization package using differentiable ray tracing 
 - [x] Hard minimum for exact optimization
 - [x] Coverage metrics (threshold-based)
 - [x] Position bounds and constraints
+- [x] Reflector initialization and runtime control integrated into scene and optimization flow
 
 ### Ray-Parallel Distributed Optimization (100%)
 - [x] ActorPool pattern with persistent workers (Scene loaded once)
@@ -39,6 +40,8 @@ Physics-aware AP position optimization package using differentiable ray tracing 
 - [x] Ordered `pool.map` (prevents freeze issues from `map_unordered`)
 - [x] Configurable GPU fraction per worker (0.25 = 4 workers/GPU)
 - [x] Per-task trajectory plots, evolution plots, Hall of Fame
+- [x] Ray execution validated on multi-GPU runs
+- [x] Non-Ray baseline runs validated for reflector-aware path
 
 ### Code Quality (100%)
 - [x] Modular package structure
@@ -131,6 +134,7 @@ Physics-aware AP position optimization package using differentiable ray tracing 
 
 ### Advanced Features (20% complete)
 - [x] Genetic algorithm baseline (DEAP) with Ray-parallel evaluation
+- [x] Mechanical reflector initialization and control integration
 - [ ] Multi-objective optimization (coverage + capacity)
 - [ ] Constrained optimization (wall mounting)
 - [ ] Multi-AP joint optimization
@@ -199,12 +203,12 @@ Physics-aware AP position optimization package using differentiable ray tracing 
 
 ### Phase 4: Advanced Features (Q1-Q2 2026)
 - Multi-objective optimization
-- Mechanical reflector integration
+- Mechanical reflector integration (initialization + control complete)
 - Multi-AP optimization
 - Hybrid GA+GD pipeline
 - Performance improvements
 
-**Status**: 📋 Planned  
+**Status**: 🚧 In Progress (core reflector control complete; advanced items pending)  
 **Target**: March-April 2026
 
 ### Phase 5: Publishing & Release (Q2 2026)
@@ -249,6 +253,12 @@ All dependencies are pinned to tested versions:
 
 ## Recent Changes
 
+### February 25, 2026
+- ✅ Integrated reflector initialization and runtime control in main optimization flow
+- ✅ Validated reflector-aware runs without Ray (single-process baseline path)
+- ✅ Validated Ray-parallel runs on multiple GPUs
+- ✅ Improved Ray execution visibility and robustness for long-running sweeps
+
 ### February 10, 2026
 - ✅ Implemented DEAP Genetic Algorithm with Ray-parallel fitness evaluation
 - ✅ Refactored to Inversion of Control (IoC) architecture:
@@ -290,7 +300,7 @@ All dependencies are pinned to tested versions:
 
 - **Issues**: Report bugs or feature requests via GitHub Issues
 - **Discussions**: Ask questions in GitHub Discussions
-- **Email**: your.email@example.com (update in pyproject.toml)
+- **Email**: hieu.tg.lel@gmail.com (update in pyproject.toml)
 
 ## License
 

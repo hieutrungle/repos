@@ -9,7 +9,9 @@ Physics-aware optimal placement for mechanical reflectors in NLOS (Non-Line-of-S
 - **Grid Search Optimization**: Exhaustive search over spatial grid for baseline performance
 - **Gradient Descent Optimization**: Fast gradient-based optimization using differentiable ray tracing
 - **Genetic Algorithm (DEAP)**: Evolutionary optimization with population-based search using the DEAP library
+- **Reflector Initialization & Control**: Mechanical reflector setup and runtime control integrated into scene/optimizer flows
 - **Ray-Parallel Execution**: Distributed evaluation via Ray ActorPool — all three methods run in parallel across persistent GPU workers
+- **Validated Execution Paths**: Verified runs with and without Ray, including parallel multi-GPU execution
 - **Inversion of Control (IoC) Architecture**: Clean separation of algorithm logic (DEAP) from execution engine (Ray) via dependency injection
 - **Metrics**: Minimum RSS, coverage area, and soft minimum for smooth optimization
 - **Visualizations**: Heatmaps, convergence plots, trajectory visualization, and GA evolution plots
@@ -413,6 +415,7 @@ pytest
 - ✅ **Soft Minimum Metric**: Smooth, differentiable optimization objective
 - ✅ **Coverage Metrics**: RSS threshold-based coverage calculation
 - ✅ **Radio Map Computation**: Configurable ray tracing parameters
+- ✅ **Reflector Initialization & Control**: Reflector-aware scene setup and runtime control integrated in optimization flow
 - ✅ **Optimizer Factory**: Factory pattern for creating optimizers
 - ✅ **Base Optimizer ABC**: Abstract base class enforcing optimizer interface
 
@@ -423,6 +426,8 @@ pytest
 - ✅ **GeneticAlgorithmRunner**: Pure DEAP GA logic — no Ray imports, uses injected `map`
 - ✅ **SinglePointGridSearchOptimizer**: Evaluates single (x, y) position for GA fitness
 - ✅ **GPU Management**: Configurable GPU fraction per worker (0.25 = 4 workers/GPU)
+- ✅ **Multi-GPU Validation**: Parallel Ray execution validated on multi-GPU setup
+- ✅ **Non-Ray Validation**: Baseline single-process execution validated for reflector-aware paths
 - ✅ **Freeze-safe**: Uses `pool.map` (ordered, synchronous) instead of `map_unordered`
 - ✅ **Comprehensive Documentation**: Detailed guides with examples
 
@@ -501,7 +506,7 @@ pytest
 ### New Features
 - [ ] **Multi-Objective Optimization**: Simultaneous coverage + capacity optimization
 - [ ] **Constrained Optimization**: Wall-mounting and mechanical constraints
-- [ ] **Reflector Control**: Integration of mechanical reflector from notebook
+- [x] **Reflector Control**: Mechanical reflector initialization and control integrated into main optimization path ✅
 - [ ] **Multi-AP Optimization**: Joint optimization of multiple access points
 - [ ] **Different Environments**: Support for corridor, warehouse, outdoor scenes
 - [ ] **Adaptive Learning Rate**: Automatic learning rate scheduling
@@ -589,13 +594,13 @@ pytest
 
 ### Phase 4: Advanced Features (Q1-Q2 2026)
 - Multi-objective optimization
-- Mechanical reflector integration
+- Mechanical reflector integration (initialization + control complete)
 - Multi-AP optimization
 - Adaptive learning rate
 - Coarse-to-fine Ray-based search
 - Hybrid GA+GD (seed GD from GA best solutions)
 
-**Status**: 📋 Planned  
+**Status**: 🚧 In progress (reflector control integration complete, advanced extensions pending)  
 **Target**: March-April 2026
 
 ### Phase 5: Publishing & Release (Q2 2026)
