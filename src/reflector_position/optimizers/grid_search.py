@@ -109,6 +109,7 @@ def generate_alternating_grid_tasks(
     fixed_orientations: List[Optional[Tuple[float, float, float]]],
     grid_resolution: float = 1.0,
     fixed_z: float = 3.8,
+    min_ap_separation: float = 0.0,
 ) -> List[Dict]:
     """
     Generate work-item dicts for alternating-optimisation grid search.
@@ -131,6 +132,8 @@ def generate_alternating_grid_tasks(
             typically ``None`` to sweep it, but the caller may override.
         grid_resolution: Grid spacing in metres for the active AP.
         fixed_z: Fixed z-coordinate (height) for all APs.
+        min_ap_separation: Minimum 2-D distance (metres) allowed between the
+            active AP candidate and every other AP. Set to 0 to disable.
 
     Returns:
         List of kwargs dicts, each compatible with
@@ -160,6 +163,18 @@ def generate_alternating_grid_tasks(
             else:
                 positions.append(tuple(float(c) for c in fixed_positions[i]))  # type: ignore[arg-type]
 
+        # Enforce AP separation constraint (if enabled)
+        if min_ap_separation > 0.0:
+            active_pos = positions[active_ap_idx]
+            violates = any(
+                np.hypot(active_pos[0] - positions[j][0], active_pos[1] - positions[j][1])
+                < min_ap_separation
+                for j in range(num_aps)
+                if j != active_ap_idx
+            )
+            if violates:
+                continue
+
         # Mirror the fixed_orientations list as-is
         orientations: List[Optional[Tuple[float, float, float]]] = list(
             fixed_orientations
@@ -170,6 +185,13 @@ def generate_alternating_grid_tasks(
             "evaluation_orientations": orientations,
             "fixed_z": fixed_z,
         })
+
+    if not work_items:
+        raise ValueError(
+            "No valid alternating-grid tasks after applying min_ap_separation="
+            f"{min_ap_separation}. Consider relaxing the constraint or using "
+            "coarser/further-apart initial AP positions."
+        )
 
     return work_items
 
@@ -721,6 +743,19 @@ class SinglePointGridSearchOptimizer(BaseAPOptimizer):
             self.results["percentile_score_dbm"] = best_metrics.get(
                 "percentile_score_dbm", None
             )
+
+        # Reflector metadata (when configured)
+        if self._reflector_ctrl is not None:
+            self.results["reflector_u"] = self._reflector_u
+            self.results["reflector_v"] = self._reflector_v
+            self.results["reflector_target"] = self._reflector_target
+            self.results["reflector_position"] = (
+                self._reflector_ctrl.get_position().tolist()
+            )
+            if self._reflector_ctrl.focal_point is not None:
+                self.results["reflector_focal_point"] = (
+                    self._reflector_ctrl.focal_point.detach().cpu().tolist()
+                )
 
         elapsed = time.time() - start_time
 
