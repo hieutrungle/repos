@@ -30,9 +30,12 @@ Usage:
 import time
 import json
 import os
+import warnings
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+import torch
 
 import sionna.rt
 from sionna.rt import RadioMapSolver
@@ -42,10 +45,13 @@ from reflector_position import (
     OptimizerFactory,
     rss_to_dbm,
     ReflectorController,
+    PercentileCoverageObjective,
 )
 from reflector_position.optimizers.grid_search import (
     generate_grid_positions,
     generate_alternating_grid_tasks,
+    generate_reflector_grid_tasks,
+    SinglePointGridSearchOptimizer,
 )
 from reflector_position.metrics import POWER_EPSILON
 
@@ -224,7 +230,7 @@ def run_gradient_descent(scene, num_aps: int = 1, verbose: bool = True):
     return info, optimizer
 
 
-def run_grid_search(scene, grid_resolution: float = 5.0, verbose: bool = True):
+def run_grid_search_1ap(scene, grid_resolution: float = 5.0, verbose: bool = True):
     """
     Run 1-AP grid search with 8-direction sweep via OptimizerFactory.
 
@@ -638,6 +644,754 @@ def run_reflector_verification(verbose: bool = True):
     return scene_base, scene_refl, reflector_ctrl
 
 
+# -- Reflector grid search (sequential) ----------------------------------------
+
+def run_reflector_grid_search(
+    verbose: bool = True,
+    u_steps: int = 3,
+    v_steps: int = 3,
+    target_resolution: float = 5.0,
+) -> Dict[str, Any]:
+    """Sequential grid search over reflector wall position and focal target.
+
+    Phase A is assumed complete — APs are frozen at known-good positions
+    and orientations.  This function sweeps the reflector's *(u, v)* wall
+    coordinates and the focal-target *(x, y)* grid, evaluating each
+    configuration with :class:`SinglePointGridSearchOptimizer`.
+
+    Parameters
+    ----------
+    verbose : bool
+        Print per-task progress.
+    u_steps : int
+        Number of uniformly-spaced *u* samples in [0, 1].
+    v_steps : int
+        Number of uniformly-spaced *v* samples in [0, 1].
+    target_resolution : float
+        Spacing (metres) for the focal-target XY grid.
+
+    Returns
+    -------
+    dict
+        Best reflector configuration and metric.
+    """
+    print("\n" + "=" * 80)
+    print("REFLECTOR GRID SEARCH — sequential validation")
+    print("=" * 80)
+
+    # Frozen AP configuration (from prior Phase A) ----------------------------
+    fixed_ap_positions: List[Tuple[float, float, float]] = [(10.0, 20.0, 3.8)]
+    fixed_ap_orientations: List[Tuple[float, float, float]] = [(0.0, 1.0, 0.0)]
+
+    # Wall bounding box -------------------------------------------------------
+    wall_top_left     = [15.0, 34.0, 3.0]
+    wall_bottom_right = [34.0, 34.0, 1.0]
+
+    # Focal-target search area ------------------------------------------------
+    target_bounds = {
+        "x_min": 5.0,
+        "x_max": 35.0,
+        "y_min": 5.0,
+        "y_max": 35.0,
+    }
+    target_z = 1.5  # receiver height
+
+    # Generate work items ------------------------------------------------------
+    tasks = generate_reflector_grid_tasks(
+        fixed_ap_positions=fixed_ap_positions,
+        fixed_ap_orientations=fixed_ap_orientations,
+        u_steps=u_steps,
+        v_steps=v_steps,
+        target_bounds=target_bounds,
+        target_resolution=target_resolution,
+        target_z=target_z,
+    )
+    num_tasks = len(tasks)
+
+    print(f"  Wall: top_left={wall_top_left}, bottom_right={wall_bottom_right}")
+    print(f"  u_steps={u_steps}, v_steps={v_steps}")
+    print(f"  Target bounds: {target_bounds}")
+    print(f"  Target resolution: {target_resolution} m  (z={target_z})")
+    print(f"  Total tasks: {num_tasks}")
+    print("-" * 70)
+
+    # Create a single scene + controller (re-used across all tasks) -----------
+    scene, reflector_ctrl = setup_building_floor_scene(
+        scene_path=str(SCENE_PATH),
+        frequency=5.18e9,
+        tx_power_dbm=5.0,
+        reflector_enabled=True,
+        reflector_size=(2.0, 2.0),
+        wall_top_left=wall_top_left,
+        wall_bottom_right=wall_bottom_right,
+        focal_point=[20.0, 20.0, target_z],  # placeholder, overwritten per task
+        device="cpu",
+    )
+
+    # Ray-tracing parameters (lighter for validation) --------------------------
+    rt_params = {
+        "samples_per_tx": 500_000,
+        "max_depth": 13,
+        "coverage_threshold_dbm": -100.0,
+        "verbose": False,
+    }
+
+    best_rss = -float("inf")
+    best_task: Optional[Dict[str, Any]] = None
+    best_rss_dbm = -200.0
+
+    start = time.time()
+
+    for idx, task in enumerate(tasks):
+        optimizer = SinglePointGridSearchOptimizer(
+            scene=scene,
+            evaluation_positions=task["evaluation_positions"],
+            evaluation_orientations=task["evaluation_orientations"],
+            fixed_z=task["fixed_z"],
+            reflector_controller=reflector_ctrl,
+            reflector_u=task["reflector_u"],
+            reflector_v=task["reflector_v"],
+            reflector_target=task["reflector_target"],
+        )
+
+        _pos, _orient, rss_watts = optimizer.optimize(**rt_params)
+        rss_dbm = _rss_watts_to_dbm(rss_watts)
+
+        if rss_watts > best_rss:
+            best_rss = rss_watts
+            best_rss_dbm = rss_dbm
+            best_task = {
+                "reflector_u": task["reflector_u"],
+                "reflector_v": task["reflector_v"],
+                "reflector_target": task["reflector_target"],
+                "rss_watts": rss_watts,
+                "rss_dbm": rss_dbm,
+            }
+
+        if verbose and (idx % max(1, num_tasks // 20) == 0 or idx == num_tasks - 1):
+            u_val = task["reflector_u"]
+            v_val = task["reflector_v"]
+            tgt = task["reflector_target"]
+            print(
+                f"  [{idx + 1:>{len(str(num_tasks))}}/{num_tasks}] "
+                f"u={u_val:.2f} v={v_val:.2f} "
+                f"target=({tgt[0]:.1f},{tgt[1]:.1f},{tgt[2]:.1f}) "
+                f"-> {rss_dbm:.2f} dBm  "
+                f"(best so far: {best_rss_dbm:.2f} dBm)"
+            )
+
+    total_time = time.time() - start
+
+    print("-" * 70)
+    print(f"  Reflector Grid Search Complete! ({total_time:.1f}s)")
+    if best_task is not None:
+        print(f"  Best u={best_task['reflector_u']:.3f}, "
+              f"v={best_task['reflector_v']:.3f}")
+        print(f"  Best target=({best_task['reflector_target'][0]:.1f}, "
+              f"{best_task['reflector_target'][1]:.1f}, "
+              f"{best_task['reflector_target'][2]:.1f})")
+        print(f"  Best Min RSS: {best_rss_dbm:.2f} dBm")
+    print("=" * 80)
+
+    result = {
+        "best_task": best_task,
+        "best_rss": best_rss,
+        "best_rss_dbm": best_rss_dbm,
+        "num_tasks": num_tasks,
+        "time_elapsed": total_time,
+        "u_steps": u_steps,
+        "v_steps": v_steps,
+        "target_resolution": target_resolution,
+    }
+    return result
+
+
+# -- Physically-Aware Alternating Grid Search ----------------------------------
+
+def run_grid_search_physically_aware(
+    scene_path: str = str(SCENE_PATH),
+    *,
+    # --- AP grid-search parameters ---
+    ap_grid_resolution: float = 5.0,
+    ap_alternating_rounds: int = ALTERNATING_ROUNDS,
+    initial_ap_positions: Optional[List[Tuple[float, float]]] = None,
+    # --- Reflector grid-search parameters ---
+    reflector_enabled: bool = True,
+    reflector_size: Tuple[float, float] = (2.0, 2.0),
+    wall_top_left: List[float] = [15.0, 34.0, 3.0],
+    wall_bottom_right: List[float] = [34.0, 34.0, 1.0],
+    u_steps: int = 5,
+    v_steps: int = 5,
+    target_bounds: Optional[Dict[str, float]] = None,
+    target_resolution: float = 5.0,
+    target_z: float = 1.5,
+    # --- Objective / quantile parameters ---
+    target_quantile: float = 0.05,
+    shadow_fraction: Optional[float] = None,
+    # --- Outer alternation ---
+    outer_rounds: int = 2,
+    # --- Ray-tracing parameters ---
+    samples_per_tx: int = 1_000_000,
+    max_depth: int = 13,
+    coverage_threshold_dbm: float = -100.0,
+    # --- Misc ---
+    rx_position: Tuple[float, float, float] = (16.0, 6.5, 1.5),
+    frequency: float = 5.18e9,
+    tx_power_dbm: float = 5.0,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """Physically-Aware Alternating Grid Search for 2 APs + 1 reflector.
+
+    Orchestrates a derivative-free optimisation loop that alternates
+    between two phases:
+
+    **Phase A — AP placement:**
+        Alternating grid search over 2 AP positions and orientations
+        (8-cardinal sweep per active AP, fixed reflector configuration).
+
+    **Phase B — Reflector placement:**
+        Grid search over the reflector's wall coordinates ``(u, v)`` and
+        focal-target ``(x, y)`` with APs frozen at their Phase-A winners.
+
+    Phases A and B are repeated for ``outer_rounds`` iterations.  Each
+    evaluation uses the :class:`PercentileCoverageObjective` so that the
+    RF shadow cast by the opaque reflector does not dominate the metric.
+
+    Parameters
+    ----------
+    scene_path : str
+        Path to the Mitsuba/Sionna XML scene file.
+    ap_grid_resolution : float
+        Grid spacing (metres) for AP position sweep.
+    ap_alternating_rounds : int
+        Number of inner AP0 → AP1 alternation sweeps per Phase A.
+    initial_ap_positions : list of (float, float), optional
+        Starting ``(x, y)`` for AP0 and AP1.  Defaults to
+        ``INITIAL_AP_POSITIONS_2AP``.
+    reflector_enabled : bool
+        If *False* the reflector phase is skipped entirely.
+    reflector_size : tuple of float
+        ``(width, height)`` of the reflector in metres.
+    wall_top_left, wall_bottom_right : list of float
+        3-D corner points of the reflector's wall bounding box.
+    u_steps, v_steps : int
+        Number of uniform samples along each wall dimension.
+    target_bounds : dict, optional
+        ``{x_min, x_max, y_min, y_max}`` for the focal-target grid.
+        Defaults to the full building floor ``(5 – 35)``.
+    target_resolution : float
+        Grid spacing (metres) for the focal-target XY grid.
+    target_z : float
+        Fixed height for focal-target evaluation points.
+    target_quantile : float
+        Percentile used by :class:`PercentileCoverageObjective`.  **Must**
+        exceed the fraction of the coverage grid swallowed by the
+        reflector's RF shadow (see *Shadow-Area Constraint* below).
+    shadow_fraction : float, optional
+        Estimated shadow-area fraction.  When provided the objective
+        constructor validates ``target_quantile > shadow_fraction`` and
+        raises ``ValueError`` otherwise.
+    outer_rounds : int
+        Number of full Phase-A → Phase-B alternation cycles.
+    samples_per_tx, max_depth : int
+        Ray-tracing fidelity parameters.
+    coverage_threshold_dbm : float
+        Threshold for the auxiliary hard-coverage metric.
+    rx_position : tuple of float
+        Receiver position ``(x, y, z)``.
+    frequency : float
+        Operating frequency in Hz.
+    tx_power_dbm : float
+        Total transmitter power in dBm.
+    verbose : bool
+        Print per-phase progress.
+
+    Returns
+    -------
+    dict
+        Summary with keys: ``best_ap_positions``, ``best_ap_orientations``,
+        ``best_reflector_u``, ``best_reflector_v``,
+        ``best_reflector_target``, ``best_percentile_score``,
+        ``best_percentile_score_dbm``, ``best_min_rss_dbm``,
+        ``time_elapsed``, ``history``.
+
+    Shadow-Area Constraint
+    ~~~~~~~~~~~~~~~~~~~~~~
+    The ``target_quantile`` must be **strictly larger** than the fraction
+    of the coverage grid covered by the reflector's physical shadow.  For
+    a 2 m × 2 m reflector in a 30 m × 30 m room the shadow is roughly:
+
+    .. math::
+
+        \\frac{2 \\times 30}{30 \\times 30} \\approx 7\\%
+
+    (conservatively, the shadow behind the reflector extends the full
+    room depth).  A ``target_quantile`` of 0.05 (5 %) may still clip the
+    shadow edge; 0.10 is safer.  If you know the exact shadow area, pass
+    ``shadow_fraction`` to enable a strict validation check.
+    """
+    # ------------------------------------------------------------------
+    # 0. Instantiate the percentile objective
+    # ------------------------------------------------------------------
+    objective = PercentileCoverageObjective(
+        target_quantile=target_quantile,
+        mode="maximize",
+        shadow_fraction=shadow_fraction,
+    )
+
+    if initial_ap_positions is None:
+        initial_ap_positions = list(INITIAL_AP_POSITIONS_2AP)
+
+    if target_bounds is None:
+        target_bounds = {
+            "x_min": 5.0,
+            "x_max": 35.0,
+            "y_min": 5.0,
+            "y_max": 35.0,
+        }
+
+    rt_params = {
+        "samples_per_tx": samples_per_tx,
+        "max_depth": max_depth,
+        "coverage_threshold_dbm": coverage_threshold_dbm,
+        "verbose": False,
+    }
+
+    # ------------------------------------------------------------------
+    # 1. Create the scene with 2 APs + reflector
+    # ------------------------------------------------------------------
+    tx_positions_3d = [
+        (p[0], p[1], FIXED_Z) for p in initial_ap_positions
+    ]
+    scene_setup_kwargs: Dict[str, Any] = dict(
+        scene_path=scene_path,
+        frequency=frequency,
+        tx_positions=tx_positions_3d,
+        tx_power_dbm=tx_power_dbm,
+        rx_position=rx_position,
+        reflector_enabled=reflector_enabled,
+        reflector_size=reflector_size,
+        wall_top_left=wall_top_left,
+        wall_bottom_right=wall_bottom_right,
+        focal_point=[20.0, 20.0, target_z],  # placeholder
+        device="cpu",  # grid search is derivative-free
+    )
+
+    if reflector_enabled:
+        scene, reflector_ctrl = setup_building_floor_scene(**scene_setup_kwargs)
+    else:
+        scene = setup_building_floor_scene(**scene_setup_kwargs)
+        reflector_ctrl = None
+
+    # ------------------------------------------------------------------
+    # State tracking
+    # ------------------------------------------------------------------
+    current_ap_positions: List[Tuple[float, float]] = list(initial_ap_positions)
+    current_ap_orientations: List[Optional[Tuple[float, float, float]]] = [
+        None, None,
+    ]
+    current_reflector_u: float = 0.5
+    current_reflector_v: float = 0.5
+    current_reflector_target: Tuple[float, float, float] = (20.0, 20.0, target_z)
+
+    best_overall_pct: float = -float("inf")
+    best_overall_rss: float = -float("inf")
+    best_ap_positions: List[Tuple[float, float]] = list(current_ap_positions)
+    best_ap_orientations: List[Optional[Tuple[float, float, float]]] = [None, None]
+    best_reflector_u: float = current_reflector_u
+    best_reflector_v: float = current_reflector_v
+    best_reflector_target: Tuple[float, float, float] = current_reflector_target
+
+    history: List[Dict[str, Any]] = []
+
+    print("\n" + "=" * 80)
+    print("PHYSICALLY-AWARE ALTERNATING GRID SEARCH")
+    print(f"  2 APs + {'1 reflector' if reflector_enabled else 'no reflector'}")
+    print(f"  Objective: {target_quantile*100:.1f}th-percentile coverage")
+    print(f"  Outer rounds: {outer_rounds}")
+    print(f"  AP grid resolution: {ap_grid_resolution} m")
+    if reflector_enabled:
+        print(f"  Reflector u_steps={u_steps}, v_steps={v_steps}, "
+              f"target_resolution={target_resolution} m")
+    print("=" * 80)
+
+    global_start = time.time()
+
+    # ==================================================================
+    # OUTER ALTERNATION LOOP
+    # ==================================================================
+    with torch.no_grad():
+        for outer_rnd in range(outer_rounds):
+            print(f"\n{'─'*70}")
+            print(f"  OUTER ROUND {outer_rnd + 1}/{outer_rounds}")
+            print(f"{'─'*70}")
+
+            # ==========================================================
+            # PHASE A: AP position & orientation sweep (alternating)
+            # ==========================================================
+            print(f"\n  Phase A: AP placement sweep "
+                  f"({ap_alternating_rounds} inner rounds)")
+
+            for inner_rnd in range(ap_alternating_rounds):
+                for active_idx in range(2):
+                    fixed_idx = 1 - active_idx
+
+                    # Build orientations: active AP sweeps, fixed uses best
+                    orientations_for_tasks: List[
+                        Optional[Tuple[float, float, float]]
+                    ] = [None, None]
+                    orientations_for_tasks[fixed_idx] = (
+                        current_ap_orientations[fixed_idx]
+                    )
+
+                    tasks = generate_alternating_grid_tasks(
+                        active_ap_idx=active_idx,
+                        search_bounds=POSITION_BOUNDS,
+                        fixed_positions=current_ap_positions,
+                        fixed_orientations=orientations_for_tasks,
+                        grid_resolution=ap_grid_resolution,
+                        fixed_z=FIXED_Z,
+                    )
+                    num_tasks = len(tasks)
+
+                    if verbose:
+                        print(
+                            f"    Inner {inner_rnd+1}/{ap_alternating_rounds} "
+                            f"— sweeping AP{active_idx} "
+                            f"({num_tasks} pts, AP{fixed_idx} fixed at "
+                            f"{current_ap_positions[fixed_idx]})"
+                        )
+
+                    phase_best_pct = -float("inf")
+                    phase_best_info: Optional[Dict[str, Any]] = None
+                    phase_best_orientations: Optional[List] = None
+
+                    for t_idx, task_kwargs in enumerate(tasks):
+                        optimizer = SinglePointGridSearchOptimizer(
+                            scene=scene,
+                            reflector_controller=reflector_ctrl,
+                            reflector_u=current_reflector_u,
+                            reflector_v=current_reflector_v,
+                            reflector_target=current_reflector_target,
+                            percentile_objective=objective,
+                            **task_kwargs,
+                        )
+                        _pos, _orient, _rss = optimizer.optimize(**rt_params)
+
+                        pct_score = optimizer.results.get(
+                            "percentile_score", _rss
+                        )
+                        if pct_score > phase_best_pct:
+                            phase_best_pct = pct_score
+                            phase_best_info = {
+                                "position": _pos,
+                                "orientation": _orient,
+                                "rss": _rss,
+                                "percentile_score": pct_score,
+                                "percentile_score_dbm": optimizer.results.get(
+                                    "percentile_score_dbm",
+                                    _rss_watts_to_dbm(_rss),
+                                ),
+                            }
+                            phase_best_orientations = optimizer.results.get(
+                                "best_orientations", None
+                            )
+
+                        if verbose and (
+                            t_idx + 1
+                        ) % max(1, num_tasks // 5) == 0:
+                            print(
+                                f"      {t_idx + 1}/{num_tasks} | "
+                                f"best pct so far: "
+                                f"{_rss_watts_to_dbm(phase_best_pct):.2f} dBm"
+                            )
+
+                    # Update AP state with phase winner
+                    if phase_best_info is not None:
+                        pos = phase_best_info["position"]
+                        if isinstance(pos, np.ndarray):
+                            pos = pos.tolist()
+                        if isinstance(pos[0], (list, tuple)):
+                            current_ap_positions = [
+                                (p[0], p[1]) for p in pos
+                            ]
+                        else:
+                            current_ap_positions[active_idx] = (
+                                pos[0], pos[1],
+                            )
+
+                        if phase_best_orientations is not None:
+                            for i, d in enumerate(phase_best_orientations):
+                                current_ap_orientations[i] = (
+                                    tuple(d) if d is not None else None
+                                )
+
+                    if verbose:
+                        pct_dbm = _rss_watts_to_dbm(phase_best_pct)
+                        print(
+                            f"    → AP{active_idx} best at "
+                            f"{current_ap_positions[active_idx]}, "
+                            f"pct = {pct_dbm:.2f} dBm"
+                        )
+
+            # ==========================================================
+            # PHASE B: Reflector sweep (u, v, focal target)
+            # ==========================================================
+            if reflector_enabled and reflector_ctrl is not None:
+                print(f"\n  Phase B: Reflector placement sweep")
+
+                # Freeze AP positions & orientations for reflector sweep
+                frozen_ap_3d: List[Tuple[float, float, float]] = [
+                    (p[0], p[1], FIXED_Z) for p in current_ap_positions
+                ]
+                frozen_ap_dirs: List[Tuple[float, float, float]] = [
+                    o if o is not None else (0.0, 1.0, 0.0)
+                    for o in current_ap_orientations
+                ]
+
+                refl_tasks = generate_reflector_grid_tasks(
+                    fixed_ap_positions=frozen_ap_3d,
+                    fixed_ap_orientations=frozen_ap_dirs,
+                    u_steps=u_steps,
+                    v_steps=v_steps,
+                    target_bounds=target_bounds,
+                    target_resolution=target_resolution,
+                    target_z=target_z,
+                )
+                num_refl_tasks = len(refl_tasks)
+
+                if verbose:
+                    print(f"    {num_refl_tasks} reflector configurations")
+
+                refl_best_pct = -float("inf")
+                refl_best_task: Optional[Dict[str, Any]] = None
+
+                for r_idx, task in enumerate(refl_tasks):
+                    optimizer = SinglePointGridSearchOptimizer(
+                        scene=scene,
+                        evaluation_positions=task["evaluation_positions"],
+                        evaluation_orientations=task[
+                            "evaluation_orientations"
+                        ],
+                        fixed_z=task["fixed_z"],
+                        reflector_controller=reflector_ctrl,
+                        reflector_u=task["reflector_u"],
+                        reflector_v=task["reflector_v"],
+                        reflector_target=task["reflector_target"],
+                        percentile_objective=objective,
+                    )
+                    _pos, _orient, _rss = optimizer.optimize(**rt_params)
+
+                    pct_score = optimizer.results.get(
+                        "percentile_score", _rss
+                    )
+                    if pct_score > refl_best_pct:
+                        refl_best_pct = pct_score
+                        refl_best_task = {
+                            "reflector_u": task["reflector_u"],
+                            "reflector_v": task["reflector_v"],
+                            "reflector_target": task["reflector_target"],
+                            "rss": _rss,
+                            "percentile_score": pct_score,
+                            "percentile_score_dbm": optimizer.results.get(
+                                "percentile_score_dbm",
+                                _rss_watts_to_dbm(_rss),
+                            ),
+                        }
+
+                    if verbose and (
+                        r_idx + 1
+                    ) % max(1, num_refl_tasks // 10) == 0:
+                        print(
+                            f"      {r_idx + 1}/{num_refl_tasks} | "
+                            f"best pct: "
+                            f"{_rss_watts_to_dbm(refl_best_pct):.2f} dBm"
+                        )
+
+                # Update reflector state
+                if refl_best_task is not None:
+                    current_reflector_u = refl_best_task["reflector_u"]
+                    current_reflector_v = refl_best_task["reflector_v"]
+                    current_reflector_target = refl_best_task[
+                        "reflector_target"
+                    ]
+
+                    if verbose:
+                        print(
+                            f"    → Reflector best: u={current_reflector_u:.3f}, "
+                            f"v={current_reflector_v:.3f}, "
+                            f"target={current_reflector_target}, "
+                            f"pct = {refl_best_task['percentile_score_dbm']:.2f} dBm"
+                        )
+
+            # ----------------------------------------------------------
+            # Track global best across outer rounds
+            # ----------------------------------------------------------
+            # Re-evaluate current best config to get canonical score
+            round_pct = phase_best_pct
+            if reflector_enabled and refl_best_task is not None:
+                round_pct = max(round_pct, refl_best_pct)
+
+            if round_pct > best_overall_pct:
+                best_overall_pct = round_pct
+                best_ap_positions = list(current_ap_positions)
+                best_ap_orientations = list(current_ap_orientations)
+                best_reflector_u = current_reflector_u
+                best_reflector_v = current_reflector_v
+                best_reflector_target = current_reflector_target
+                if reflector_enabled and refl_best_task is not None:
+                    best_overall_rss = refl_best_task["rss"]
+                elif phase_best_info is not None:
+                    best_overall_rss = phase_best_info["rss"]
+
+            history.append({
+                "outer_round": outer_rnd + 1,
+                "ap_positions": [list(p) for p in current_ap_positions],
+                "ap_orientations": [
+                    list(o) if o is not None else None
+                    for o in current_ap_orientations
+                ],
+                "reflector_u": current_reflector_u,
+                "reflector_v": current_reflector_v,
+                "reflector_target": list(current_reflector_target),
+                "percentile_score": float(round_pct),
+                "percentile_score_dbm": _rss_watts_to_dbm(round_pct),
+            })
+
+            if verbose:
+                print(
+                    f"\n  Round {outer_rnd + 1} summary: "
+                    f"pct = {_rss_watts_to_dbm(round_pct):.2f} dBm  "
+                    f"(global best: {_rss_watts_to_dbm(best_overall_pct):.2f} dBm)"
+                )
+
+    # ==================================================================
+    # Summary
+    # ==================================================================
+    total_time = time.time() - global_start
+    best_pct_dbm = _rss_watts_to_dbm(best_overall_pct)
+    best_rss_dbm = _rss_watts_to_dbm(best_overall_rss)
+
+    best_ap_3d = [[p[0], p[1], FIXED_Z] for p in best_ap_positions]
+
+    print("\n" + "=" * 80)
+    print("PHYSICALLY-AWARE GRID SEARCH — COMPLETE")
+    print(f"  Total time: {total_time:.1f}s")
+    print(f"  Best AP positions: {best_ap_positions}")
+    print(f"  Best AP orientations: {best_ap_orientations}")
+    if reflector_enabled:
+        print(f"  Best reflector u={best_reflector_u:.3f}, "
+              f"v={best_reflector_v:.3f}")
+        print(f"  Best reflector target: {best_reflector_target}")
+    print(f"  Best {target_quantile*100:.0f}th-percentile: {best_pct_dbm:.2f} dBm")
+    print(f"  Min RSS at best config: {best_rss_dbm:.2f} dBm")
+    print("=" * 80)
+
+    return {
+        "best_ap_positions": best_ap_3d,
+        "best_ap_orientations": [
+            list(o) if o is not None else None
+            for o in best_ap_orientations
+        ],
+        "best_reflector_u": best_reflector_u,
+        "best_reflector_v": best_reflector_v,
+        "best_reflector_target": list(best_reflector_target),
+        "best_percentile_score": float(best_overall_pct),
+        "best_percentile_score_dbm": best_pct_dbm,
+        "best_min_rss": float(best_overall_rss),
+        "best_min_rss_dbm": best_rss_dbm,
+        "target_quantile": target_quantile,
+        "outer_rounds": outer_rounds,
+        "ap_grid_resolution": ap_grid_resolution,
+        "reflector_u_steps": u_steps,
+        "reflector_v_steps": v_steps,
+        "time_elapsed": total_time,
+        "history": history,
+        # Standard interface keys for comparison table
+        "best_position": best_ap_3d,
+        "best_metric": float(best_overall_pct),
+        "best_metric_dbm": best_pct_dbm,
+        "best_direction": [
+            list(o) if o is not None else None
+            for o in best_ap_orientations
+        ],
+        "best_look_at": None,
+        "final_position": best_ap_3d,
+        "final_direction": [
+            list(o) if o is not None else None
+            for o in best_ap_orientations
+        ],
+        "final_look_at": None,
+        "best_iteration": -1,
+    }
+
+
+def run_grid_search_2ap_with_reflector(
+    scene_path: str = str(SCENE_PATH),
+    *,
+    ap_grid_resolution: float = 5.0,
+    ap_alternating_rounds: int = ALTERNATING_ROUNDS,
+    initial_ap_positions: Optional[List[Tuple[float, float]]] = None,
+    reflector_size: Tuple[float, float] = (2.0, 2.0),
+    wall_top_left: List[float] = [15.0, 34.0, 3.0],
+    wall_bottom_right: List[float] = [34.0, 34.0, 1.0],
+    u_steps: int = 5,
+    v_steps: int = 5,
+    target_bounds: Optional[Dict[str, float]] = None,
+    target_resolution: float = 5.0,
+    target_z: float = 1.5,
+    target_quantile: float = 0.05,
+    shadow_fraction: Optional[float] = None,
+    outer_rounds: int = 2,
+    samples_per_tx: int = 1_000_000,
+    max_depth: int = 13,
+    coverage_threshold_dbm: float = -100.0,
+    rx_position: Tuple[float, float, float] = (16.0, 6.5, 1.5),
+    frequency: float = 5.18e9,
+    tx_power_dbm: float = 5.0,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """Run joint 2-AP + reflector position/orientation grid search.
+
+    This is a convenience wrapper around
+    :func:`run_grid_search_physically_aware` dedicated to the use case of
+    optimizing two APs together with one passive reflector.
+
+    Notes
+    -----
+    - APs: alternating grid search over positions + orientation sweep.
+    - Reflector: grid search over wall placement ``(u, v)`` + focal target.
+    - Objective: quantile-based robustness metric (default 5th percentile).
+    - Entire evaluation runs under ``torch.no_grad()`` in the underlying
+      implementation for derivative-free execution.
+    """
+    return run_grid_search_physically_aware(
+        scene_path=scene_path,
+        ap_grid_resolution=ap_grid_resolution,
+        ap_alternating_rounds=ap_alternating_rounds,
+        initial_ap_positions=initial_ap_positions,
+        reflector_enabled=True,
+        reflector_size=reflector_size,
+        wall_top_left=wall_top_left,
+        wall_bottom_right=wall_bottom_right,
+        u_steps=u_steps,
+        v_steps=v_steps,
+        target_bounds=target_bounds,
+        target_resolution=target_resolution,
+        target_z=target_z,
+        target_quantile=target_quantile,
+        shadow_fraction=shadow_fraction,
+        outer_rounds=outer_rounds,
+        samples_per_tx=samples_per_tx,
+        max_depth=max_depth,
+        coverage_threshold_dbm=coverage_threshold_dbm,
+        rx_position=rx_position,
+        frequency=frequency,
+        tx_power_dbm=tx_power_dbm,
+        verbose=verbose,
+    )
+
+
 # -- Comparison and reporting --------------------------------------------------
 
 def _fmt_dir(d):
@@ -663,62 +1417,67 @@ def main():
     # ==================================================================
     # 0. REFLECTOR INTEGRATION VERIFICATION
     # ==================================================================
-    run_reflector_verification(verbose=True)
+    # run_reflector_verification(verbose=True)
 
     # ==================================================================
-    # 1-AP RUNS (scene with 1 transmitter)
+    # 0b. REFLECTOR GRID SEARCH (sequential validation)
     # ==================================================================
-    print("Setting up 1-AP scene...")
-    scene_1ap = setup_building_floor_scene(
+    refl_gs_info = run_reflector_grid_search(
+        verbose=True,
+        u_steps=3,
+        v_steps=3,
+        target_resolution=10.0,  # coarse grid for validation
+    )
+
+    # # ==================================================================
+    # # 1-AP RUNS (scene with 1 transmitter)
+    # # ==================================================================
+    # print("Setting up 1-AP scene...")
+    # scene_1ap = setup_building_floor_scene(
+    #     scene_path=str(SCENE_PATH),
+    #     frequency=5.18e9,
+    #     tx_power_dbm=5.0,
+    # )
+
+    # # -- 1-AP Grid Search ------------------------------------------------------
+    # gs_1ap_info = run_grid_search_1ap(scene_1ap, grid_resolution=5.0, verbose=True)
+
+    # # -- 1-AP Gradient Descent -------------------------------------------------
+    # gd_1ap_info, gd_1ap_opt = run_gradient_descent(
+    #     scene_1ap, num_aps=1, verbose=True,
+    # )
+
+    # ==================================================================
+    # 2-AP + Reflector RUN (joint physically-aware grid search)
+    # ==================================================================
+    print("\n\nRunning 2-AP + Reflector grid search...")
+    gs_2ap_refl_info = run_grid_search_2ap_with_reflector(
         scene_path=str(SCENE_PATH),
-        frequency=5.18e9,
-        tx_power_dbm=5.0,
+        ap_grid_resolution=5.0,
+        ap_alternating_rounds=ALTERNATING_ROUNDS,
+        initial_ap_positions=list(INITIAL_AP_POSITIONS_2AP),
+        u_steps=3,
+        v_steps=3,
+        target_resolution=10.0,
+        target_quantile=0.05,
+        outer_rounds=2,
+        verbose=True,
     )
 
-    # -- 1-AP Grid Search ------------------------------------------------------
-    gs_1ap_info = run_grid_search(scene_1ap, grid_resolution=5.0, verbose=True)
-
-    # -- 1-AP Gradient Descent -------------------------------------------------
-    gd_1ap_info, gd_1ap_opt = run_gradient_descent(
-        scene_1ap, num_aps=1, verbose=True,
-    )
-
-    # ==================================================================
-    # 2-AP RUNS (scene with 2 transmitters)
-    # ==================================================================
-    print("\n\nSetting up 2-AP scene...")
-    scene_2ap = setup_building_floor_scene(
-        scene_path=str(SCENE_PATH),
-        frequency=5.18e9,
-        tx_power_dbm=5.0,
-        tx_positions=[
-            (INITIAL_AP_POSITIONS_2AP[0][0], INITIAL_AP_POSITIONS_2AP[0][1], FIXED_Z),
-            (INITIAL_AP_POSITIONS_2AP[1][0], INITIAL_AP_POSITIONS_2AP[1][1], FIXED_Z),
-        ],
-    )
-
-    # -- 2-AP Grid Search (alternating) ----------------------------------------
-    gs_2ap_info = run_grid_search_2ap(
-        scene_2ap, grid_resolution=5.0, num_rounds=ALTERNATING_ROUNDS, verbose=True,
-    )
-
-    # -- 2-AP Gradient Descent -------------------------------------------------
-    gd_2ap_info, gd_2ap_opt = run_gradient_descent(
-        scene_2ap, num_aps=2, verbose=True,
-    )
+    # # -- 2-AP Gradient Descent -------------------------------------------------
+    # gd_2ap_info, gd_2ap_opt = run_gradient_descent(
+    #     scene_2ap, num_aps=2, verbose=True,
+    # )
 
     # ==================================================================
     # COMPARISON TABLE
     # ==================================================================
     print("\n" + "=" * 80)
-    print("FULL COMPARISON — 1 AP vs 2 APs × Grid Search vs Gradient Descent")
+    print("RUN SUMMARY — 2 APs + Reflector Grid Search")
     print("=" * 80)
 
     configs = [
-        ("GS  1-AP", gs_1ap_info),
-        ("GD  1-AP", gd_1ap_info),
-        ("GS  2-AP", gs_2ap_info),
-        ("GD  2-AP", gd_2ap_info),
+        ("GS 2-AP + Reflector", gs_2ap_refl_info),
     ]
 
     for label, info in configs:
@@ -739,7 +1498,7 @@ def main():
 
     # Quick summary line
     print("\n" + "-" * 80)
-    print("  Summary (Min RSS in dBm):")
+    print("  Summary (Best Metric in dBm):")
     for label, info in configs:
         print(f"    {label}: {info['best_metric_dbm']:.2f} dBm  ({info['time_elapsed']:.1f}s)")
 
@@ -758,13 +1517,129 @@ def main():
         json.dump(summary, f, indent=2, default=str)
     print(f"\nResults saved to: {out_path}")
 
-    # -- Plot results ----------------------------------------------------------
-    for name, opt in [("1-AP", gd_1ap_opt), ("2-AP", gd_2ap_opt)]:
-        try:
-            opt.plot_optimization_trajectory()
-        except Exception as e:
-            print(f"\nNote: Could not plot {name} GD results (requires display): {e}")
+    # # -- Plot results ----------------------------------------------------------
+    # for name, opt in [("1-AP", gd_1ap_opt), ("2-AP", gd_2ap_opt)]:
+    #     try:
+    #         opt.plot_optimization_trajectory()
+    #     except Exception as e:
+    #         print(f"\nNote: Could not plot {name} GD results (requires display): {e}")
 
+
+# def main():
+#     # ==================================================================
+#     # 0. REFLECTOR INTEGRATION VERIFICATION
+#     # ==================================================================
+#     run_reflector_verification(verbose=True)
+
+#     # ==================================================================
+#     # 0b. REFLECTOR GRID SEARCH (sequential validation)
+#     # ==================================================================
+#     refl_gs_info = run_reflector_grid_search(
+#         verbose=True,
+#         u_steps=3,
+#         v_steps=3,
+#         target_resolution=10.0,  # coarse grid for validation
+#     )
+
+#     # ==================================================================
+#     # 1-AP RUNS (scene with 1 transmitter)
+#     # ==================================================================
+#     print("Setting up 1-AP scene...")
+#     scene_1ap = setup_building_floor_scene(
+#         scene_path=str(SCENE_PATH),
+#         frequency=5.18e9,
+#         tx_power_dbm=5.0,
+#     )
+
+#     # -- 1-AP Grid Search ------------------------------------------------------
+#     gs_1ap_info = run_grid_search_1ap(scene_1ap, grid_resolution=5.0, verbose=True)
+
+#     # -- 1-AP Gradient Descent -------------------------------------------------
+#     gd_1ap_info, gd_1ap_opt = run_gradient_descent(
+#         scene_1ap, num_aps=1, verbose=True,
+#     )
+
+#     # ==================================================================
+#     # 2-AP RUNS (scene with 2 transmitters)
+#     # ==================================================================
+#     print("\n\nSetting up 2-AP scene...")
+#     scene_2ap = setup_building_floor_scene(
+#         scene_path=str(SCENE_PATH),
+#         frequency=5.18e9,
+#         tx_power_dbm=5.0,
+#         tx_positions=[
+#             (INITIAL_AP_POSITIONS_2AP[0][0], INITIAL_AP_POSITIONS_2AP[0][1], FIXED_Z),
+#             (INITIAL_AP_POSITIONS_2AP[1][0], INITIAL_AP_POSITIONS_2AP[1][1], FIXED_Z),
+#         ],
+#     )
+
+#     # -- 2-AP Grid Search (alternating) ----------------------------------------
+#     gs_2ap_info = run_grid_search_2ap(
+#         scene_2ap, grid_resolution=5.0, num_rounds=ALTERNATING_ROUNDS, verbose=True,
+#     )
+
+#     # -- 2-AP Gradient Descent -------------------------------------------------
+#     gd_2ap_info, gd_2ap_opt = run_gradient_descent(
+#         scene_2ap, num_aps=2, verbose=True,
+#     )
+
+#     # ==================================================================
+#     # COMPARISON TABLE
+#     # ==================================================================
+#     print("\n" + "=" * 80)
+#     print("FULL COMPARISON — 1 AP vs 2 APs × Grid Search vs Gradient Descent")
+#     print("=" * 80)
+
+#     configs = [
+#         ("GS  1-AP", gs_1ap_info),
+#         ("GD  1-AP", gd_1ap_info),
+#         ("GS  2-AP", gs_2ap_info),
+#         ("GD  2-AP", gd_2ap_info),
+#     ]
+
+#     for label, info in configs:
+#         print(f"\n  {label}:")
+#         print(f"    Best position:  {_fmt_pos(info['best_position'])}")
+#         print(f"    Best direction: {_fmt_dir(info['best_direction'])}")
+#         if info.get("best_look_at"):
+#             print(f"    Best look_at:   {_fmt_pos(info['best_look_at'])}")
+#         if info.get("final_position") and info["final_position"] != info["best_position"]:
+#             print(f"    Final position: {_fmt_pos(info['final_position'])}")
+#         if info.get("final_direction") and info["final_direction"] != info["best_direction"]:
+#             print(f"    Final dir:      {_fmt_dir(info['final_direction'])}")
+#         if info.get("best_iteration", -1) >= 0:
+#             print(f"    Best iteration: {info['best_iteration'] + 1}"
+#                   f"/{info.get('num_iterations', '?')}")
+#         print(f"    Min RSS:        {info['best_metric_dbm']:.2f} dBm")
+#         print(f"    Time:           {info['time_elapsed']:.1f}s")
+
+#     # Quick summary line
+#     print("\n" + "-" * 80)
+#     print("  Summary (Min RSS in dBm):")
+#     for label, info in configs:
+#         print(f"    {label}: {info['best_metric_dbm']:.2f} dBm  ({info['time_elapsed']:.1f}s)")
+
+#     # -- Save results ----------------------------------------------------------
+#     os.makedirs(OUTPUT_DIR, exist_ok=True)
+#     summary = {}
+#     for label, info in configs:
+#         key = label.strip().lower().replace(" ", "_").replace("-", "")
+#         # Drop non-serialisable bits
+#         summary[key] = {
+#             k: v for k, v in info.items()
+#             if k != "all_point_results"
+#         }
+#     out_path = os.path.join(OUTPUT_DIR, "comparison_results.json")
+#     with open(out_path, "w") as f:
+#         json.dump(summary, f, indent=2, default=str)
+#     print(f"\nResults saved to: {out_path}")
+
+#     # -- Plot results ----------------------------------------------------------
+#     for name, opt in [("1-AP", gd_1ap_opt), ("2-AP", gd_2ap_opt)]:
+#         try:
+#             opt.plot_optimization_trajectory()
+#         except Exception as e:
+#             print(f"\nNote: Could not plot {name} GD results (requires display): {e}")
 
 if __name__ == "__main__":
     main()
