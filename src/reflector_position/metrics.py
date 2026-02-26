@@ -2,8 +2,8 @@
 Metrics for evaluating radio map quality and coverage.
 
 This module provides functions for computing various metrics from radio maps,
-including minimum RSS, soft minimum RSS, normalized SoftMin loss, and coverage
-area calculations.
+including minimum RSS, soft minimum RSS, normalized SoftMin loss, coverage
+area calculations, and percentile-based robustness objectives.
 
 Constants:
     POWER_EPSILON: Minimum power floor (Watts) used throughout the module to
@@ -13,6 +13,7 @@ Constants:
 """
 
 import torch
+import torch.nn as nn
 
 # ---------------------------------------------------------------------------
 # Global epsilon — single source of truth for all power-floor comparisons
@@ -280,3 +281,133 @@ def differentiable_coverage_loss(
 
     # Return loss to minimise (1 − coverage)
     return 1.0 - soft_coverage_ratio
+
+
+# ---------------------------------------------------------------------------
+# Percentile Coverage Objective (derivative-free)
+# ---------------------------------------------------------------------------
+
+class PercentileCoverageObjective(nn.Module):
+    """Derivative-free objective targeting a specific quantile of the coverage map.
+
+    Standard minimum-signal (0th-percentile) objectives fail when a passive
+    reflector is present because the reflector casts a perfect RF shadow
+    (dead zone) behind it.  The absolute minimum is always inside this
+    physical shadow and traps the optimiser.
+
+    This objective evaluates the *q*-th quantile of the power map instead,
+    effectively ignoring the small fraction of the grid swallowed by the
+    shadow.
+
+    Shadow-Area Constraint
+    ~~~~~~~~~~~~~~~~~~~~~~
+    The chosen ``target_quantile`` **must** be strictly larger than the
+    fraction of grid cells covered by the reflector's physical shadow.
+    For example, if a 2 m × 2 m reflector shadows ≈ 3 % of the room
+    area, setting ``target_quantile = 0.02`` would still evaluate cells
+    inside the dead zone, defeating the purpose.  A safe rule of thumb:
+
+    .. math::
+
+        q_{\\text{target}} > \\frac{A_{\\text{shadow}}}{A_{\\text{room}}}
+
+    The constructor enforces a *minimum* quantile (default 0.02) and
+    emits a warning when the value is suspiciously low.
+
+    Parameters
+    ----------
+    target_quantile : float
+        Percentile to evaluate, in [0, 1].  Default **0.05** (5th
+        percentile).  Must exceed the shadow-area fraction.
+    mode : str
+        ``"maximize"`` — higher score ⇒ better coverage (default for
+        GA / grid search fitness).
+        ``"minimize"`` — returns the negative score so that lower ⇒ better
+        (for loss-based minimisers).
+    shadow_fraction : float, optional
+        Estimated fraction of the grid area covered by the reflector's
+        shadow.  When provided, the constructor validates that
+        ``target_quantile > shadow_fraction`` and raises ``ValueError``
+        otherwise.  This is a soft safety net; callers should compute the
+        true shadow fraction from their geometry when possible.
+    """
+
+    def __init__(
+        self,
+        target_quantile: float = 0.05,
+        mode: str = "maximize",
+        shadow_fraction: float | None = None,
+    ) -> None:
+        super().__init__()
+        if not (0.0 <= target_quantile <= 1.0):
+            raise ValueError(
+                f"target_quantile must be in [0, 1], got {target_quantile}"
+            )
+        if mode not in ("maximize", "minimize"):
+            raise ValueError(f"mode must be 'maximize' or 'minimize', got {mode!r}")
+
+        # --- Shadow-area safety check ---
+        if shadow_fraction is not None:
+            if not (0.0 <= shadow_fraction < 1.0):
+                raise ValueError(
+                    f"shadow_fraction must be in [0, 1), got {shadow_fraction}"
+                )
+            if target_quantile <= shadow_fraction:
+                raise ValueError(
+                    f"target_quantile ({target_quantile}) must be strictly "
+                    f"larger than shadow_fraction ({shadow_fraction}).  "
+                    f"Otherwise the quantile still evaluates cells inside "
+                    f"the reflector's RF dead zone."
+                )
+
+        import warnings
+
+        _MIN_SENSIBLE_QUANTILE = 0.02
+        if target_quantile < _MIN_SENSIBLE_QUANTILE:
+            warnings.warn(
+                f"target_quantile={target_quantile} is very low.  With a "
+                f"typical reflector the physical shadow covers 2–5 % of the "
+                f"room.  A quantile below that threshold will still evaluate "
+                f"dead-zone cells.  Consider using ≥ 0.05.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        self.target_quantile = target_quantile
+        self.mode = mode
+
+    def forward(self, coverage_map: torch.Tensor) -> torch.Tensor:
+        """Evaluate the percentile objective on a coverage map.
+
+        Parameters
+        ----------
+        coverage_map : torch.Tensor
+            Signal-strength grid.  Accepted shapes:
+            - 2-D ``(H, W)`` — single grid evaluation.
+            - 3-D ``(B, H, W)`` — batched evaluation (one score per grid).
+            Values should be in **linear Watts** or **dBm**; the quantile
+            operation is order-preserving so the unit does not affect the
+            ranking, only the absolute score.
+
+        Returns
+        -------
+        torch.Tensor
+            Scalar (single grid) or ``(B,)`` tensor of fitness scores.
+            Higher ⇒ better when ``mode="maximize"``; lower ⇒ better when
+            ``mode="minimize"``.
+        """
+        if not coverage_map.is_floating_point():
+            coverage_map = coverage_map.float()
+
+        # Batched input: (B, H, W) → (B, H*W)
+        if coverage_map.dim() > 2:
+            flat_maps = coverage_map.view(coverage_map.size(0), -1)
+            score = torch.quantile(flat_maps, self.target_quantile, dim=1)
+        else:
+            flat_map = coverage_map.view(-1)
+            score = torch.quantile(flat_map, self.target_quantile)
+
+        if self.mode == "minimize":
+            return -score
+
+        return score

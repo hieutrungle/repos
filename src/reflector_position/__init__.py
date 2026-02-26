@@ -11,6 +11,7 @@ from .optimizers import (
     BaseAPOptimizer,
     SinglePointGridSearchOptimizer,
     generate_alternating_grid_tasks,
+    generate_reflector_grid_tasks,
     GradientDescentAPOptimizer,
     OptimizerFactory,
     create_optimizer,
@@ -26,6 +27,7 @@ from .metrics import (
     differentiable_coverage_loss,
     rss_to_dbm,
     dbm_to_rss,
+    PercentileCoverageObjective,
 )
 from .utils import compute_radio_map_with_tx_position
 from .config import (
@@ -41,6 +43,7 @@ __all__ = [
     "BaseAPOptimizer",
     "SinglePointGridSearchOptimizer",
     "generate_alternating_grid_tasks",
+    "generate_reflector_grid_tasks",
     "GradientDescentAPOptimizer",
     "OptimizerFactory",
     "create_optimizer",
@@ -59,6 +62,7 @@ __all__ = [
     "differentiable_coverage_loss",
     "rss_to_dbm",
     "dbm_to_rss",
+    "PercentileCoverageObjective",
     # Utils
     "compute_radio_map_with_tx_position",
     # Config

@@ -7,6 +7,7 @@ from .grid_search import (
     SinglePointGridSearchOptimizer,
     generate_grid_positions,
     generate_alternating_grid_tasks,
+    generate_reflector_grid_tasks,
     CARDINAL_DIRECTIONS,
 )
 from .gradient_descent import GradientDescentAPOptimizer
