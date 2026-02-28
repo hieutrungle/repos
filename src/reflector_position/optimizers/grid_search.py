@@ -684,9 +684,12 @@ class SinglePointGridSearchOptimizer(BaseAPOptimizer):
             # Apply reflector geometry (no-op if no controller supplied)
             self._apply_reflector(tx_positions)
 
-            metrics = self._compute_metrics(
-                samples_per_tx, max_depth, coverage_threshold_dbm,
-            )
+            # Wrap evaluation in no_grad to save GPU memory and maximize
+            # throughput during derivative-free (GA / grid search) runs.
+            with torch.no_grad():
+                metrics = self._compute_metrics(
+                    samples_per_tx, max_depth, coverage_threshold_dbm,
+                )
 
             # Store per-combo sweep data
             sweep_entry: Dict[str, Any] = {

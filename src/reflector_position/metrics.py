@@ -251,6 +251,155 @@ def normalized_softmin_loss(
 
 
 # ---------------------------------------------------------------------------
+# Masked SoftMin Loss (shadow-aware, for reflector environments)
+# ---------------------------------------------------------------------------
+
+class MaskedSoftMinLoss(nn.Module):
+    """Shadow-aware differentiable soft-min loss for reflector environments.
+
+    Standard soft-min losses treat every grid cell equally, which fails when
+    a passive reflector creates a permanent RF dead zone (shadow) covering
+    2-5 % of the map.  This module **masks out** the lowest-signal cells
+    before computing the soft-min, so the optimiser focuses on improvable
+    coverage rather than the immovable shadow.
+
+    Architectural Constraints
+    -------------------------
+    1. **Differentiable masking via** ``detach()``:  The quantile threshold
+       used to identify shadow cells is computed with
+       ``torch.quantile(...).detach()``.  Gradients flow through the
+       *values* of surviving cells but **not** through the mask boundary,
+       preventing the optimiser from gaming the masking criterion.
+
+    2. **Loss minimisation = maximising minimum signal**:  The returned value
+       is ``-soft_min`` so that ``minimise(loss) ≡ maximise(soft_min) ≡
+       maximise(worst-case signal strength)``.
+
+    3. **Temperature tuning & numerical stability**:  The ``temperature``
+       parameter *τ* controls how closely the soft-min approximates the true
+       ``min()``.  Lower *τ* → sharper approximation (same convention as
+       :func:`normalized_softmin_loss`).  The ratio
+       ``max(|score|) / τ`` must stay below ~80 to avoid overflow inside
+       ``logsumexp``.  For dBm-normalised scores in [0, 1], *τ* ∈ [0.02, 0.2]
+       is generally safe.  A ``RuntimeWarning`` is emitted when the ratio
+       approaches the stability threshold.
+
+    Parameters
+    ----------
+    shadow_quantile : float
+        Fraction of lowest-signal cells to exclude (the reflector shadow).
+        Must be in (0, 1).  Default **0.05** (excludes bottom 5 %).
+    temperature : float
+        Soft-min sharpness (τ).  Lower → closer to true ``min()``.
+        Same convention as :func:`normalized_softmin_loss`.
+        Default **0.1**.
+    floor_dbm : float
+        dBm value mapped to normalised score 0.0 ("dead zone").
+        Default −120.
+    ceil_dbm : float
+        dBm value mapped to normalised score 1.0 ("strong signal").
+        Default −60.
+
+    Example::
+
+        >>> loss_fn = MaskedSoftMinLoss(shadow_quantile=0.05, temperature=0.1)
+        >>> rss = torch.tensor([1e-11, 1e-12, 1e-13, 1e-16])
+        >>> loss = loss_fn(rss)
+        >>> loss.backward()   # gradients flow cleanly
+    """
+
+    _LOGSUMEXP_SAFE: float = 80.0  # max_score / τ threshold for overflow warning
+
+    def __init__(
+        self,
+        shadow_quantile: float = 0.05,
+        temperature: float = 0.1,
+        floor_dbm: float = -120.0,
+        ceil_dbm: float = -60.0,
+    ) -> None:
+        super().__init__()
+        if not (0.0 < shadow_quantile < 1.0):
+            raise ValueError(
+                f"shadow_quantile must be in (0, 1), got {shadow_quantile}"
+            )
+        if temperature <= 0:
+            raise ValueError(f"temperature must be positive, got {temperature}")
+        self.shadow_quantile = shadow_quantile
+        self.temperature = temperature
+        self.floor_dbm = floor_dbm
+        self.ceil_dbm = ceil_dbm
+
+    def forward(self, rss_watts: torch.Tensor) -> torch.Tensor:
+        """Compute the masked soft-min loss.
+
+        Parameters
+        ----------
+        rss_watts : torch.Tensor
+            Radio-map RSS in **linear Watts**.  Any shape; flattened
+            internally.
+
+        Returns
+        -------
+        torch.Tensor
+            Scalar loss to **minimise**.  Lower ⇒ better worst-case
+            coverage among non-shadow cells.
+        """
+        flat = rss_watts.flatten()
+
+        # Exclude numerical-noise cells
+        valid_mask = flat > POWER_EPSILON
+        valid = flat[valid_mask]
+
+        if valid.numel() == 0:
+            return torch.tensor(
+                0.0, device=rss_watts.device, dtype=rss_watts.dtype,
+                requires_grad=True,
+            )
+
+        # -- Watts → dBm → [0, 1] normalised scores -----------------------
+        valid_dbm = 10.0 * torch.log10(valid + POWER_EPSILON) + 30.0
+        span = self.ceil_dbm - self.floor_dbm
+        scores = (valid_dbm - self.floor_dbm) / span
+        scores = torch.clamp(scores, min=0.0, max=1.0)
+
+        # -- Constraint 1: detached quantile mask --------------------------
+        # .detach() severs gradient through the threshold itself so the
+        # optimiser cannot shift the mask boundary to cheat.
+        threshold = torch.quantile(scores, self.shadow_quantile).detach()
+        mask = scores > threshold
+        valid_scores = scores[mask]
+
+        if valid_scores.numel() == 0:
+            return torch.tensor(
+                0.0, device=rss_watts.device, dtype=rss_watts.dtype,
+                requires_grad=True,
+            )
+
+        # -- Constraint 3: numerical-stability check -----------------------
+        tau = self.temperature
+        max_val = float(valid_scores.max().item())
+        if max_val / tau > self._LOGSUMEXP_SAFE:
+            import warnings
+            warnings.warn(
+                f"MaskedSoftMinLoss: max_score/τ = {max_val / tau:.1f} > "
+                f"{self._LOGSUMEXP_SAFE}.  Risk of numerical overflow in "
+                f"logsumexp.  Consider increasing temperature (currently {tau}) "
+                f"or widening the dBm normalisation window.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+        # -- Constraint 2: soft-min via logsumexp --------------------------
+        # soft_min ≈ min(valid_scores) as τ → 0
+        # Same formula as normalized_softmin_loss:
+        #   loss = τ · logsumexp(-s / τ)
+        soft_min = -tau * torch.logsumexp(-valid_scores / tau, dim=0)
+
+        # Minimise -soft_min  ≡  maximise soft_min  ≡  maximise worst-case
+        return -soft_min
+
+
+# ---------------------------------------------------------------------------
 # Differentiable Coverage Loss (Sigmoid approximation)
 # ---------------------------------------------------------------------------
 

@@ -24,6 +24,7 @@ from .metrics import (
     compute_p5_rss_metric,
     compute_soft_min_rss_metric,
     normalized_softmin_loss,
+    MaskedSoftMinLoss,
     compute_coverage_metric,
     differentiable_coverage_loss,
     rss_to_dbm,

@@ -30,6 +30,20 @@ Chromosome Encoding:
       are closer than ``min_ap_separation`` metres, saving expensive
       ray-tracing by returning a penalty fitness immediately.
 
+    **Reflector extension** (``reflector_enabled=True``):
+      When a passive reflector is present, 4 additional genes are
+      appended *after* the AP direction genes:
+
+        ``[..., reflector_u, reflector_v, focal_x, focal_y]``
+
+      - ``reflector_u`` ∈ [0, 1]: lateral wall-surface coordinate.
+      - ``reflector_v`` ∈ [0, 1]: vertical wall-surface coordinate.
+      - ``focal_x``, ``focal_y``: horizontal components of the 3-D
+        focal point the reflector should aim at.
+
+      The focal point's *z* component is fixed at the receiver height
+      (``focal_z``) so the GA only searches in 2-D focal space.
+
     Direction genes encode the horizontal components of the look-at vector.
     The vertical component ``dir_z`` is fixed at ``-0.5`` (downward bias).
     Before evaluation the raw vector ``[dir_x, dir_y, -0.5]`` is
@@ -40,6 +54,10 @@ Key Principles:
     2. **Dependency injection** via ``executor_map``.
     3. ``_format_individual(ind)`` converts a DEAP individual into
        the argument tuple expected by ``OptimizationWorker.optimize``.
+       When reflector genes are present the formatted kwargs include
+       ``reflector_u``, ``reflector_v``, ``reflector_target``, and
+       ``percentile_target_quantile`` so the worker configures the
+       reflector and uses the shadow-robust objective automatically.
     4. The injected ``map`` returns raw worker result dicts; fitness extraction
        (``result["best_metric"]``) happens here in the GA runner.
 
@@ -135,12 +153,27 @@ def _normalize_direction(
     return (float(unit[0]), float(unit[1]), float(unit[2]))
 
 
-def _split_mutate(individual, mu, sigma_pos, sigma_dir, indpb, num_pos_genes=2):
-    """Gaussian mutation with different sigmas for position vs direction genes.
+def _split_mutate(
+    individual,
+    mu,
+    sigma_pos,
+    sigma_dir,
+    indpb,
+    num_pos_genes=2,
+    sigma_reflector=0.1,
+    reflector_gene_start=-1,
+):
+    """Gaussian mutation with different sigmas for position, direction, and
+    reflector genes.
 
     Genes ``0`` to ``num_pos_genes - 1`` receive ``sigma_pos``;
-    remaining genes receive ``sigma_dir``.  This allows coarse spatial
-    exploration and fine-grained angular tuning simultaneously.
+    genes from ``num_pos_genes`` to ``reflector_gene_start - 1`` receive
+    ``sigma_dir`` (AP orientation); genes from ``reflector_gene_start``
+    onward receive ``sigma_reflector`` (reflector wall-surface *u*/*v*
+    and focal-point coordinates).
+
+    When ``reflector_gene_start < 0`` (default) no reflector region
+    exists and the function behaves exactly as before.
 
     For 1-AP: ``num_pos_genes=2`` → genes 0–1 position, genes 2–3 direction.
     For 2-AP: ``num_pos_genes=4`` → genes 0–3 position, genes 4–7 direction.
@@ -150,7 +183,12 @@ def _split_mutate(individual, mu, sigma_pos, sigma_dir, indpb, num_pos_genes=2):
     """
     for i in range(len(individual)):
         if random.random() < indpb:
-            sigma = sigma_pos if i < num_pos_genes else sigma_dir
+            if i < num_pos_genes:
+                sigma = sigma_pos
+            elif reflector_gene_start >= 0 and i >= reflector_gene_start:
+                sigma = sigma_reflector
+            else:
+                sigma = sigma_dir
             individual[i] += random.gauss(mu, sigma)
     return (individual,)
 
@@ -181,6 +219,19 @@ class GeneticAlgorithmRunner:
     individual whose APs are closer than ``min_ap_separation`` metres
     receives a penalty fitness and is *not* evaluated via ray tracing,
     saving compute.
+
+    When ``reflector_enabled=True``, 4 continuous reflector genes are
+    appended after the AP genes:
+
+    - ``reflector_u`` ∈ [0, 1]: lateral wall-surface coordinate.
+    - ``reflector_v`` ∈ [0, 1]: vertical wall-surface coordinate.
+    - ``focal_x``, ``focal_y``: horizontal focal-point components
+      (bounded by ``focal_bounds``).
+
+    The formatted evaluation kwargs include the reflector parameters and
+    the ``percentile_target_quantile`` so the worker automatically
+    constructs a :class:`PercentileCoverageObjective` and configures the
+    reflector geometry before each ray-trace.
     """
 
     def __init__(
@@ -192,6 +243,11 @@ class GeneticAlgorithmRunner:
         fixed_dir_z: float = FIXED_DIR_Z_DEFAULT,
         num_aps: int = 1,
         min_ap_separation: float = MIN_AP_SEPARATION_DEFAULT,
+        # ---- Reflector parameters (optional) ----
+        reflector_enabled: bool = False,
+        focal_bounds: Optional[Dict[str, float]] = None,
+        focal_z: float = 1.5,
+        percentile_target_quantile: float = 0.05,
     ):
         """
         Args:
@@ -208,6 +264,18 @@ class GeneticAlgorithmRunner:
             min_ap_separation: Minimum allowed Euclidean distance (metres)
                 between APs.  Individuals violating this constraint receive
                 a penalty fitness.  Only used when ``num_aps >= 2``.
+            reflector_enabled: If ``True``, append 4 reflector genes
+                (``u``, ``v``, ``focal_x``, ``focal_y``) to every
+                individual.
+            focal_bounds: Search-space bounds for the focal-point genes:
+                ``{fx_min, fx_max, fy_min, fy_max}``.  Defaults to the
+                same spatial bounds as AP positions when ``None``.
+            focal_z: Fixed z-coordinate for the reflector focal point
+                (typically the receiver height).
+            percentile_target_quantile: Quantile passed to the
+                ``PercentileCoverageObjective`` on each worker.  Default
+                0.05 (5th percentile).  Must exceed the reflector shadow
+                fraction.
         """
         self.bounds = position_bounds
         self.fixed_z = fixed_z
@@ -217,13 +285,38 @@ class GeneticAlgorithmRunner:
         self.num_aps = num_aps
         self.min_ap_separation = min_ap_separation
 
+        # ---- Reflector configuration ----
+        self.reflector_enabled = reflector_enabled
+        self.focal_z = focal_z
+        self.percentile_target_quantile = percentile_target_quantile
+
+        if focal_bounds is not None:
+            self.focal_bounds = focal_bounds
+        else:
+            # Default: same spatial extent as AP position bounds
+            self.focal_bounds = {
+                "fx_min": position_bounds["x_min"],
+                "fx_max": position_bounds["x_max"],
+                "fy_min": position_bounds["y_min"],
+                "fy_max": position_bounds["y_max"],
+            }
+
         # Derived chromosome dimensions
         self._n_pos_genes = 2 * num_aps           # x, y per AP
         if optimize_orientation:
             self._n_dir_genes = 2 * num_aps       # dx, dy per AP
         else:
             self._n_dir_genes = 0
-        self._n_genes = self._n_pos_genes + self._n_dir_genes
+        self._n_reflector_genes = 4 if reflector_enabled else 0  # u, v, fx, fy
+        self._n_genes = (
+            self._n_pos_genes + self._n_dir_genes + self._n_reflector_genes
+        )
+
+        # Index where reflector genes start in the chromosome
+        self._reflector_gene_start = (
+            self._n_pos_genes + self._n_dir_genes
+            if reflector_enabled else -1
+        )
 
         # Task counter for sequential IDs (useful for logging)
         self._task_counter: int = 0
@@ -293,6 +386,14 @@ class GeneticAlgorithmRunner:
           ``ind = [x1, y1, x2, y2]``.  Multi-AP positions, worker sweeps
           8 directions per AP.
 
+        **Reflector extension:**
+          When ``reflector_enabled=True`` the last 4 genes encode
+          ``[reflector_u, reflector_v, focal_x, focal_y]``.  These are
+          injected into ``optimizer_kwargs`` as ``reflector_u``,
+          ``reflector_v``, ``reflector_target``, and
+          ``percentile_target_quantile`` so the worker automatically
+          configures the reflector and uses the shadow-robust objective.
+
         Returns:
             ``(task_id, "grid_search_point", optimizer_kwargs, optimization_params)``
         """
@@ -332,6 +433,23 @@ class GeneticAlgorithmRunner:
                     orientations.append((nx, ny, nz))
                 optimizer_kwargs["evaluation_orientations"] = orientations
 
+        # ---- Reflector genes ------------------------------------------
+        if self.reflector_enabled:
+            rg = self._reflector_gene_start
+            r_u = float(ind[rg])
+            r_v = float(ind[rg + 1])
+            focal_x = float(ind[rg + 2])
+            focal_y = float(ind[rg + 3])
+
+            optimizer_kwargs["reflector_u"] = r_u
+            optimizer_kwargs["reflector_v"] = r_v
+            optimizer_kwargs["reflector_target"] = (
+                focal_x, focal_y, self.focal_z,
+            )
+            optimizer_kwargs["percentile_target_quantile"] = (
+                self.percentile_target_quantile
+            )
+
         return (
             task_id,
             "grid_search_point",
@@ -348,6 +466,9 @@ class GeneticAlgorithmRunner:
 
         Position genes are clamped to ``position_bounds``.
         Direction genes, when present, are clamped to ``[-1, 1]``.
+        Reflector genes, when present, are clamped:
+            - ``u``, ``v`` to ``[0, 1]``
+            - ``focal_x``, ``focal_y`` to ``focal_bounds``
         """
         # Clamp position genes (x, y pairs for each AP)
         for ap_idx in range(self.num_aps):
@@ -361,8 +482,23 @@ class GeneticAlgorithmRunner:
             )
         # Clamp direction genes to [-1, 1]
         if self.optimize_orientation:
-            for i in range(self._n_pos_genes, self._n_genes):
+            dir_end = self._n_pos_genes + self._n_dir_genes
+            for i in range(self._n_pos_genes, dir_end):
                 ind[i] = max(-1.0, min(ind[i], 1.0))
+
+        # Clamp reflector genes
+        if self.reflector_enabled:
+            rg = self._reflector_gene_start
+            ind[rg] = max(0.0, min(ind[rg], 1.0))          # u ∈ [0, 1]
+            ind[rg + 1] = max(0.0, min(ind[rg + 1], 1.0))  # v ∈ [0, 1]
+            ind[rg + 2] = max(
+                self.focal_bounds["fx_min"],
+                min(ind[rg + 2], self.focal_bounds["fx_max"]),
+            )
+            ind[rg + 3] = max(
+                self.focal_bounds["fy_min"],
+                min(ind[rg + 3], self.focal_bounds["fy_max"]),
+            )
 
     # ------------------------------------------------------------------
     # Evaluation helper
@@ -490,6 +626,19 @@ class GeneticAlgorithmRunner:
                             name = gs.get("best_orientation_name")
                             ind.best_orientation_names = [name] * self.num_aps
 
+                # ---- Reflector attribute storage ----------------------
+                if self.reflector_enabled:
+                    ind.reflector_u = res.get("reflector_u")
+                    ind.reflector_v = res.get("reflector_v")
+                    ind.reflector_target = res.get("reflector_target")
+                    ind.reflector_position = res.get("reflector_position")
+                    # Percentile score (shadow-robust objective)
+                    gs = res.get("grid_results", {})
+                    ind.percentile_score = gs.get("percentile_score")
+                    ind.percentile_score_dbm = gs.get(
+                        "percentile_score_dbm",
+                    )
+
         return len(invalid_ind)
 
     # ------------------------------------------------------------------
@@ -534,6 +683,24 @@ class GeneticAlgorithmRunner:
             dirs.append(list(_normalize_direction(dx, dy, self.fixed_dir_z)))
         return dirs
 
+    def _extract_reflector(self, ind) -> Optional[Dict[str, Any]]:
+        """Extract reflector parameters from an individual's genes.
+
+        Returns:
+            Dict with ``u``, ``v``, ``focal_x``, ``focal_y``,
+            ``focal_z`` keys, or ``None`` if reflector is disabled.
+        """
+        if not self.reflector_enabled:
+            return None
+        rg = self._reflector_gene_start
+        return {
+            "u": float(ind[rg]),
+            "v": float(ind[rg + 1]),
+            "focal_x": float(ind[rg + 2]),
+            "focal_y": float(ind[rg + 3]),
+            "focal_z": self.focal_z,
+        }
+
     # ------------------------------------------------------------------
     # Verbose formatting helpers
     # ------------------------------------------------------------------
@@ -569,6 +736,16 @@ class GeneticAlgorithmRunner:
                     f"d{ap_idx}=({d[0]:+.3f},{d[1]:+.3f},{d[2]:+.3f})"
                 )
         return (" | " + " ".join(parts)) if parts else ""
+
+    def _fmt_reflector(self, ind) -> str:
+        """Format reflector genes for verbose logging."""
+        refl = self._extract_reflector(ind)
+        if refl is None:
+            return ""
+        return (
+            f" | refl(u={refl['u']:.3f}, v={refl['v']:.3f}) "
+            f"focal({refl['focal_x']:.2f}, {refl['focal_y']:.2f})"
+        )
 
     def _build_generation_detail(
         self,
@@ -614,6 +791,11 @@ class GeneticAlgorithmRunner:
             detail["ap_separation"] = self._ap_distance(
                 best_ind, self.num_aps,
             )
+
+        # Reflector genes (when enabled)
+        if self.reflector_enabled:
+            detail["reflector"] = self._extract_reflector(best_ind)
+
         return detail
 
     # ------------------------------------------------------------------
@@ -701,17 +883,20 @@ class GeneticAlgorithmRunner:
             else:
                 if self.optimize_orientation:
                     _mode = (
-                        f"{self._n_genes}D "
+                        f"{self._n_pos_genes + self._n_dir_genes}D "
                         f"[{'x,y,' * self.num_aps}"
                         f"{'dx,dy,' * self.num_aps}] "
                         f"({self.num_aps} APs)"
                     )
                 else:
                     _mode = (
-                        f"{self._n_genes}D "
+                        f"{self._n_pos_genes}D "
                         f"[{'x,y,' * self.num_aps}] "
                         f"({self.num_aps} APs)"
                     )
+            if self.reflector_enabled:
+                _mode += " + Reflector [u,v,fx,fy]"
+            _mode += f" → {self._n_genes} genes total"
             print(f"DEAP GENETIC ALGORITHM ({_mode}, IoC-injected map)")
             print("=" * 80)
             print(
@@ -737,6 +922,17 @@ class GeneticAlgorithmRunner:
                 f"{self.bounds['x_max']}], "
                 f"y=[{self.bounds['y_min']}, {self.bounds['y_max']}]"
             )
+            if self.reflector_enabled:
+                fb = self.focal_bounds
+                print(
+                    f"  REFLECTOR: genes +4 (u,v,fx,fy) | "
+                    f"focal_z={self.focal_z} | "
+                    f"quantile={self.percentile_target_quantile}"
+                )
+                print(
+                    f"  Focal bounds: fx=[{fb['fx_min']}, {fb['fx_max']}], "
+                    f"fy=[{fb['fy_min']}, {fb['fy_max']}]"
+                )
             print("-" * 80)
 
         # -- DEAP toolbox setup -----------------------------------------
@@ -756,11 +952,13 @@ class GeneticAlgorithmRunner:
             self.bounds["y_max"],
         )
 
-        # Build gene cycle: all position genes first, then direction genes.
+        # Build gene cycle: all position genes first, then direction genes,
+        # then (optionally) reflector genes.
         #   1-AP orient:    (x, y, dx, dy)                      — 4 genes
         #   2-AP orient:    (x1, y1, x2, y2, dx1, dy1, dx2, dy2) — 8 genes
         #   1-AP no-orient: (x, y)                                — 2 genes
         #   2-AP no-orient: (x1, y1, x2, y2)                     — 4 genes
+        #   + reflector:    (..., u, v, focal_x, focal_y)         — +4 genes
         pos_genes = (toolbox.attr_x, toolbox.attr_y) * self.num_aps
 
         if self.optimize_orientation:
@@ -769,6 +967,29 @@ class GeneticAlgorithmRunner:
             gene_cycle = pos_genes + dir_genes
         else:
             gene_cycle = pos_genes
+
+        # Reflector genes: u ∈ [0,1], v ∈ [0,1], focal_x, focal_y
+        if self.reflector_enabled:
+            toolbox.register("attr_refl_uv", random.uniform, 0.0, 1.0)
+            toolbox.register(
+                "attr_focal_x",
+                random.uniform,
+                self.focal_bounds["fx_min"],
+                self.focal_bounds["fx_max"],
+            )
+            toolbox.register(
+                "attr_focal_y",
+                random.uniform,
+                self.focal_bounds["fy_min"],
+                self.focal_bounds["fy_max"],
+            )
+            reflector_genes = (
+                toolbox.attr_refl_uv,   # u
+                toolbox.attr_refl_uv,   # v
+                toolbox.attr_focal_x,   # focal_x
+                toolbox.attr_focal_y,   # focal_y
+            )
+            gene_cycle = gene_cycle + reflector_genes
 
         toolbox.register(
             "individual",
@@ -787,8 +1008,10 @@ class GeneticAlgorithmRunner:
         # Evolutionary operators
         toolbox.register("mate", tools.cxBlend, alpha=cx_alpha)
 
-        if self.optimize_orientation:
-            # Split mutation: coarse sigma for position, fine for direction
+        if self.optimize_orientation or self.reflector_enabled:
+            # Split mutation: separate sigmas for position, direction,
+            # and reflector genes.
+            mut_sigma_reflector = ga.get("mut_sigma_reflector", 0.1)
             toolbox.register(
                 "mutate",
                 _split_mutate,
@@ -797,6 +1020,8 @@ class GeneticAlgorithmRunner:
                 sigma_dir=mut_sigma_dir,
                 indpb=mut_indpb,
                 num_pos_genes=self._n_pos_genes,
+                sigma_reflector=mut_sigma_reflector,
+                reflector_gene_start=self._reflector_gene_start,
             )
         else:
             # Legacy uniform mutation (position-only mode)
@@ -869,13 +1094,14 @@ class GeneticAlgorithmRunner:
                 )
                 _sep_tag = f" | sep={sep:.1f}m pen={n_pen}"
             _cov = getattr(best_ind, "best_coverage", 0.0)
+            _refl_tag = self._fmt_reflector(best_ind)
             print(
                 f"  Gen  0 | evals={nevals:>3d} | "
                 f"best={record['max_dbm']:.2f} dBm | "
                 f"mean={record['mean_dbm']:.2f} dBm | "
                 f"cov={_cov:.1f}% | "
                 f"pos={self._fmt_best_pos(best_ind)}"
-                f"{_dir_tag}{_sep_tag} | "
+                f"{_dir_tag}{_sep_tag}{_refl_tag} | "
                 f"time={gen_time:.1f}s"
             )
 
@@ -940,13 +1166,14 @@ class GeneticAlgorithmRunner:
                     )
                     _sep_tag = f" | sep={sep:.1f}m pen={n_pen}"
                 _cov = getattr(best_ind, "best_coverage", 0.0)
+                _refl_tag = self._fmt_reflector(best_ind)
                 print(
                     f"  Gen {gen:>2d} | evals={nevals:>3d} | "
                     f"best={record['max_dbm']:.2f} dBm | "
                     f"mean={record['mean_dbm']:.2f} dBm | "
                     f"cov={_cov:.1f}% | "
                     f"pos={self._fmt_best_pos(best_ind)}"
-                    f"{_dir_tag}{_sep_tag} | "
+                    f"{_dir_tag}{_sep_tag}{_refl_tag} | "
                     f"time={gen_time:.1f}s"
                 )
 
@@ -989,6 +1216,8 @@ class GeneticAlgorithmRunner:
                 hof_entry["ap_separation"] = self._ap_distance(
                     ind, self.num_aps,
                 )
+            if self.reflector_enabled:
+                hof_entry["reflector"] = self._extract_reflector(ind)
             hall_of_fame_list.append(hof_entry)
 
         _best_genes = [float(g) for g in best]
@@ -1022,6 +1251,7 @@ class GeneticAlgorithmRunner:
                 "fixed_dir_z": self.fixed_dir_z,
                 "num_aps": self.num_aps,
                 "min_ap_separation": self.min_ap_separation,
+                "reflector_enabled": self.reflector_enabled,
             },
             "generation_details": generation_details,
         }
@@ -1051,6 +1281,14 @@ class GeneticAlgorithmRunner:
             )
             results["best_ap_separation"] = self._ap_distance(
                 best, self.num_aps,
+            )
+
+        # Reflector results
+        if self.reflector_enabled:
+            results["reflector_enabled"] = True
+            results["best_reflector"] = self._extract_reflector(best)
+            results["percentile_target_quantile"] = (
+                self.percentile_target_quantile
             )
 
         if verbose:
@@ -1095,6 +1333,17 @@ class GeneticAlgorithmRunner:
                 )
             print(f"  Best P5 RSS:  {results['best_fitness_dbm']:.2f} dBm")
             print(f"  Coverage:      {results['best_coverage']:.1f}%")
+            if self.reflector_enabled:
+                refl = results.get("best_reflector", {})
+                print(
+                    f"  Reflector u,v: ({refl.get('u', 0):.4f}, "
+                    f"{refl.get('v', 0):.4f})"
+                )
+                print(
+                    f"  Focal point:   ({refl.get('focal_x', 0):.2f}, "
+                    f"{refl.get('focal_y', 0):.2f}, "
+                    f"{refl.get('focal_z', 0):.2f})"
+                )
             print(f"  Total evals:   {total_evaluations}")
             print(f"  Wall-clock:    {total_time:.2f}s")
             print("=" * 80)

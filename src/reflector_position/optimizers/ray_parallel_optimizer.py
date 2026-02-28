@@ -307,10 +307,23 @@ class OptimizationWorker:
             "best_look_at": best_look_at,
             "final_look_at": final_look_at,
             "time_elapsed": elapsed_time,
-            "reflector_u": optimizer_kwargs_local.get("reflector_u"),
-            "reflector_v": optimizer_kwargs_local.get("reflector_v"),
-            "reflector_target": optimizer_kwargs_local.get("reflector_target"),
         }
+
+        # Reflector state: for grid search the reflector (u, v, target) is
+        # specified per work item; for GD the optimizer *learns* them.
+        # Prefer the optimizer's snapshot when available.
+        if hasattr(optimizer, "_snapshot_reflector") and callable(optimizer._snapshot_reflector):
+            refl_snap = optimizer._snapshot_reflector()
+            output["reflector_u"] = refl_snap.get("u")
+            output["reflector_v"] = refl_snap.get("v")
+            output["reflector_focal_point"] = refl_snap.get("focal_point")
+            output["reflector_position"] = refl_snap.get("position")
+            # Keep backward-compat key used by grid search callers
+            output["reflector_target"] = refl_snap.get("focal_point")
+        else:
+            output["reflector_u"] = optimizer_kwargs_local.get("reflector_u")
+            output["reflector_v"] = optimizer_kwargs_local.get("reflector_v")
+            output["reflector_target"] = optimizer_kwargs_local.get("reflector_target")
 
         # Include history if optimizer tracks it (gradient descent has history)
         if hasattr(optimizer, "history"):

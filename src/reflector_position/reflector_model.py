@@ -282,6 +282,8 @@ class ReflectorController:
 
     @u.setter
     def u(self, value: torch.Tensor) -> None:
+        if isinstance(value, torch.Tensor) and self._wall_origin is not None:
+            value = value.to(self._wall_origin.device)
         self._u = value
 
     @property
@@ -291,6 +293,8 @@ class ReflectorController:
 
     @v.setter
     def v(self, value: torch.Tensor) -> None:
+        if isinstance(value, torch.Tensor) and self._wall_origin is not None:
+            value = value.to(self._wall_origin.device)
         self._v = value
 
     @property

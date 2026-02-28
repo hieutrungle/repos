@@ -25,6 +25,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import drjit as dr
+import mitsuba as mi
 import matplotlib.pyplot as plt
 import sionna.rt
 from sionna.rt import RadioMapSolver, Transmitter
@@ -37,10 +38,12 @@ from ..metrics import (
     compute_p5_rss_metric,
     compute_soft_min_rss_metric,
     normalized_softmin_loss,
+    MaskedSoftMinLoss,
     differentiable_coverage_loss,
     compute_coverage_metric,
     rss_to_dbm,
 )
+from ..reflector_model import ReflectorController
 
 # Per-AP colours and markers for trajectory plots
 _AP_COLORS = ["#1f77b4", "#d62728", "#2ca02c", "#ff7f0e", "#9467bd", "#8c564b"]
@@ -57,6 +60,12 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
 
     For ``num_aps > 1`` a repulsion loss prevents the APs from merging into the
     single strongest location.
+
+    **Joint reflector optimisation:**  When an optional
+    :class:`ReflectorController` is provided, the optimizer additionally
+    learns the reflector's wall placement ``(u, v)`` and 3-D focal point
+    ``(x, y, z)`` through ``torch.sigmoid``-bounded raw parameters that
+    maintain continuous gradients into the Sionna scene graph.
     """
 
     # ------------------------------------------------------------------
@@ -76,6 +85,8 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
         fixed_dir_z: float = -0.3,
         optimize_orientation: bool = True,
         repulsion_weight: float = 1.0,
+        reflector_controller: Optional[ReflectorController] = None,
+        initial_focal_point: Optional[Tuple[float, float, float]] = None,
     ):
         """
         Initialise gradient descent optimizer for one or more APs.
@@ -103,6 +114,12 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
             repulsion_weight: Multiplier for the pairwise repulsion loss term.
                 Only active when ``num_aps > 1``.  Higher values push APs
                 further apart.  Set to ``0`` to disable.
+            reflector_controller: Optional :class:`ReflectorController`
+                instance.  When provided the optimizer jointly learns the
+                reflector's wall placement and focal-point orientation.
+            initial_focal_point: Initial 3-D focal point ``(x, y, z)`` for
+                the reflector beam-forming.  Falls back to the centre of
+                ``position_bounds`` at ``z = fixed_z`` if not given.
         """
         super().__init__(scene=scene, fixed_z=fixed_z, position_bounds=position_bounds)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -180,6 +197,38 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
         self.radio_solver = RadioMapSolver()
         self.radio_solver.loop_mode = "evaluated"
 
+        # --- Reflector (optional) -----------------------------------------
+        self.reflector_controller: Optional[ReflectorController] = reflector_controller
+        self.reflector_u_raw: Optional[torch.Tensor] = None
+        self.reflector_v_raw: Optional[torch.Tensor] = None
+        self.focal_point_raw: Optional[torch.Tensor] = None
+
+        if reflector_controller is not None:
+            # Unbounded raw parameters — sigmoid maps them to [0, 1]
+            # Initialise at 0.0 so sigmoid(0) = 0.5 (wall centre)
+            self.reflector_u_raw = torch.tensor(
+                0.0, dtype=torch.float32, device=self.device,
+                requires_grad=True,
+            )
+            self.reflector_v_raw = torch.tensor(
+                0.0, dtype=torch.float32, device=self.device,
+                requires_grad=True,
+            )
+
+            # Focal-point initialisation
+            if initial_focal_point is not None:
+                fp_init = list(initial_focal_point)
+            else:
+                # Default: centre of position bounds at receiver height
+                cx = (self.pos_min + self.pos_max) / 2.0
+                cy = (self.pos_min + self.pos_max) / 2.0
+                fp_init = [cx, cy, 1.5]
+
+            self.focal_point_raw = torch.tensor(
+                fp_init, dtype=torch.float32, device=self.device,
+                requires_grad=True,
+            )
+
         # --- History tracking ---------------------------------------------
         self.history: Dict[str, list] = {
             "positions": [],            # per-iter AP positions
@@ -196,6 +245,10 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
             "gradients": [],            # per-iter position gradients
             "direction_gradients": [],  # per-iter direction gradients
             "ap_distances": [],         # per-iter pairwise AP distances
+            "reflector_u": [],          # per-iter reflector u coordinate
+            "reflector_v": [],          # per-iter reflector v coordinate
+            "reflector_focal_point": [],  # per-iter reflector focal point
+            "reflector_position": [],   # per-iter reflector world position
         }
 
     # ------------------------------------------------------------------
@@ -363,6 +416,299 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
         return repulsion.squeeze()
 
     # ------------------------------------------------------------------
+    # Reflector parameter injection
+    # ------------------------------------------------------------------
+
+    def _apply_reflector_params(self) -> None:
+        """Apply current reflector trainable parameters to the scene graph.
+
+        Converts unbounded ``reflector_u_raw`` / ``reflector_v_raw`` through
+        ``torch.sigmoid`` to obtain wall coordinates in [0, 1], injects them
+        into the :class:`ReflectorController`, computes the specular-reflection
+        orientation from ``focal_point_raw``, and pushes the updated geometry
+        into the Mitsuba scene graph.
+
+        This method is intentionally called **outside** ``torch.no_grad()``
+        so the sigmoid / focal-point operations remain on the computational
+        graph.  The ``apply_to_scene()`` call detaches values at the
+        Mitsuba boundary, but the upstream PyTorch graph is unaffected.
+        """
+        ctrl = self.reflector_controller
+        if ctrl is None:
+            return
+
+        # 1. Sigmoid-bounded wall coordinates  [0, 1]
+        u_bounded = torch.sigmoid(self.reflector_u_raw)
+        v_bounded = torch.sigmoid(self.reflector_v_raw)
+        ctrl.u = u_bounded
+        ctrl.v = v_bounded
+
+        # 2. Update TX reference for reflection math (use first AP position)
+        phys_positions = self.get_full_positions()  # [N, 3] — detached NumPy
+        ctrl.set_tx_position(phys_positions[0])
+
+        # 3. Focal-point injection and specular orientation
+        ctrl.set_focal_point(self.focal_point_raw, requires_grad=True)
+        ctrl.orient_to_target()
+
+        # 4. Push geometry into Mitsuba scene graph
+        ctrl.apply_to_scene()
+
+    # ------------------------------------------------------------------
+    # SPSA numerical gradient estimation for reflector parameters
+    # ------------------------------------------------------------------
+
+    def _eval_detached_loss(
+        self,
+        samples_per_tx: int,
+        max_depth: int,
+        use_soft_min: bool,
+        temperature: float,
+        shadow_quantile: float,
+        fairness_loss_type: str,
+        alpha: float,
+        beta: float,
+        coverage_threshold_dbm: float,
+        coverage_temperature: float,
+    ) -> float:
+        """Evaluate the composite loss with current scene state (no grad).
+
+        Sets AP positions from ``self.tx_x / tx_y`` (detached), runs the
+        radio solver, computes the same fairness + coverage loss as
+        ``compute_loss``, and returns the scalar value.  Used by SPSA.
+        """
+        dr.suspend_grad()
+        try:
+            cur_dirs = self.get_current_directions()
+            phys_pos = self.get_full_positions()
+            tx_list = [self.scene.transmitters[n] for n in self.tx_names]
+            for i in range(self.num_aps):
+                tx_list[i].position = [
+                    float(phys_pos[i, 0]),
+                    float(phys_pos[i, 1]),
+                    self.fixed_z,
+                ]
+                target = [
+                    float(phys_pos[i, 0]) + float(cur_dirs[i, 0].item()),
+                    float(phys_pos[i, 1]) + float(cur_dirs[i, 1].item()),
+                    self.fixed_z + float(cur_dirs[i, 2].item()),
+                ]
+                tx_list[i].look_at(target)
+
+            rm = self.radio_solver(
+                self.scene,
+                cell_size=(1.0, 1.0),
+                samples_per_tx=samples_per_tx,
+                max_depth=max_depth,
+                refraction=True,
+                diffraction=True,
+            )
+            rss = torch.from_numpy(np.array(rm.rss))
+        finally:
+            dr.resume_grad()
+
+        # Compute composite loss (pure PyTorch, no grad needed)
+        with torch.no_grad():
+            effective_type = fairness_loss_type
+            if effective_type == "auto" and not use_soft_min:
+                effective_type = "percentile"
+            fairness = self._compute_fairness_loss(
+                rss,
+                fairness_loss_type=effective_type,
+                temperature=temperature,
+                shadow_quantile=shadow_quantile,
+            )
+            cov = differentiable_coverage_loss(
+                rss,
+                threshold_dbm=coverage_threshold_dbm,
+                temperature=coverage_temperature,
+            )
+            loss_val = float((alpha * fairness + beta * cov).item())
+        return loss_val
+
+    def _reflector_spsa_gradients(
+        self,
+        samples_per_tx: int,
+        max_depth: int,
+        use_soft_min: bool,
+        temperature: float,
+        shadow_quantile: float,
+        fairness_loss_type: str,
+        alpha: float,
+        beta: float,
+        coverage_threshold_dbm: float,
+        coverage_temperature: float,
+        perturbation_scale: float = 0.1,
+    ) -> None:
+        """Estimate reflector parameter gradients via SPSA.
+
+        SPSA (Simultaneous Perturbation Stochastic Approximation) estimates
+        the gradient of a scalar loss w.r.t. all parameters using only **2**
+        forward evaluations, regardless of the number of parameters.
+
+        This is used because ``SceneObject.position`` / ``.look_at()``
+        mutate mesh vertices via ``scene_params.update()``, which is
+        incompatible with DrJit's AD graph inside ``@dr.wrap``.
+
+        After this call, ``.grad`` is set on ``reflector_u_raw``,
+        ``reflector_v_raw``, and ``focal_point_raw``.
+        """
+        if self.reflector_controller is None:
+            return
+
+        c = perturbation_scale
+
+        # Collect reflector trainable parameters
+        params: list = [self.reflector_u_raw, self.reflector_v_raw]
+        if self.focal_point_raw is not None:
+            params.append(self.focal_point_raw)
+
+        # Bernoulli ±1 perturbation for each parameter tensor
+        deltas = [
+            (torch.bernoulli(torch.ones_like(p.data) * 0.5) * 2 - 1)
+            for p in params
+        ]
+
+        eval_kwargs = dict(
+            samples_per_tx=samples_per_tx,
+            max_depth=max_depth,
+            use_soft_min=use_soft_min,
+            temperature=temperature,
+            shadow_quantile=shadow_quantile,
+            fairness_loss_type=fairness_loss_type,
+            alpha=alpha,
+            beta=beta,
+            coverage_threshold_dbm=coverage_threshold_dbm,
+            coverage_temperature=coverage_temperature,
+        )
+
+        # ---- Forward evaluation at +perturbation -------------------------
+        with torch.no_grad():
+            for p, d in zip(params, deltas):
+                p.data.add_(c * d)
+            self._apply_reflector_params()
+        loss_plus = self._eval_detached_loss(**eval_kwargs)
+
+        # ---- Forward evaluation at -perturbation -------------------------
+        with torch.no_grad():
+            for p, d in zip(params, deltas):
+                p.data.sub_(2.0 * c * d)       # from +c*d to -c*d
+            self._apply_reflector_params()
+        loss_minus = self._eval_detached_loss(**eval_kwargs)
+
+        # ---- Restore original parameter values ---------------------------
+        with torch.no_grad():
+            for p, d in zip(params, deltas):
+                p.data.add_(c * d)              # back to original
+            self._apply_reflector_params()
+
+        # ---- Set .grad via SPSA formula ----------------------------------
+        # g_i ≈ (loss+ − loss−) / (2 * c * Δ_i)
+        diff = loss_plus - loss_minus
+        for p, d in zip(params, deltas):
+            grad = diff / (2.0 * c * d)
+            if p.grad is None:
+                p.grad = grad.clone()
+            else:
+                p.grad.copy_(grad)
+
+    # ------------------------------------------------------------------
+    # Reflector state snapshot (for logging)
+    # ------------------------------------------------------------------
+
+    def _snapshot_reflector(self) -> Dict[str, Optional[list]]:
+        """Return a dict of current reflector parameter values for logging.
+
+        Returns detached CPU lists suitable for JSON serialisation.
+        All keys are present but set to ``None`` when no reflector is active.
+        """
+        if self.reflector_controller is None:
+            return {
+                "u": None,
+                "v": None,
+                "focal_point": None,
+                "position": None,
+            }
+        ctrl = self.reflector_controller
+        u_val = torch.sigmoid(self.reflector_u_raw).detach().cpu().item()
+        v_val = torch.sigmoid(self.reflector_v_raw).detach().cpu().item()
+        fp_val = self.focal_point_raw.detach().cpu().tolist()
+        try:
+            pos_val = ctrl.wall_position().detach().cpu().tolist()
+        except RuntimeError:
+            pos_val = ctrl.get_position().tolist()
+        return {
+            "u": u_val,
+            "v": v_val,
+            "focal_point": fp_val,
+            "position": pos_val,
+        }
+
+    # ------------------------------------------------------------------
+    # Loss computation
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Fairness loss dispatch
+    # ------------------------------------------------------------------
+
+    _VALID_FAIRNESS_TYPES = ("auto", "softmin", "masked_softmin", "percentile")
+
+    def _compute_fairness_loss(
+        self,
+        rss: torch.Tensor,
+        fairness_loss_type: str,
+        temperature: float,
+        shadow_quantile: float,
+    ) -> torch.Tensor:
+        """Dispatch fairness loss by type.
+
+        Parameters
+        ----------
+        rss : torch.Tensor
+            Radio-map RSS in linear Watts (from ``compute_rss``).
+        fairness_loss_type : str
+            One of ``"auto"``, ``"softmin"``, ``"masked_softmin"``,
+            ``"percentile"``.
+        temperature : float
+            τ parameter for soft-min variants.
+        shadow_quantile : float
+            Quantile mask for ``MaskedSoftMinLoss``.
+
+        Returns
+        -------
+        torch.Tensor
+            Scalar fairness loss to minimise.
+        """
+        kind = fairness_loss_type
+        if kind == "auto":
+            kind = (
+                "masked_softmin"
+                if self.reflector_controller is not None
+                else "softmin"
+            )
+
+        if kind == "masked_softmin":
+            return MaskedSoftMinLoss(
+                shadow_quantile=shadow_quantile,
+                temperature=temperature,
+            )(rss)
+        elif kind == "softmin":
+            return normalized_softmin_loss(
+                rss.flatten().unsqueeze(0),
+                temperature=temperature,
+            )
+        elif kind == "percentile":
+            p5_rss = compute_p5_rss_metric(rss)
+            log_p5_rss = rss_to_dbm(p5_rss)
+            return -log_p5_rss / 100.0
+        else:
+            raise ValueError(
+                f"Unknown fairness_loss_type={fairness_loss_type!r}.  "
+                f"Valid options: {self._VALID_FAIRNESS_TYPES}"
+            )
+
+    # ------------------------------------------------------------------
     # Loss computation
     # ------------------------------------------------------------------
 
@@ -372,6 +718,8 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
         max_depth: int = 13,
         use_soft_min: bool = True,
         temperature: float = 0.1,
+        shadow_quantile: float = 0.05,
+        fairness_loss_type: str = "auto",
         alpha: float = 0.6,
         beta: float = 0.4,
         coverage_threshold_dbm: float = -120.0,
@@ -382,8 +730,16 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
 
         The loss is a weighted composite of three terms:
 
-        1. **Fairness loss** (``alpha``): ``normalized_softmin_loss`` — maximises
-           the worst-case user RSSI via a differentiable soft-minimum.
+        1. **Fairness loss** (``alpha``): controlled by ``fairness_loss_type``.
+
+           - ``"auto"`` (default): ``MaskedSoftMinLoss`` when a reflector is
+             active, ``normalized_softmin_loss`` otherwise.
+           - ``"softmin"``: always ``normalized_softmin_loss``.
+           - ``"masked_softmin"``: always ``MaskedSoftMinLoss``
+             (shadow-aware, excludes bottom ``shadow_quantile`` cells).
+           - ``"percentile"``: 5th-percentile RSS converted to dBm.
+             Non-differentiable through DrJit but works with SPSA.
+
         2. **Coverage loss** (``beta``): ``differentiable_coverage_loss`` —
            maximises the fraction of users above ``coverage_threshold_dbm``
            using a smooth Sigmoid approximation.
@@ -395,8 +751,16 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
         Args:
             samples_per_tx: Number of ray samples per transmitter.
             max_depth: Maximum ray tracing bounces.
-            use_soft_min: Use differentiable softmin for fairness (recommended).
-            temperature: Temperature for softmin fairness loss.
+            use_soft_min: **Deprecated** — use ``fairness_loss_type`` instead.
+                When ``fairness_loss_type="auto"`` and ``use_soft_min=False``,
+                falls back to ``"percentile"`` for backward compatibility.
+            temperature: Temperature (τ) for soft-min fairness losses.
+                Lower → sharper approximation of true min.
+            shadow_quantile: Fraction of lowest-signal cells to mask out when
+                using ``MaskedSoftMinLoss``.  Default 0.05.
+            fairness_loss_type: Fairness loss selector.  One of
+                ``"auto"``, ``"softmin"``, ``"masked_softmin"``,
+                ``"percentile"``.  Default ``"auto"``.
             alpha: Weight for fairness loss.  Default 0.6.
             beta: Weight for coverage loss.  Default 0.4.
             coverage_threshold_dbm: Threshold for coverage objective (dBm).
@@ -405,6 +769,19 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
         Returns:
             Scalar loss tensor to minimise.
         """
+        # ---- Reflector: apply current params to scene (detached) ----------
+        # The reflector is a SceneObject whose position/orientation setters
+        # modify mesh vertices via scene_params.update().  This is
+        # fundamentally incompatible with @dr.wrap's AD graph (Transmitters,
+        # by contrast, just store a mi.Point3f — no mesh mutation).
+        #
+        # Strategy: apply reflector geometry *outside* @dr.wrap so the
+        # radio-map correctly reflects the reflector's placement, then use
+        # SPSA (see _reflector_spsa_gradients) to estimate numerical
+        # gradients for reflector_u_raw / reflector_v_raw / focal_point_raw.
+        if self.reflector_controller is not None:
+            self._apply_reflector_params()
+
         # L2-normalised directions for all APs  [num_aps, 3]
         directions = self.get_current_directions()
 
@@ -415,7 +792,7 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
         tx_list = [self.scene.transmitters[n] for n in self.tx_names]
 
         # Build flat scalar arg list for @dr.wrap:
-        #   [x_0 .. x_{N-1}, y_0 .. y_{N-1}, dx_0 .. dx_{N-1}, dy_0 .. dy_{N-1}]
+        #   AP args:  [x_0..x_{N-1}, y_0..y_{N-1}, dx_0..dx_{N-1}, dy_0..dy_{N-1}]
         wrap_args: list = []
         for i in range(self.num_aps):
             wrap_args.append(self.tx_x[i])
@@ -462,16 +839,18 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
         # Cache for metric logging (avoids a second radio-map evaluation)
         self._last_rss = rss.detach().clone()
 
-        # ---- Fairness loss (soft-min of worst-case user) -----------------
-        if use_soft_min:
-            fairness_loss = normalized_softmin_loss(
-                rss.flatten().unsqueeze(0),
-                temperature=temperature,
-            )
-        else:
-            p5_rss = compute_p5_rss_metric(rss)
-            log_p5_rss = rss_to_dbm(p5_rss)
-            fairness_loss = -log_p5_rss / 100.0
+        # ---- Fairness loss -----------------------------------------------
+        # Backward compat: use_soft_min=False → percentile when type="auto"
+        effective_type = fairness_loss_type
+        if effective_type == "auto" and not use_soft_min:
+            effective_type = "percentile"
+
+        fairness_loss = self._compute_fairness_loss(
+            rss,
+            fairness_loss_type=effective_type,
+            temperature=temperature,
+            shadow_quantile=shadow_quantile,
+        )
 
         # ---- Coverage loss (sigmoid-smoothed coverage ratio) -------------
         cov_loss = differentiable_coverage_loss(
@@ -535,6 +914,8 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
         max_depth: int = 13,
         use_soft_min: bool = True,
         temperature: float = 0.2,
+        shadow_quantile: float = 0.05,
+        fairness_loss_type: str = "auto",
         coverage_threshold_dbm: float = -120.0,
         alpha: float = 0.6,
         beta: float = 0.4,
@@ -549,8 +930,18 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
             learning_rate: Base learning rate for position parameters.
             samples_per_tx: Ray samples per transmitter per iteration.
             max_depth: Maximum ray bounces.
-            use_soft_min: Use softmin for fairness loss (recommended).
-            temperature: Softmin temperature for fairness loss.
+            use_soft_min: **Deprecated** — use ``fairness_loss_type`` instead.
+                Kept for backward compatibility.  When ``fairness_loss_type``
+                is ``"auto"`` and ``use_soft_min=False``, the percentile loss
+                is used.
+            temperature: Softmin temperature (τ) for fairness loss.  Lower →
+                sharper approximation of true min.
+            shadow_quantile: Fraction of lowest-signal cells to mask out
+                inside ``MaskedSoftMinLoss``.  Default 0.05 (5 %).
+            fairness_loss_type: Fairness loss selector.  One of ``"auto"``,
+                ``"softmin"``, ``"masked_softmin"``, ``"percentile"``.
+                Default ``"auto"`` (masked_softmin if reflector present,
+                else softmin).
             coverage_threshold_dbm: Coverage threshold in dBm.
             alpha: Weight for fairness (softmin) loss.  Default 0.6.
             beta: Weight for coverage (sigmoid) loss.  Default 0.4.
@@ -563,6 +954,7 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
         """
         # ---- Parameter groups --------------------------------------------
         DIR_LR_MULTIPLIER = 10.0
+        REFLECTOR_LR_MULTIPLIER = 0.5
         pos_lr = learning_rate / self.pos_range
         param_groups = [
             {"params": [self.tx_x, self.tx_y], "lr": pos_lr},
@@ -570,6 +962,15 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
         if self.optimize_orientation:
             param_groups.append(
                 {"params": [self.tx_dir_xy], "lr": learning_rate * DIR_LR_MULTIPLIER},
+            )
+
+        # Register reflector trainable parameters
+        if self.reflector_controller is not None:
+            reflector_params: list = [self.reflector_u_raw, self.reflector_v_raw]
+            if self.focal_point_raw is not None:
+                reflector_params.append(self.focal_point_raw)
+            param_groups.append(
+                {"params": reflector_params, "lr": learning_rate * REFLECTOR_LR_MULTIPLIER},
             )
 
         optimizer = torch.optim.AdamW(param_groups)
@@ -596,11 +997,29 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
                 print(f"  LR (direction): {learning_rate * DIR_LR_MULTIPLIER} ({DIR_LR_MULTIPLIER}x)")
             if self.num_aps > 1:
                 print(f"  Repulsion weight: {self.repulsion_weight}")
+            if self.reflector_controller is not None:
+                refl_snap = self._snapshot_reflector()
+                print(f"  Reflector: ENABLED")
+                print(f"    Initial u={refl_snap['u']:.4f}, v={refl_snap['v']:.4f}")
+                if refl_snap["focal_point"] is not None:
+                    fp = refl_snap["focal_point"]
+                    print(f"    Initial focal point: ({fp[0]:.2f}, {fp[1]:.2f}, {fp[2]:.2f})")
+                print(f"    LR (reflector): {learning_rate * REFLECTOR_LR_MULTIPLIER}")
+                print(f"    Shadow quantile (MaskedSoftMinLoss): {shadow_quantile}")
             print(f"  Iterations: {num_iterations}")
             print(f"  Samples per iteration: {samples_per_tx}")
             print(f"  Use soft minimum: {use_soft_min}")
-            if use_soft_min:
-                print(f"  Fairness temperature: {temperature}")
+            # Resolve display name for fairness loss
+            _display_type = fairness_loss_type
+            if _display_type == "auto" and not use_soft_min:
+                _display_type = "percentile"
+            elif _display_type == "auto":
+                _display_type = (
+                    "masked_softmin"
+                    if self.reflector_controller is not None
+                    else "softmin"
+                )
+            print(f"  Fairness loss: {_display_type} (temperature={temperature})")
             print(f"  Loss weights: alpha={alpha} (fairness), beta={beta} (coverage)")
             print(f"  Coverage threshold: {coverage_threshold_dbm} dBm")
             print(f"  Coverage temperature: {coverage_temperature}")
@@ -618,10 +1037,12 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
                 max_depth=max_depth,
                 use_soft_min=use_soft_min,
                 temperature=temperature,
+                shadow_quantile=shadow_quantile,
                 alpha=alpha,
                 beta=beta,
                 coverage_threshold_dbm=coverage_threshold_dbm,
                 coverage_temperature=coverage_temperature,
+                fairness_loss_type=fairness_loss_type,
             )
 
             # ---- Detached radio-map for metrics --------------------------
@@ -655,6 +1076,24 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
             # ---- Backward pass -------------------------------------------
             loss.backward()
 
+            # ---- SPSA reflector gradients --------------------------------
+            # SceneObject vertex manipulation is incompatible with DrJit AD,
+            # so reflector gradients are estimated numerically via SPSA
+            # (2 extra forward passes per iteration).
+            if self.reflector_controller is not None:
+                self._reflector_spsa_gradients(
+                    samples_per_tx=samples_per_tx,
+                    max_depth=max_depth,
+                    use_soft_min=use_soft_min,
+                    temperature=temperature,
+                    shadow_quantile=shadow_quantile,
+                    alpha=alpha,
+                    beta=beta,
+                    coverage_threshold_dbm=coverage_threshold_dbm,
+                    coverage_temperature=coverage_temperature,
+                    fairness_loss_type=fairness_loss_type,
+                )
+
             # ---- Extract gradients ---------------------------------------
             grad_x = (
                 self.tx_x.grad.detach().cpu().numpy()
@@ -686,6 +1125,12 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
                 if torch.any(torch.isnan(self.tx_dir_xy.grad)):
                     self.tx_dir_xy.grad[torch.isnan(self.tx_dir_xy.grad)] = 0.0
                     nan_detected = True
+            # NaN guard for reflector parameters
+            if self.reflector_controller is not None:
+                for rp in [self.reflector_u_raw, self.reflector_v_raw, self.focal_point_raw]:
+                    if rp is not None and rp.grad is not None and torch.any(torch.isnan(rp.grad)):
+                        rp.grad[torch.isnan(rp.grad)] = 0.0
+                        nan_detected = True
             if nan_detected and verbose:
                 print(f"WARNING: NaN gradients at iteration {iteration + 1}, zeroed out")
 
@@ -755,6 +1200,13 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
             self.history["repulsion_losses"].append(self._last_repulsion_loss)
             self.history["ap_distances"].append(ap_dists)
 
+            # Reflector history
+            refl_snap = self._snapshot_reflector()
+            self.history["reflector_u"].append(refl_snap["u"])
+            self.history["reflector_v"].append(refl_snap["v"])
+            self.history["reflector_focal_point"].append(refl_snap["focal_point"])
+            self.history["reflector_position"].append(refl_snap["position"])
+
             iter_time = time.time() - iter_start
 
             # ---- Verbose logging -----------------------------------------
@@ -778,6 +1230,22 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
                     parts.append(f"Rep:{self._last_repulsion_loss:.2e}")
                 pos_grad_norm = float(np.sqrt(np.sum(grad_x ** 2 + grad_y ** 2)))
                 parts.append(f"∇pos:{pos_grad_norm:.2e}")
+                if self.reflector_controller is not None and refl_snap["u"] is not None:
+                    parts.append(
+                        f"Refl:u={refl_snap['u']:.3f},v={refl_snap['v']:.3f}"
+                    )
+                    # Show reflector gradient magnitude for diagnostics
+                    refl_grad_norms = []
+                    for rp_name, rp in [("u", self.reflector_u_raw),
+                                        ("v", self.reflector_v_raw),
+                                        ("fp", self.focal_point_raw)]:
+                        if rp is not None and rp.grad is not None:
+                            refl_grad_norms.append(
+                                f"{rp_name}:{float(rp.grad.norm()):.2e}"
+                            )
+                        else:
+                            refl_grad_norms.append(f"{rp_name}:None")
+                    parts.append(f"∇refl:[{','.join(refl_grad_norms)}]")
                 parts.append(f"{iter_time:.1f}s")
                 print(" | ".join(parts))
 
@@ -832,6 +1300,16 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
                 f"{self.history['min_rss_dbm_values'][-1] - self.history['min_rss_dbm_values'][0]:.2f} dB"
             )
             print(f"  Final coverage: {self.history['coverage_values'][-1]:.1f}%")
+            if self.reflector_controller is not None:
+                refl_final = self._snapshot_reflector()
+                print(f"  Reflector final:")
+                print(f"    u={refl_final['u']:.4f}, v={refl_final['v']:.4f}")
+                if refl_final["focal_point"] is not None:
+                    fp = refl_final["focal_point"]
+                    print(f"    Focal point: ({fp[0]:.2f}, {fp[1]:.2f}, {fp[2]:.2f})")
+                if refl_final["position"] is not None:
+                    rp = refl_final["position"]
+                    print(f"    Wall position: ({rp[0]:.2f}, {rp[1]:.2f}, {rp[2]:.2f})")
             print(f"  Total time: {elapsed_time:.2f}s")
             print(f"  Time per iteration: {elapsed_time / num_iterations:.2f}s")
 
