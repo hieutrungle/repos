@@ -1,432 +1,372 @@
 # Optimization Workflow
 
+**Last Updated**: February 27, 2026
+
 ## Overview
 
-This document describes the **Ray-based distributed parallel optimization workflow** used in the Reflector Position Optimization framework. The approach implements **three optimization methods** — Distributed Multi-Start Gradient Descent, True Parallel Grid Search, and DEAP Genetic Algorithm — all sharing the same Ray ActorPool infrastructure for exploring the non-convex optimization landscape when optimizing physical reflector positions.
+This document describes the **distributed parallel optimization workflow** used in the Reflector Position Optimization framework. The system implements three optimization methods — **Gradient Descent (GD)**, **Grid Search (GS)**, and **Genetic Algorithm (GA)** — all sharing the same Ray ActorPool infrastructure. Each method supports three operating modes: `1ap` (single AP), `2ap` (dual AP), and `2ap_reflector` (dual AP + passive reflector).
 
-### Why Ray Instead of Vectorized Batching?
+### Key Design Decisions
 
-**Critical Distinction**: Ray is necessary when optimizing **physical scene geometry** (reflector positions) rather than just wave parameters or Tx/Rx coordinates.
+1. **Ray ActorPool** (not per-task actors): Fixed pool of N persistent workers process M >> N tasks. Scene loaded once per worker, reused for all tasks.
+2. **Inversion of Control (IoC)**: Algorithm logic (DEAP GA) is decoupled from execution engine (Ray) via dependency injection of a `map` callable.
+3. **Shadow-robust objective**: 5th-percentile RSS (`PercentileCoverageObjective`) replaces hard minimum, which is trapped inside reflector dead zones.
+4. **SPSA for reflector gradients**: SceneObject vertex manipulation is incompatible with DrJit AD, so reflector parameters use 2-point finite-difference gradient estimates within the GD optimizer.
 
-- **Vectorized Batching**: Suitable for changing parameters within a single scene (e.g., transmitter positions, phase shifts)
-- **Ray Architecture**: Required when each optimization trajectory needs **independent scene geometry** (e.g., moving physical reflectors, walls, obstacles)
+---
 
-Since reflectors are physical objects in the scene, each optimization instance requires its own independent Scene copy with different reflector positions. Ray provides this process-level isolation.
+## System Architecture
 
-## Overall Parallel System Architecture
+### ActorPool Pattern (All Methods)
 
-```bash
-+=============================================================================+
-|                  1. PARALLEL SYSTEM CONFIGURATION                           |
-+=============================================================================+
-|                                                                             |
-|   +---------------------------+       +---------------------------------+   |
-|   |     USER REQUIREMENTS     |       |       BATCH CONFIGURATION       |   |
-|   +---------------------------+       +---------------------------------+   |
-|   | • Floor Plan: Office_v1   |       | • Batch Size (B): 32            |   |
-|   | • Num. APs: 2             |       |   (Creates 32 "Parallel Worlds")|   |
-|   | • Num. RIS: 1             |       | • Learning Rates: [0.1, 0.01]   |   |
-|   +-------------+-------------+       +----------------+----------------+   |
-|                 |                                      |                    |
-+=================|======================================|====================+
-                  |                                      |
-                  v                                      v
-+-----------------------------------------------------------------------------+
-|                        2. VECTORIZED INITIALIZATION                         |
-+-----------------------------------------------------------------------------+
-| • Tensor Shapes:                                                            |
-|   - AP Positions:  [32, 2, 3]  (32 worlds, 2 APs, xyz coords)               |
-|   - RIS Position:  [32, 1, 1]  (32 worlds, 1 RIS, "t" scalar on wall)       |
-|   - Focal Points:  [32, 1, 3]  (32 worlds, 1 target point)                  |
-|                                                                             |
-| • Random Seeding:                                                           |
-|   - Each of the 32 worlds starts with APs/RIS in DIFFERENT random spots.    |
-+--------------------------------------+--------------------------------------+
-                                       |
-                                       v
-            /-----------------------------------------------------\
-            |            3. OPTIMIZATION LOOP                     |
-            |     (All 32 worlds optimize simultaneously)         |
-            \--------------------------+--------------------------/
-                                       |
-        +------------------------------<-------------------------------+
-        |                                                              |
-+-------v-------------------------------------------------------+      |
-|  A. PARALLEL PHYSICS PASS (Sionna RT)                         |      |
-|  • Ray Casting: Traces rays for 32 scenes at once.            |      |
-|    (GPU efficiently handles this parallel load)               |      |
-|  • Output: [32, Num_Users] coverage maps.                     |      |
-|  • Loss:   [32] separate loss values.                         |      |
-+-------+-------------------------------------------------------+      |
-        |                                                              |
-        v                                                              |
-+-------+-------------------------------------------------------+      |
-|  B. PARALLEL BACKPROPAGATION                                  |      |
-|  • TensorFlow computes gradients for all 32 tensors.          |      |
-|  • Result: Gradient vectors pointing in 32 different          |      |
-|    directions, exploring different parts of the room.         |      |
-+-------+-------------------------------------------------------+      |
-        |                                                              |
-        v                                                              |
-+-------+-------------------------------------------------------+      |
-|  C. UPDATE STEP (The Scheduler)                               |      |
-|  • Update all 32 configurations.                              |      |
-|  • Some "worlds" might get stuck in corners (local minima).   |      |
-|  • Other "worlds" will find the perfect LOS paths.            |      |
-+-------+-------------------------------------------------------+      |
-        |                                                              |
-        |   Converged?                                                 |
-        |   NO --------------------------------------------------------+
-        |
-        v YES
-+=============================================================================+
-|                             4. WINNER SELECTION                             |
-+=============================================================================+
-| • Input: 32 Final Coverage Maps                                             |
-| • Logic: `best_index = argmin(final_losses)`                                |
-| • Output:                                                                   |
-|   - The single best configuration found across all 32 attempts.             |
-|   - "World #7 found the optimal placement."                                 |
-+-----------------------------------------------------------------------------+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│          Orchestrator / Driver  (single process)                │
+│                                                                 │
+│   RayParallelOptimizer        or        RayActorPoolExecutor    │
+│   (GD, GS methods)                      (GA via DEAP)          │
+│                                                                 │
+│         │                                    │                  │
+│    pool.map_unordered()              pool.map (ordered)         │
+│         │                                    │                  │
+│    ┌────┼────┬────────┬──────┐    ┌──────────┼──────────┐       │
+│    ▼    ▼    ▼        ▼      ▼    ▼          ▼          ▼       │
+│   W0   W1   W2  ...  Wk    W0   W1         W2    ...  Wk       │
+│                                                                 │
+│   Each Worker has:                                              │
+│     • Persistent Scene (loaded once)                            │
+│     • Optional ReflectorController                              │
+│     • Fresh optimizer per task                                  │
+│     • Configurable GPU fraction (0.5 = 2 workers/GPU)           │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### MapReduce Analogy
+### Component File Map
 
-The GPU execution model implements a massive, iterative MapReduce operation:
+| Component | File | Purpose |
+|-----------|------|---------|
+| `OptimizationWorker` | `ray_parallel_optimizer.py` | Ray actor — persistent Scene + optimizer creation per task |
+| `RayParallelOptimizer` | `ray_parallel_optimizer.py` | Orchestrator for GD and GS tasks |
+| `RayActorPoolExecutor` | `ray_evaluator.py` | Generic ordered `pool.map` engine (IoC target) |
+| `GeneticAlgorithmRunner` | `deap_logic.py` | Pure DEAP logic — no Ray imports |
+| `GradientDescentAPOptimizer` | `gradient_descent.py` | Differentiable AP + reflector optimizer |
+| `SinglePointGridSearchOptimizer` | `grid_search.py` | Single-position evaluator (used by GA + GS) |
+| `OptimizerFactory` | `optimizer_factory.py` | Factory dispatching to GD/GS/single-point |
 
-### Map Step (Parallel Physics)
+---
 
-```text
-    [BATCH OF 32 RANDOM INITIAL POSITIONS]
-                   |
-                   v
-+--------------------------------------------+
-| MAP OPERATION (Parallel Physics)           |
-| ------------------------------------------ |
-| Universe 0 | Universe 1 | ... | Universe 31|  <-- GPU Threads
-| (Ray Trace)| (Ray Trace)| ... | (Ray Trace)|
-+--------------------------------------------+
-                   |
-                   v
-        [32 INDEPENDENT LOSS VALUES]
+## Three Optimization Modes
+
+### `1ap` — Single Access Point
+
+- **Chromosome (GA)**: `[x, y, dir_x, dir_y]` (4 genes)
+- **GD**: 1 trainable position + 1 trainable direction
+- **GS**: Grid sweep over (x, y), 8-direction orientation sweep per point
+
+### `2ap` — Dual Access Point
+
+- **Chromosome (GA)**: `[x1, y1, x2, y2, dir1_x, dir1_y, dir2_x, dir2_y]` (8 genes)
+- **GD**: 2 trainable positions + 2 trainable directions + repulsion loss
+- **GS**: Alternating grid search — fix AP1, sweep AP2; fix AP2, sweep AP1; repeat
+
+### `2ap_reflector` — Dual AP + Passive Reflector
+
+- **Chromosome (GA)**: `[x1, y1, x2, y2, d1x, d1y, d2x, d2y, refl_u, refl_v, focal_x, focal_y]` (12 genes)
+- **GD**: 2 AP positions + 2 directions + reflector `(u, v)` + focal point `(x, y, z)` — all jointly optimised. Reflector gradients via SPSA.
+- **GS**: Outer loop sweeps reflector UV × focal-target grid; inner loop alternates AP positions via grid search.
+
+---
+
+## Method 1: Gradient Descent (GD)
+
+### Architecture
+
+Multi-start gradient descent via Ray: the orchestrator generates N random initial configurations and distributes them across the worker pool. Each worker runs a full GD trajectory independently.
+
+```
+Orchestrator
+  │
+  ├── generate_random_initial_positions(N, bounds, seed)
+  │
+  └── pool.map_unordered(worker.optimize, tasks)
+        │
+        ├─ Worker0: GradientDescentAPOptimizer(pos_0) → 50 iterations → result_0
+        ├─ Worker1: GradientDescentAPOptimizer(pos_1) → 50 iterations → result_1
+        ├─ ...
+        └─ WorkerN: GradientDescentAPOptimizer(pos_N) → 50 iterations → result_N
+        │
+        └── Winner selection: argmax(best_metric across all tasks)
 ```
 
-## Detail Ray-Based Distributed Architecture
+### Trainable Parameters
 
-```text
-+=============================================================================+
-|                      1. ORCHESTRATOR (DRIVER PROCESS)                       |
-+=============================================================================+
-|  • Role: The "God" class that manages the parallel universes.               |
-|  • Resources: CPU (Management), RAM (Object Store)                          |
-|  • Configuration:                                                           |
-|    - Num_Workers: 32                                                        |
-|    - GPU_Fraction: 0.1 per worker (allows 10 workers per physical GPU)      |
-+=============================================================================+
-                                      |
-         (Spawns Independent Actors via Ray Object Store)
-                                      |
-        +-----------------------------+-----------------------------+
-        |                             |                             |
-        v                             v                             v
-+---------------------+     +---------------------+     +---------------------+
-|    RAY ACTOR 1      |     |    RAY ACTOR 2      |     |    RAY ACTOR 32     |
-|   (Process ID X)    |     |   (Process ID Y)    |     |   (Process ID Z)    |
-+---------------------+     +---------------------+     +---------------------+
-| [ISOLATED MEMORY]   |     | [ISOLATED MEMORY]   |     | [ISOLATED MEMORY]   |
-|                     |     |                     |     |                     |
-| 1. Scene Instance   |     | 1. Scene Instance   |     | 1. Scene Instance   |
-|    - Reflector @ P1 |     |    - Reflector @ P2 |     |    - Reflector @ P32|
-|    - Walls, Meshes  |     |    - Walls, Meshes  |     |    - Walls, Meshes  |
-|                     |     |                     |     |                     |
-| 2. Optimizer Class  |     | 2. Optimizer Class  |     | 2. Optimizer Class  |
-|    (GradientDescent)|     |    (GradientDescent)|     |    (GradientDescent)|
-|                     |     |                     |     |                     |
-| 3. Local Loop       |     | 3. Local Loop       |     | 3. Local Loop       |
-|    - Forward Pass   |     |    - Forward Pass   |     |    - Forward Pass   |
-|    - Backward Pass  |     |    - Backward Pass  |     |    - Backward Pass  |
-|    - Update Geom.   |     |    - Update Geom.   |     |    - Update Geom.   |
-+----------+----------+     +----------+----------+     +----------+----------+
-           |                           |                           |
-+=============================================================================+
-|                        3. AGGREGATION & SELECTION                           |
-+=============================================================================+
-| • Ray.get(futures) -> List of [Final_Pos, Min_RSS, History]                 |
-| • Winner Selection: best_config = max(results, key=lambda x: x.rss)         |
-| • Post-Processing:  Plot heatmaps of the best "Universe"                    |
-+=============================================================================+
+| Parameter | Tensor | Gradient Source | Learning Rate |
+|-----------|--------|----------------|---------------|
+| AP positions `(x, y)` | `tx_x`, `tx_y` (normalised) | DrJit AD (differentiable RT) | `lr / pos_range` |
+| AP directions `(dx, dy)` | `tx_dir_xy` | DrJit AD | `lr × 10` |
+| Reflector wall UV | `reflector_u_raw`, `reflector_v_raw` | SPSA (2-point finite diff) | `lr × 0.5` |
+| Reflector focal point | `focal_point_raw` | SPSA (2-point finite diff) | `lr × 0.5` |
+
+### Loss Functions
+
+The total loss is a weighted combination:
+
+$$L = \alpha \cdot L_{\text{fairness}} + \beta \cdot L_{\text{coverage}} + L_{\text{repulsion}}$$
+
+Where `fairness_loss_type` selects:
+
+| Type | Class | When Used |
+|------|-------|-----------|
+| `softmin` | `normalized_softmin_loss` | Default for AP-only modes |
+| `masked_softmin` | `MaskedSoftMinLoss` | Default for reflector modes (`auto`) |
+| `percentile` | `PercentileCoverageObjective` | Shadow-robust; ignores bottom q% |
+| `auto` | — | Selects `masked_softmin` if reflector present, else `softmin` |
+
+The coverage component uses `differentiable_coverage_loss` (sigmoid approximation).
+
+### History Tracking
+
+Every iteration records: positions, directions, look-at targets, P5 RSS, coverage, total loss, fairness loss, coverage loss, repulsion loss, gradients, AP distances, reflector UV, reflector focal point, reflector world position.
+
+---
+
+## Method 2: Grid Search (GS)
+
+### 1-AP Mode
+
+Simple parallel grid: generate all `(x, y)` points at the specified resolution, submit each as an independent task. Each task evaluates 8 cardinal orientations.
+
+```
+generate_grid_positions(bounds, resolution)  →  N grid points
+pool.map_unordered(worker.optimize, grid_tasks)
+Winner = argmax(best_metric)
 ```
 
-### Key Architectural Differences
+### 2-AP Mode (Alternating Optimisation)
 
-| Aspect | Vectorized Batching | Ray Architecture |
-|--------|-------------------|------------------|
-| **Memory Model** | Shared Scene State | **Independent Scene Instances** |
-| **Geometry** | Static (Fixed Meshes) | **Dynamic (Unique Positions per Worker)** |
-| **Process Model** | Single Process, GPU Threads | **Multiple Python Processes** |
-| **Use Case** | Parameter Optimization | **Physical Object Placement** |
-| **Memory Usage** | Low (1 Scene, N Rays) | High (N Scenes, N Rays) |
-| **Parallelism** | GPU Vectorization | **Process-Level Isolation** |
+Alternating grid search cycles:
 
-## Execution Flow: Three Phases
+```
+for round in 1..num_rounds:
+    Fix AP2 at current best, sweep AP1 over grid  →  update AP1 best
+    Fix AP1 at current best, sweep AP2 over grid  →  update AP2 best
+```
 
-The execution is split into three distinct phases: **Initialization**, **Async Execution**, and **Reduction**.
+A `min_ap_separation` filter prunes grid points too close to the fixed AP.
 
-### Phase A: Initialization (The "Fork")
+### 2-AP + Reflector Mode
 
-1. **Define Search Space**: The Orchestrator defines 32 initial seed positions for the reflector
-2. **Spawn Actors**: Ray spins up 32 Python processes (Ray Actors)
-3. **Load Scenes**: *Critical Step* - Each Actor independently calls `load_scene()`:
-   - *Actor 1*: Loads XML, then executes `scene.get("Reflector").position = [x1, y1, z]`
-   - *Actor 2*: Loads XML, then executes `scene.get("Reflector").position = [x2, y2, z]`
-   - *Actor 32*: Loads XML, then executes `scene.get("Reflector").position = [x32, y32, z]`
-   - **Result**: The geometry is unique per worker - no shared state
+Nested outer/inner loops:
 
-### Phase B: Asynchronous Execution (The "Map")
+```
+for outer_round in 1..outer_rounds:
+    1. Fix APs at current best
+    2. Generate reflector grid: u_steps × v_steps × target_grid
+    3. Pool-evaluate all reflector configurations
+    4. Update best reflector (u, v, target)
 
-1. **Trigger Optimization**: Orchestrator calls `worker.optimize.remote()` on all 32 actors (non-blocking)
-2. **Local Gradient Descent**: Inside each actor, the `GradientDescentAPOptimizer` runs:
-   - Computes Ray Tracing (Sionna RT with DrJit)
-   - Calculates Loss (Min RSS or Soft Minimum)
-   - Computes Gradient (∇Loss w.r.t. reflector position)
-   - Updates the local position variable
-   - Modifies the Scene geometry for next iteration
-3. **VRAM Management**: Ray manages GPU memory via the `num_gpus` parameter
-   - Example: 24GB VRAM, each scene takes 1GB → Ray queues tasks if requests exceed capacity
-   - Automatic load balancing across available GPUs
+    for inner_round in 1..num_rounds:
+        5. Fix reflector + AP2, sweep AP1  →  update AP1
+        6. Fix reflector + AP1, sweep AP2  →  update AP2
+```
 
-### Phase C: Reduction (The "Gather")
+The reflector grid is generated by `generate_reflector_grid_tasks()`:
+- `u` ∈ linspace(0, 1, u_steps), `v` ∈ linspace(0, 1, v_steps)
+- Target points: grid over position bounds at `target_resolution`
+- Each task evaluates one (u, v, target) with fixed APs
 
-1. **Await Completion**: The Orchestrator waits for all 32 futures to resolve: `results = ray.get(futures)`
-2. **Optional Pruning**: For multi-stage approaches:
-   - Stop bottom 50% of workers halfway through
-   - Reallocate resources to top performers
-3. **Winner Takes All**: Compare final configurations and return the single best: `best = max(results, key=lambda x: x.rss)`
+Worker evaluation uses `PercentileCoverageObjective` for shadow-robust scoring.
 
-## Comparison with Particle Swarm Optimization (PSO)
+---
 
-### Particle Swarm Optimization (PSO)
-- **Social**: Particles "talk" to each other. Particle A knows that Particle B found a better spot
-- **Behavior**: The swarm clusters together quickly
-- **Risk**: If the swarm converges too fast to a "pretty good" spot, they all get stuck there (Premature Convergence)
+## Method 3: Genetic Algorithm (GA)
 
-### Ray-Based Distributed Multi-Start Gradient Descent
-- **Asocial**: "Universe 1" has no idea "Universe 2" exists. They run in separate Python processes with isolated memory
-- **Behavior**: 32 scouts explore 32 completely different valleys of the optimization landscape independently
-- **Benefit**: Better for non-convex problems. If 31 scouts get stuck behind a wall (local minimum), the 1 scout who started near the door can still find the global optimum without being pulled back by the failures of the others
-- **Gradient Information**: Unlike PSO, each worker has full gradient information from differentiable ray tracing
+### Architecture (IoC Pattern)
 
-## Implementation Details
+```
+┌───────────────────────────────────────────────────┐
+│  run_ga_modular.py / ray_experiment_runner.py     │
+│  Wire executor.map  →  GA runner                  │
+└───────┬───────────────────────────┬───────────────┘
+        │                           │
+        ▼                           ▼
+┌──────────────────────┐  ┌──────────────────────────┐
+│  ray_evaluator.py    │  │    deap_logic.py          │
+│  RayActorPoolExecutor│  │  GeneticAlgorithmRunner   │
+│                      │  │                           │
+│  pool.map (ordered)  │  │  Pure DEAP (no Ray)       │
+│  Returns result dicts│  │  toolbox.map = injected   │
+└──────────────────────┘  └──────────────────────────┘
+```
 
-### Ray Actor Wrapper
+### Chromosome Encoding
+
+| Mode | Genes | Layout |
+|------|-------|--------|
+| 1-AP | 4 | `[x, y, dir_x, dir_y]` |
+| 2-AP | 8 | `[x1, y1, x2, y2, dx1, dy1, dx2, dy2]` |
+| 2-AP + reflector | 12 | `[x1, y1, x2, y2, dx1, dy1, dx2, dy2, refl_u, refl_v, focal_x, focal_y]` |
+
+### Evolutionary Operators
+
+| Operator | DEAP Function | Parameters |
+|----------|--------------|------------|
+| Crossover | `cxBlend` | α = 0.5 |
+| Mutation | `_split_mutate` | σ_pos=2.0, σ_dir=0.3, σ_reflector=0.1, indpb=0.2 |
+| Selection | `selTournament` | tournsize = 10 |
+
+Split mutation applies different σ values to position, direction, and reflector genes — reflecting their different scales.
+
+### Constraints
+
+- **Bounds**: Position genes clamped to `[x_min, x_max]`, direction to `[-1, 1]`, reflector UV to `[0, 1]`, focal to spatial bounds.
+- **Separation** (2-AP): Individuals with inter-AP distance < `min_ap_separation` receive penalty fitness (`1e-100` Watts ≈ −970 dBm) without ray-tracing.
+
+### Fitness
+
+- 1-AP and 2-AP modes: maximise `best_metric` (P5 RSS in linear Watts)
+- 2-AP + reflector mode: maximise `best_metric` via `PercentileCoverageObjective` (shadow-robust)
+
+### Per-Generation Flow
+
+```
+Population  →  filter invalid fitness
+             →  check separation constraint (penalise violators)
+             →  format valid individuals via _format_individual()
+             →  executor.map(evaluate, iterable)  →  ordered results
+             →  assign fitness from result["best_metric"]
+             →  tournament selection → crossover → mutation → clamp
+             →  update HallOfFame + statistics
+```
+
+---
+
+## Experiment Runner
+
+The unified `ray_experiment_runner.py` automates batch execution across all methods and modes.
+
+### JSON Config Schema
+
+```json
+{
+  "shared": { "num_pool_workers": 2, "gpu_fraction": 0.5, ... },
+  "trials": [ { "name": "...", "method": "gd", "mode": "2ap_reflector", ... } ],
+  "sweep_groups": [ { "name_prefix": "...", "grid": { "param": [v1, v2] } } ]
+}
+```
+
+- **`shared`**: Default parameters merged into every trial.
+- **`trials`**: Explicit trial definitions (one method × one mode each).
+- **`sweep_groups`**: Cartesian product over hyperparameter grids × random seeds.
+
+### Trial Execution Flow
+
+```
+1. Load JSON config
+2. _build_trials()  →  expand explicit + sweep_groups → flat list
+3. For each trial:
+   a. Create output directory
+   b. TeeStream captures stdout to terminal + log file
+   c. _run_trial_method(trial, output_dir)  →  dispatches to GD/GS/GA
+   d. _extract_summary_row(trial, results, run_dir)
+4. _save_summary_files(run_root, rows, detailed)
+   → summary.csv, summary.json, all_trials_detailed.json
+```
+
+### Config Sizes
+
+- **Production**: `ray_experiment_runner_config.example.json` — 259 trials
+- **Smoke test**: `ray_experiment_runner_config.smoke_test.json` — 19 trials
+
+---
+
+## Reflector-Aware Optimization (All Methods)
+
+### Reflector Parameterisation
+
+The reflector is characterised by:
+- **Wall-surface coordinates** `(u, v)` ∈ [0, 1]²: position on the wall bounding box defined by `wall_top_left` and `wall_bottom_right`
+- **Focal point** `(x, y, z)`: 3-D target the reflector aims at; the `z` component is fixed at receiver height
+
+`ReflectorController` translates `(u, v)` → world position and computes the orientation to aim at the focal point, then updates the scene mesh vertices.
+
+### Per-Method Approach
+
+| Aspect | GD | GS | GA |
+|--------|----|----|-----|
+| **Reflector params** | `torch.sigmoid`-bounded raw tensors | Discrete grid (u_steps × v_steps × target_grid) | 4 continuous genes `[u, v, fx, fy]` |
+| **Gradient source** | SPSA (2 extra forward passes/iter) | N/A (exhaustive) | Evolutionary (crossover + mutation) |
+| **Integration** | ReflectorController in optimizer | ReflectorController in worker per task | Worker constructs `PercentileCoverageObjective` from gene values |
+| **Objective** | Configurable (`auto` → masked_softmin) | `PercentileCoverageObjective` | `PercentileCoverageObjective` |
+
+### Shadow-Robust Objective
+
+The passive reflector creates a physical dead zone (shadow) behind it, affecting ~2-5% of coverage cells. The hard minimum RSS is always trapped in this dead zone. The **5th-percentile RSS** (P5) is robust:
+
+$$P_5 = \text{quantile}(\{r \in \mathcal{R} : r > \epsilon\},\; q=0.05)$$
+
+This is implemented as `PercentileCoverageObjective(target_quantile=0.05, mode="maximize")`.
+
+---
+
+## Winner Selection and Output
+
+### Per-Task Result Dictionary
+
+Every worker returns a standardised dict:
 
 ```python
-import ray
-from gradient_descent import GradientDescentAPOptimizer
-
-@ray.remote(num_gpus=0.1)  # Each actor uses 10% of a GPU
-class ReflectorOptimizerWorker:
-    def __init__(self, scene_config, initial_reflector_pos, worker_id):
-        # 1. Load a fresh, independent copy of the scene
-        self.scene = load_scene(scene_config)
-        
-        # 2. Set unique reflector position for this worker
-        self.scene.get("Reflector").position = initial_reflector_pos
-        
-        # 3. Initialize optimizer with this worker's scene
-        self.optimizer = GradientDescentAPOptimizer(
-            scene=self.scene,
-            initial_position=initial_reflector_pos
-        )
-        
-        self.worker_id = worker_id
-
-    def optimize(self, num_iterations, learning_rate):
-        # Run gradient descent locally
-        final_pos, final_rss = self.optimizer.optimize(
-            num_iterations=num_iterations,
-            learning_rate=learning_rate
-        )
-        return {
-            'worker_id': self.worker_id,
-            'final_position': final_pos,
-            'final_rss': final_rss,
-            'history': self.optimizer.history
-        }
-
-# --- Orchestrator ---
-def run_distributed_optimization():
-    # 1. Define 32 distinct starting positions
-    initial_positions = [
-        [2.0, 5.0, 1.5],   # World 1
-        [8.0, 1.0, 1.5],   # World 2
-        # ... 30 more positions
-    ]
-    
-    # 2. Spawn Ray Actors
-    workers = [
-        ReflectorOptimizerWorker.remote(
-            scene_config="office_v1.xml",
-            initial_reflector_pos=pos,
-            worker_id=i
-        )
-        for i, pos in enumerate(initial_positions)
-    ]
-    
-    # 3. Start optimization (non-blocking)
-    futures = [w.optimize.remote(num_iterations=10, learning_rate=0.5) 
-               for w in workers]
-    
-    # 4. Gather results (blocking)
-    results = ray.get(futures)
-    
-    # 5. Select winner
-    best = max(results, key=lambda x: x['final_rss'])
-    print(f"Winner: Worker {best['worker_id']} with RSS={best['final_rss']:.2f} dB")
-    
-    return best
+{
+    "task_id": int,
+    "worker_id": int,
+    "num_aps": int,
+    "best_position": [x, y, z],       # or [[x1,y1,z1], [x2,y2,z2]]
+    "best_metric": float,              # P5 RSS (linear Watts)
+    "best_metric_dbm": float,          # P5 RSS (dBm)
+    "best_direction": [...],
+    "reflector_u": float,
+    "reflector_v": float,
+    "reflector_target": [fx, fy, fz],
+    "reflector_position": [x, y, z],
+    "time_elapsed": float,
+    "history": {...},                  # GD iterations
+    "grid_results": {...},             # GS evaluation details
+}
 ```
 
-### Memory Management Considerations
+### Aggregation
 
-**Critical**: Each Ray Actor loads a full Scene copy (meshes, textures, BVH trees), which can consume significant VRAM.
+- **GD**: Best task = `argmax(best_metric)` across all multi-start trajectories
+- **GS**: Best task = `argmax(best_metric)` across all grid points
+- **GA**: Best individual from Hall of Fame after final generation
 
-**Strategies**:
-1. **Limit GPU Fraction**: Use `num_gpus=0.1` to allow 10 workers per GPU
-2. **Start Small**: Test with 4-8 workers before scaling to 32
-3. **Monitor Memory**: Use `nvidia-smi` to track VRAM usage
-4. **Staged Execution**: Run 8 workers at a time if memory constrained
+---
 
-**Example VRAM Calculation**:
-- Scene size: 1 GB (meshes + BVH)
-- Ray tracing buffer: 500 MB per worker
-- 32 workers × 1.5 GB = 48 GB total
-- With 4× RTX 4090 (24 GB each) = 96 GB available → Feasible
+## Resource Management
 
-### Key Features
+### GPU Fraction
 
-1. **Process-Level Isolation**: Each Ray Actor runs in a separate Python process with independent memory
-2. **Scene Independence**: Each actor has its own Scene object with unique reflector positions
-3. **Exploration Without Communication**: Each world explores independently, avoiding premature convergence
-4. **Physics-Aware Gradients**: Uses differentiable ray tracing to compute exact gradients through the radio propagation model
-5. **Efficient Winner Selection**: Simple max/min reduction to select the best solution from all parallel attempts
-6. **GPU Resource Management**: Ray automatically balances GPU memory across workers
+Each `OptimizationWorker` is allocated a configurable GPU fraction:
 
-## Benefits Over Traditional Methods
+| Configuration | Workers/GPU | Use Case |
+|---------------|------------|----------|
+| `gpu_fraction=1.0` | 1 | Large scenes, high sample count |
+| `gpu_fraction=0.5` | 2 | Default for most runs |
+| `gpu_fraction=0.25` | 4 | Small scenes, many parallel tasks |
 
-| Aspect | Traditional PSO | Vectorized Batching | Ray Architecture |
-|--------|----------------|---------------------|------------------|
-| **Communication** | Particles share global best | No communication | No communication |
-| **Convergence** | Fast but risky (premature) | Slower but robust | Slower but robust |
-| **Gradient Usage** | No gradients (black box) | Full gradient information | Full gradient information |
-| **Scene Geometry** | Can't modify | Static (shared) | **Dynamic (independent)** |
-| **Memory Model** | Sequential updates | Shared GPU memory | **Isolated process memory** |
-| **Use Case** | General optimization | Parameter tuning | **Physical object placement** |
-| **Local Minima** | Susceptible to trapping | 32 independent escape attempts | 32 independent escape attempts |
+### Memory Considerations
 
-## When to Use Ray vs Vectorization
+- Scene + BVH + ray-tracing buffers: ~1-2 GB per worker
+- Each worker has its own `ReflectorController` (mesh vertices modified in-place)
+- No scene state is shared across workers — full process-level isolation
 
-### Use Vectorized Batching When:
-- Optimizing **parameters** (e.g., transmitter power, phase shifts)
-- Optimizing **Tx/Rx positions** (point coordinates)
-- Scene geometry remains **static**
-- Memory is limited (single scene instance)
+---
 
-### Use Ray Architecture When:
-- Optimizing **physical object positions** (reflectors, walls, obstacles)
-- Each optimization trajectory needs **different scene geometry**
-- Sufficient memory/VRAM available (multiple scene instances)
-- Need **true process isolation** for stability
+## Cross-References
 
-## Future Enhancements
-
-### Genetic Algorithm (DEAP) — Evolutionary Optimization ✅ COMPLETE
-
-In addition to gradient-based multi-start and exhaustive grid search, the framework now includes a **population-based evolutionary optimizer** using the DEAP library.
-
-#### IoC Architecture (Inversion of Control)
-
-The GA implementation uses a clean separation of concerns:
-
-```text
-+─────────────────────────────────────────────────────────+
-│  GeneticAlgorithmRunner (deap_logic.py)              │
-│  • Pure DEAP — NO Ray imports                        │
-│  • Population of (x, y) individuals                   │
-│  • Blend crossover, Gaussian mutation, tournament sel  │
-│  • toolbox.register("map", executor_map)  ← Injected   │
-+─────────────────────────┬───────────────────────────────+
-                          │
-                          │ executor_map (Dependency Injection)
-                          │
-+─────────────────────────┼───────────────────────────────+
-│  RayActorPoolExecutor (ray_evaluator.py)              │
-│  • pool.map (ordered, synchronous)                    │
-│  • Persistent OptimizationWorker actors               │
-│  • Scene loaded once per worker                       │
-+─────────────────────────────────────────────────────────+
-          │              │             │            │
-        Worker0       Worker1      Worker2     Worker3
-        (Scene)       (Scene)      (Scene)     (Scene)
-        GPU 0.25      GPU 0.25     GPU 0.25    GPU 0.25
-```
-
-#### GA Workflow
-
-1. **Initialisation**: Random population of 50–100 (x, y) positions
-2. **Evaluation**: Each individual evaluated via `SinglePointGridSearchOptimizer` on Ray ActorPool
-3. **Selection**: Tournament selection (k=3)
-4. **Crossover**: Blend crossover (`cxBlend`, α=0.5)
-5. **Mutation**: Gaussian mutation (σ=2.0, probability=0.2) with bounds enforcement
-6. **Repeat**: For N generations, tracking Hall of Fame and statistics
-7. **Result**: Best (x, y) position with minimum RSS in dBm
-
-#### Key Advantage
-
-The GA explores the search space globally via an evolving population, complementing gradient-based methods that may get trapped in local minima. When combined with the Ray ActorPool, each fitness evaluation runs on a persistent worker with its own Scene instance, enabling true parallel evaluation.
-
-**For complete GA implementation details**, see [GA_DEAP_IMPLEMENTATION.md](GA_DEAP_IMPLEMENTATION.md).
-
-### Staged Optimization (Pruning)
-1. Run all 32 workers for first 5 iterations
-2. Rank workers by current RSS
-3. Stop bottom 50% (16 workers)
-4. Continue top 50% for remaining iterations
-5. Benefit: Saves computation while maintaining diversity
-
-### Adaptive Learning Rates
-```python
-def optimize_adaptive(self, num_iterations):
-    for iteration in range(num_iterations):
-        # High learning rate initially
-        lr = 1.0 * (0.9 ** iteration)
-        # ... optimization step
-```
-
-### Multi-Objective with Ray
-```python
-def optimize_multi_objective(self):
-    results = {
-        'min_rss': self.optimizer.compute_min_rss(),
-        'coverage': self.optimizer.compute_coverage(),
-        'interference': self.optimizer.compute_interference()
-    }
-    # Pareto frontier selection in orchestrator
-    return results
-```
-
-### Integration with PSO
-To add PSO-style social behavior while maintaining Ray architecture:
-1. After each iteration, gather all positions: `positions = ray.get([w.get_position.remote() for w in workers])`
-2. Identify global best: `g_best = max(positions, key=...)`
-3. Add "pull" force toward `g_best` in each worker's update step
-4. Tune social parameters (inertia, cognitive, social coefficients)
-
-**Note**: This hybrid approach may reduce exploration benefits but could accelerate convergence if the landscape is not too non-convex.
-
-### Hybrid GA+GD Pipeline (Planned)
-Seed gradient descent from the best solutions found by the genetic algorithm:
-1. Run GA (20 generations, pop=50) to identify promising regions
-2. Extract top-k individuals from Hall of Fame
-3. Run multi-start GD from those positions for fine-tuning
-4. Combines global exploration (GA) with local convergence (GD)
+- **[RAY_ARCHITECTURE.md](RAY_ARCHITECTURE.md)** — Why Ray vs vectorised batching
+- **[RAY_PARALLEL_GUIDE.md](RAY_PARALLEL_GUIDE.md)** — Complete usage guide with code examples
+- **[RAY_IMPLEMENTATION_SUMMARY.md](RAY_IMPLEMENTATION_SUMMARY.md)** — Implementation status and file map
+- **[GA_DEAP_IMPLEMENTATION.md](GA_DEAP_IMPLEMENTATION.md)** — Detailed GA implementation guide
+- **[BASELINES.md](BASELINES.md)** — Comparison with PSO and Alternating Optimisation
+- **[RAY_EXPERIMENT_RUNNER.md](../../docs/guides/RAY_EXPERIMENT_RUNNER.md)** — Config-driven batch runner guide

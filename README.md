@@ -6,15 +6,16 @@ Physics-aware optimal placement for mechanical reflectors in NLOS (Non-Line-of-S
 
 ## Features
 
-- **Grid Search Optimization**: Exhaustive search over spatial grid for baseline performance
-- **Gradient Descent Optimization**: Fast gradient-based optimization using differentiable ray tracing
-- **Genetic Algorithm (DEAP)**: Evolutionary optimization with population-based search using the DEAP library
-- **Reflector Initialization & Control**: Mechanical reflector setup and runtime control integrated into scene/optimizer flows
+- **Grid Search Optimization**: Exhaustive search over spatial grid for baseline performance; supports 1-AP, 2-AP alternating, and 2-AP + reflector modes
+- **Gradient Descent Optimization**: Fast gradient-based optimization using differentiable ray tracing; joint AP position, orientation, and reflector placement
+- **Genetic Algorithm (DEAP)**: Evolutionary optimization with population-based search; 12-gene chromosome encoding AP positions, orientations, and reflector parameters
+- **Reflector-Aware Optimization**: All three methods support passive reflector placement and focal-point aiming on wall surfaces, with shadow-robust objectives (5th-percentile RSS)
 - **Ray-Parallel Execution**: Distributed evaluation via Ray ActorPool — all three methods run in parallel across persistent GPU workers
-- **Validated Execution Paths**: Verified runs with and without Ray, including parallel multi-GPU execution
+- **Experiment Runner**: Config-driven batch hyperparameter sweeps across GD / GS / GA with JSON configs (259 production trials, 19 smoke-test trials)
+- **Three Optimization Modes**: `1ap` (single AP), `2ap` (dual AP), `2ap_reflector` (dual AP + passive reflector)
 - **Inversion of Control (IoC) Architecture**: Clean separation of algorithm logic (DEAP) from execution engine (Ray) via dependency injection
-- **Metrics**: Minimum RSS, coverage area, and soft minimum for smooth optimization
-- **Visualizations**: Heatmaps, convergence plots, trajectory visualization, and GA evolution plots
+- **Metrics**: 5th-percentile RSS, soft minimum (LogSumExp), masked soft minimum (shadow-aware), percentile coverage objective, and differentiable coverage loss
+- **Visualizations**: Heatmaps, convergence plots, trajectory visualization, GA evolution plots, and Hall of Fame
 - **CLI Tool**: Command-line interface for easy experimentation
 
 ## Installation
@@ -178,9 +179,11 @@ See the `examples/` directory for complete examples:
 
 - `examples/quick_test.py`: Fast gradient descent test with reduced parameters
 - `examples/full_comparison.py`: Compare grid search vs gradient descent
-- `examples/ray_parallel_example.py`: Ray-parallel gradient descent (64 tasks) and grid search (441 points) via ActorPool
+- `examples/ray_parallel_example.py`: Ray-parallel GD, GS, and GA across 1-AP, 2-AP, and 2-AP + reflector modes via ActorPool
 - `examples/run_ga_modular.py`: **Modular GA** — DEAP genetic algorithm with Ray-parallel fitness evaluation (IoC pattern)
-- `examples/ray_experiment_runner.py`: Unified Ray runner for hyperparameter sweeps across GD / GS / GA (one method per trial)
+- `examples/ray_experiment_runner.py`: Unified config-driven experiment runner for hyperparameter sweeps (one method per trial)
+- `examples/ray_experiment_runner_config.example.json`: Production config (259 trials across GD / GS / GA sweeps)
+- `examples/ray_experiment_runner_config.smoke_test.json`: Quick validation config (19 trials)
 
 Run examples:
 
@@ -196,8 +199,9 @@ python examples/ray_experiment_runner.py --config examples/ray_experiment_runner
 
 `examples/ray_experiment_runner.py` is the single entrypoint for Ray-based hyperparameter automation.
 
-- Runs one method per trial (`gd`, `gs`, or `ga`), avoiding repeated execution of unrelated methods
-- Supports explicit trials and automatic hyperparameter sweeps via `sweep_groups`
+- Runs one method per trial (`gd`, `gs`, or `ga`) in one of three modes (`1ap`, `2ap`, `2ap_reflector`)
+- Supports explicit trials and automatic hyperparameter sweeps via `sweep_groups` (Cartesian grid)
+- Reflector-aware trials automatically configure wall geometry, focal point, and shadow-robust objectives
 - Saves per-trial logs and consolidated summaries (`summary.csv`, `summary.json`, `all_trials_detailed.json`)
 
 ### Step 1: Generate explicit trial config (recommended)
@@ -256,9 +260,11 @@ reflector-position/
 │       ├── ray_evaluator.py         # Generic Ray execution engine (IoC)
 │       ├── deap_logic.py            # Pure DEAP GA logic (no Ray imports)
 │       └── ray_deap_optimizer.py    # Monolithic DEAP+Ray (legacy)
+│   ├── reflector_model.py           # ReflectorController + mesh creation
 ├── examples/
-│   ├── ray_parallel_example.py  # Parallel GD + GS via ActorPool
+│   ├── ray_parallel_example.py  # GD, GS, GA across 1ap/2ap/2ap_reflector
 │   ├── run_ga_modular.py        # Modular GA entry point (IoC)
+│   ├── ray_experiment_runner.py # Config-driven batch experiment runner
 │   └── ...                      # Other examples
 ├── docs/                        # Comprehensive documentation
 ├── tests/                       # pytest test suite (62 tests)
@@ -287,14 +293,18 @@ Uses differentiable ray tracing to optimize via gradients:
 - Leverages Sionna's differentiable RadioMapSolver
 - Uses soft minimum (LogSumExp) for smooth gradients
 - PyTorch + DrJit integration via `@dr.wrap` decorator
+- Joint optimisation of AP position, orientation, and reflector placement (wall UV + focal point)
+- Multiple loss functions: `softmin`, `masked_softmin` (shadow-aware), `percentile`, `auto`
 - 50-100× faster than grid search
 
 #### Genetic Algorithm (DEAP Library) ✅
 
 Evolutionary optimisation using the DEAP framework:
-- **Population-based search**: 50-100 individuals encoding (x, y) AP positions
-- **Operators**: Blend crossover (`cxBlend`), Gaussian mutation, tournament selection
-- **Maximises minimum RSS** (linear Watts) as fitness
+- **Population-based search**: 50-200 individuals with configurable chromosome encoding
+- **12-gene reflector chromosome**: `[x1, y1, x2, y2, dir1_x, dir1_y, dir2_x, dir2_y, refl_u, refl_v, focal_x, focal_y]`
+- **Operators**: Blend crossover (`cxBlend`), split Gaussian mutation (separate σ for position/direction/reflector), tournament selection
+- **Maximises 5th-percentile RSS** (linear Watts) as fitness; shadow-robust for reflector scenarios
+- **Separation constraint**: penalises overlapping APs before expensive ray-tracing
 - **Ray-parallel evaluation**: each individual evaluated via `SinglePointGridSearchOptimizer` on Ray ActorPool
 - **Modular IoC architecture**: algorithm logic (no Ray imports) separated from execution engine
 
@@ -360,10 +370,25 @@ executor.shutdown()
 - [RAY_IMPLEMENTATION_SUMMARY.md](docs/methodology/RAY_IMPLEMENTATION_SUMMARY.md) - Implementation status
 - [BASELINES.md](docs/methodology/BASELINES.md) - Comparison with GA, PSO, and Alternating Optimization
 
+### Reflector-Aware Optimization ✅
+
+All three methods support joint AP + passive reflector placement in `2ap_reflector` mode:
+
+- **Reflector parameterisation**: wall-surface UV coordinates `(u, v)` ∈ [0, 1]² + 3-D focal-point aiming
+- **Grid Search**: outer loop sweeps reflector UV × focal-target grid; inner loop alternates AP positions
+- **Gradient Descent**: `torch.sigmoid`-bounded raw parameters for reflector UV and focal point; differentiable through Sionna scene graph
+- **Genetic Algorithm**: 4 extra genes `[refl_u, refl_v, focal_x, focal_y]` appended to AP chromosome; split mutation with separate σ for reflector genes
+- **Shadow-robust objective**: 5th-percentile RSS (`PercentileCoverageObjective`) ignores the ~2-5% of cells shadowed by the reflector body
+- **Scene integration**: `ReflectorController` manages mesh creation, wall placement, and focal-point orientation at each evaluation
+
+For details see [docs/methodology/RAY_PARALLEL_GUIDE.md](docs/methodology/RAY_PARALLEL_GUIDE.md).
+
 ### Metrics
 
-- **Minimum RSS**: Worst-case received signal strength (optimization objective)
+- **5th-Percentile RSS** (P5): Primary objective — robust worst-case coverage ignoring reflector shadows
 - **Soft Minimum**: Differentiable approximation using LogSumExp
+- **Masked SoftMin**: Shadow-aware variant that down-weights dead-zone cells
+- **Percentile Coverage**: Configurable quantile-based objective (`PercentileCoverageObjective`)
 - **Coverage**: Percentage of area above threshold (-100 dBm default)
 
 
@@ -415,16 +440,18 @@ pytest
 - ✅ **Soft Minimum Metric**: Smooth, differentiable optimization objective
 - ✅ **Coverage Metrics**: RSS threshold-based coverage calculation
 - ✅ **Radio Map Computation**: Configurable ray tracing parameters
-- ✅ **Reflector Initialization & Control**: Reflector-aware scene setup and runtime control integrated in optimization flow
+- ✅ **Reflector-Aware Optimization**: Joint AP + reflector placement for all 3 methods (GD, GS, GA) with shadow-robust P5 RSS objective
 - ✅ **Optimizer Factory**: Factory pattern for creating optimizers
 - ✅ **Base Optimizer ABC**: Abstract base class enforcing optimizer interface
 
 ### Ray-Based Parallel Optimization ✅
 - ✅ **RayParallelOptimizer**: ActorPool orchestrator for distributed multi-start GD and parallel GS
-- ✅ **OptimizationWorker**: Persistent Ray actor with reusable Scene instance
+- ✅ **OptimizationWorker**: Persistent Ray actor with reusable Scene + optional ReflectorController
 - ✅ **RayActorPoolExecutor**: Generic execution engine with ordered `pool.map` (IoC pattern)
-- ✅ **GeneticAlgorithmRunner**: Pure DEAP GA logic — no Ray imports, uses injected `map`
+- ✅ **GeneticAlgorithmRunner**: Pure DEAP GA logic — no Ray imports, uses injected `map`; 12-gene reflector chromosome
 - ✅ **SinglePointGridSearchOptimizer**: Evaluates single (x, y) position for GA fitness
+- ✅ **Experiment Runner**: Config-driven batch runner with JSON schema, sweep groups, and CSV/JSON summaries
+- ✅ **Three Modes**: `1ap`, `2ap`, `2ap_reflector` — all methods × all modes
 - ✅ **GPU Management**: Configurable GPU fraction per worker (0.25 = 4 workers/GPU)
 - ✅ **Multi-GPU Validation**: Parallel Ray execution validated on multi-GPU setup
 - ✅ **Non-Ray Validation**: Baseline single-process execution validated for reflector-aware paths
@@ -594,13 +621,14 @@ pytest
 
 ### Phase 4: Advanced Features (Q1-Q2 2026)
 - Multi-objective optimization
-- Mechanical reflector integration (initialization + control complete)
-- Multi-AP optimization
+- ✅ Reflector-aware optimization for all 3 methods (GD, GS, GA) with shadow-robust P5 objective
+- ✅ Config-driven experiment runner with hyperparameter sweep support
+- Multi-AP optimization (beyond 2-AP)
 - Adaptive learning rate
 - Coarse-to-fine Ray-based search
 - Hybrid GA+GD (seed GD from GA best solutions)
 
-**Status**: 🚧 In progress (reflector control integration complete, advanced extensions pending)  
+**Status**: 🚧 In progress (reflector optimization complete for all methods; advanced extensions pending)  
 **Target**: March-April 2026
 
 ### Phase 5: Publishing & Release (Q2 2026)

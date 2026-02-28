@@ -1,12 +1,12 @@
 # Project Status
 
-**Last Updated**: February 25, 2026  
-**Version**: 0.2.1  
+**Last Updated**: February 27, 2026  
+**Version**: 0.3.0  
 **Status**: Alpha - Active Development
 
 ## Quick Summary
 
-Physics-aware AP position optimization package using differentiable ray tracing with Sionna. Features three Ray-parallel optimization methods: gradient descent, grid search, and genetic algorithm (DEAP), plus integrated reflector initialization/control in the optimization pipeline. Uses Inversion of Control (IoC) architecture to cleanly separate algorithm logic from Ray execution engine, with validated runs in both non-Ray and Ray multi-GPU execution modes.
+Physics-aware AP position and passive reflector optimization package using differentiable ray tracing with Sionna. Features three Ray-parallel optimization methods — gradient descent, grid search, and genetic algorithm (DEAP) — each supporting `1ap`, `2ap`, and `2ap_reflector` modes. The reflector-aware mode jointly optimises AP placement and a wall-mounted reflector's position and focal-point aiming using shadow-robust 5th-percentile RSS objectives. Includes a config-driven experiment runner for automated hyperparameter sweeps (259 production trials). Uses Inversion of Control (IoC) architecture to cleanly separate algorithm logic from Ray execution engine.
 
 ## Environment
 
@@ -27,6 +27,8 @@ Physics-aware AP position optimization package using differentiable ray tracing 
 - [x] Gradient descent with differentiable ray tracing
 - [x] Soft minimum (LogSumExp) for smooth gradients
 - [x] Hard minimum for exact optimization
+- [x] 5th-percentile RSS (P5) as primary shadow-robust objective
+- [x] PercentileCoverageObjective and MaskedSoftMinLoss for reflector scenarios
 - [x] Coverage metrics (threshold-based)
 - [x] Position bounds and constraints
 - [x] Reflector initialization and runtime control integrated into scene and optimization flow
@@ -42,6 +44,25 @@ Physics-aware AP position optimization package using differentiable ray tracing 
 - [x] Per-task trajectory plots, evolution plots, Hall of Fame
 - [x] Ray execution validated on multi-GPU runs
 - [x] Non-Ray baseline runs validated for reflector-aware path
+
+### Reflector-Aware Optimization (100%)
+- [x] All three methods (GD, GS, GA) support `2ap_reflector` mode
+- [x] Reflector wall-surface parameterisation: UV coordinates ∈ [0, 1]²
+- [x] Focal-point aiming for beam-forming orientation
+- [x] GD: `torch.sigmoid`-bounded differentiable reflector parameters
+- [x] GS: outer-loop reflector sweep × inner-loop alternating AP grid search
+- [x] GA: 12-gene chromosome with 4 reflector genes (u, v, focal_x, focal_y)
+- [x] Shadow-robust P5 objective (`PercentileCoverageObjective`)
+- [x] `ReflectorController` integrated in `OptimizationWorker` for Ray execution
+
+### Experiment Runner (100%)
+- [x] Unified config-driven batch runner (`ray_experiment_runner.py`)
+- [x] JSON config with `shared`, `trials`, and `sweep_groups` sections
+- [x] Cartesian-product sweep generation across hyperparameter grids
+- [x] Per-trial log capture with `TeeStream` (stdout + file)
+- [x] Consolidated outputs: `summary.csv`, `summary.json`, `all_trials_detailed.json`
+- [x] `--generate-only` mode for config expansion without execution
+- [x] Production config (259 trials) and smoke-test config (19 trials)
 
 ### Code Quality (100%)
 - [x] Modular package structure
@@ -132,12 +153,14 @@ Physics-aware AP position optimization package using differentiable ray tracing 
 **Estimated Effort**: 3-5 days  
 **Blocker**: None
 
-### Advanced Features (20% complete)
+### Advanced Features (40% complete)
 - [x] Genetic algorithm baseline (DEAP) with Ray-parallel evaluation
 - [x] Mechanical reflector initialization and control integration
+- [x] Reflector-aware joint optimization for GD, GS, and GA (all 3 methods)
+- [x] Config-driven experiment runner with hyperparameter sweep support
 - [ ] Multi-objective optimization (coverage + capacity)
 - [ ] Constrained optimization (wall mounting)
-- [ ] Multi-AP joint optimization
+- [ ] Multi-AP joint optimization (beyond 2-AP)
 - [ ] Adaptive learning rate scheduling
 - [ ] Early stopping with convergence detection
 - [ ] Hybrid GA+GD (seed GD from GA best solutions)
@@ -203,12 +226,13 @@ Physics-aware AP position optimization package using differentiable ray tracing 
 
 ### Phase 4: Advanced Features (Q1-Q2 2026)
 - Multi-objective optimization
-- Mechanical reflector integration (initialization + control complete)
-- Multi-AP optimization
+- ✅ Reflector-aware joint optimization for all 3 methods (GD, GS, GA)
+- ✅ Config-driven experiment runner with hyperparameter sweeps
+- Multi-AP optimization (beyond 2-AP)
 - Hybrid GA+GD pipeline
 - Performance improvements
 
-**Status**: 🚧 In Progress (core reflector control complete; advanced items pending)  
+**Status**: 🚧 In Progress (reflector-aware optimization and experiment runner complete; advanced items pending)  
 **Target**: March-April 2026
 
 ### Phase 5: Publishing & Release (Q2 2026)
@@ -252,6 +276,20 @@ All dependencies are pinned to tested versions:
 - ✅ DEAP 1.4.1+ - Evolutionary algorithm library
 
 ## Recent Changes
+
+### February 27, 2026
+- ✅ Reflector-aware joint optimization implemented for all 3 methods (GD, GS, GA)
+  - GD: differentiable reflector parameters via `torch.sigmoid` bounds
+  - GS: outer reflector UV × focal-target sweep + inner alternating AP grid search
+  - GA: 12-gene chromosome with 4 reflector genes `[refl_u, refl_v, focal_x, focal_y]`
+- ✅ Shadow-robust 5th-percentile RSS objective (`PercentileCoverageObjective`) for reflector scenarios
+- ✅ Config-driven experiment runner (`ray_experiment_runner.py`) for automated hyperparameter sweeps
+  - JSON schema with `shared`, `trials`, and `sweep_groups` (Cartesian grid)
+  - Production config: 259 trials; smoke-test config: 19 trials
+  - Consolidated outputs: `summary.csv`, `summary.json`, `all_trials_detailed.json`
+- ✅ Three optimization modes: `1ap`, `2ap`, `2ap_reflector`
+- ✅ Updated all Ray framework documentation (architecture, parallel guide, implementation summary)
+- ✅ Fixed `_build_trials()` skipping comment-only entries and CSV fieldnames in `_save_summary_files()`
 
 ### February 25, 2026
 - ✅ Integrated reflector initialization and runtime control in main optimization flow
