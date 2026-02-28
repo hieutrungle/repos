@@ -62,9 +62,9 @@ SCENE_PATH = Path.home() / "blender" / "models" / "building_floor" / "building_f
 
 POSITION_BOUNDS = {
     "x_min": 5.0,
-    "x_max": 25.0,
+    "x_max": 35.0,
     "y_min": 5.0,
-    "y_max": 25.0,
+    "y_max": 35.0,
 }
 
 FIXED_Z = 3.8
@@ -806,6 +806,167 @@ def run_reflector_grid_search(
     return result
 
 
+# -- Joint GD optimization: AP + Reflector -------------------------------------
+
+def run_gradient_descent_with_reflector(
+    scene_path: str = str(SCENE_PATH),
+    *,
+    num_aps: int = 2,
+    initial_ap_positions: Optional[List[Tuple[float, float]]] = None,
+    reflector_size: Tuple[float, float] = (2.0, 2.0),
+    wall_top_left: List[float] = [15.0, 34.0, 3.0],
+    wall_bottom_right: List[float] = [34.0, 34.0, 1.0],
+    initial_focal_point: Optional[Tuple[float, float, float]] = None,
+    num_iterations: int = 30,
+    learning_rate: float = 0.5,
+    samples_per_tx: int = 1_000_000,
+    max_depth: int = 13,
+    temperature: float = 0.2,
+    shadow_quantile: float = 0.05,
+    alpha: float = 0.6,
+    beta: float = 0.4,
+    coverage_threshold_dbm: float = -120.0,
+    coverage_temperature: float = 2.0,
+    fairness_loss_type: str = "auto",
+    rx_position: Tuple[float, float, float] = (16.0, 6.5, 1.5),
+    frequency: float = 5.18e9,
+    tx_power_dbm: float = 5.0,
+    verbose: bool = True,
+) -> Tuple[Dict[str, Any], Any]:
+    """Run joint AP + Reflector gradient-descent optimisation.
+
+    Creates a scene with a passive reflector, a :class:`ReflectorController`,
+    and a :class:`GradientDescentAPOptimizer` that jointly learns AP
+    positions/orientations **and** reflector wall placement + focal point.
+
+    Parameters
+    ----------
+    scene_path : str
+        Path to the Mitsuba/Sionna XML scene file.
+    num_aps : int
+        Number of APs to optimise.
+    initial_ap_positions : list of (float, float), optional
+        Starting ``(x, y)`` per AP.  Defaults to ``INITIAL_AP_POSITIONS_2AP``.
+    reflector_size : tuple of float
+        ``(width, height)`` of the reflector mesh in metres.
+    wall_top_left, wall_bottom_right : list of float
+        3-D corner points of the reflector's wall bounding box.
+    initial_focal_point : tuple of (float, float, float), optional
+        Starting focal point for reflector beam-forming.  Defaults to
+        centre of position bounds at z = 1.5.
+    num_iterations : int
+        Gradient-descent iterations.
+    learning_rate : float
+        Base learning rate for AP position parameters.
+    samples_per_tx, max_depth : int
+        Ray-tracing fidelity knobs.
+    temperature : float
+        Softmin temperature for fairness loss.  When a reflector is active
+        this is the ``MaskedSoftMinLoss`` temperature (higher → sharper min);
+        otherwise it is the legacy ``normalized_softmin_loss`` temperature.
+    shadow_quantile : float
+        Fraction of lowest-signal cells to mask out inside
+        ``MaskedSoftMinLoss`` (reflector shadow dead zone).  Default 0.05.
+    alpha, beta : float
+        Weights for fairness and coverage losses.
+    coverage_threshold_dbm : float
+        Threshold for coverage-sigmoid loss (dBm).
+    coverage_temperature : float
+        Sigmoid sharpness for coverage loss.
+    fairness_loss_type : str
+        Which fairness loss to use: ``"auto"`` (default — masked_softmin
+        when reflector is active, softmin otherwise), ``"softmin"``,
+        ``"masked_softmin"``, or ``"percentile"``.
+    rx_position : tuple of float
+        Receiver position ``(x, y, z)``.
+    frequency : float
+        Operating frequency in Hz.
+    tx_power_dbm : float
+        Total transmitter power in dBm.
+    verbose : bool
+        Print per-iteration progress.
+
+    Returns
+    -------
+    info : dict
+        Unpacked result dictionary (same schema as other ``run_*`` helpers).
+    optimizer : GradientDescentAPOptimizer
+        The optimizer instance (for plotting / further inspection).
+    """
+    from reflector_position.optimizers.gradient_descent import (
+        GradientDescentAPOptimizer,
+    )
+
+    print("\n" + "=" * 80)
+    print(f"GRADIENT DESCENT — {num_aps} AP(s) + REFLECTOR (joint optimisation)")
+    print("=" * 80)
+
+    if initial_ap_positions is None:
+        initial_ap_positions = list(INITIAL_AP_POSITIONS_2AP[:num_aps])
+
+    # Build TX position tuples with z
+    tx_positions_3d = [
+        (p[0], p[1], FIXED_Z) for p in initial_ap_positions
+    ]
+
+    # Scene + reflector
+    scene, reflector_ctrl = setup_building_floor_scene(
+        scene_path=scene_path,
+        frequency=frequency,
+        tx_power_dbm=tx_power_dbm,
+        tx_positions=tx_positions_3d,
+        rx_position=rx_position,
+        reflector_enabled=True,
+        reflector_size=reflector_size,
+        wall_top_left=wall_top_left,
+        wall_bottom_right=wall_bottom_right,
+        focal_point=initial_focal_point,
+    )
+
+    # Instantiate the joint optimizer
+    optimizer = GradientDescentAPOptimizer(
+        scene=scene,
+        initial_positions=initial_ap_positions,
+        fixed_z=FIXED_Z,
+        position_bounds=POSITION_BOUNDS,
+        optimize_orientation=True,
+        repulsion_weight=1.0 if num_aps > 1 else 0.0,
+        reflector_controller=reflector_ctrl,
+        initial_focal_point=initial_focal_point,
+    )
+
+    start = time.time()
+    result = optimizer.optimize(
+        num_iterations=num_iterations,
+        learning_rate=learning_rate,
+        samples_per_tx=samples_per_tx,
+        max_depth=max_depth,
+        use_soft_min=True,
+        temperature=temperature,
+        shadow_quantile=shadow_quantile,
+        alpha=alpha,
+        beta=beta,
+        coverage_threshold_dbm=coverage_threshold_dbm,
+        coverage_temperature=coverage_temperature,
+        fairness_loss_type=fairness_loss_type,
+        verbose=verbose,
+    )
+    elapsed = time.time() - start
+
+    info = _unpack_result(optimizer, result)
+    info["time_elapsed"] = elapsed
+    info["num_iterations"] = len(optimizer.history["positions"])
+
+    # Append reflector-specific summary
+    refl_snap = optimizer._snapshot_reflector()
+    info["reflector_u"] = refl_snap["u"]
+    info["reflector_v"] = refl_snap["v"]
+    info["reflector_focal_point"] = refl_snap["focal_point"]
+    info["reflector_position"] = refl_snap["position"]
+
+    return info, optimizer
+
+
 # -- Physically-Aware Alternating Grid Search ----------------------------------
 
 def run_grid_search_physically_aware(
@@ -1450,19 +1611,19 @@ def main():
     # ==================================================================
     # 2-AP + Reflector RUN (joint physically-aware grid search)
     # ==================================================================
-    print("\n\nRunning 2-AP + Reflector grid search...")
-    gs_2ap_refl_info = run_grid_search_2ap_with_reflector(
-        scene_path=str(SCENE_PATH),
-        ap_grid_resolution=5.0,
-        ap_alternating_rounds=ALTERNATING_ROUNDS,
-        initial_ap_positions=list(INITIAL_AP_POSITIONS_2AP),
-        u_steps=3,
-        v_steps=3,
-        target_resolution=10.0,
-        target_quantile=0.05,
-        outer_rounds=2,
-        verbose=True,
-    )
+    # print("\n\nRunning 2-AP + Reflector grid search...")
+    # gs_2ap_refl_info = run_grid_search_2ap_with_reflector(
+    #     scene_path=str(SCENE_PATH),
+    #     ap_grid_resolution=5.0,
+    #     ap_alternating_rounds=ALTERNATING_ROUNDS,
+    #     initial_ap_positions=list(INITIAL_AP_POSITIONS_2AP),
+    #     u_steps=3,
+    #     v_steps=3,
+    #     target_resolution=10.0,
+    #     target_quantile=0.05,
+    #     outer_rounds=2,
+    #     verbose=True,
+    # )
 
     # # -- 2-AP Gradient Descent -------------------------------------------------
     # gd_2ap_info, gd_2ap_opt = run_gradient_descent(
@@ -1470,14 +1631,34 @@ def main():
     # )
 
     # ==================================================================
+    # 2-AP + Reflector GD (joint differentiable optimisation)
+    # ==================================================================
+    print("\n\nRunning 2-AP + Reflector Gradient Descent...")
+    gd_2ap_refl_info, gd_2ap_refl_opt = run_gradient_descent_with_reflector(
+        scene_path=str(SCENE_PATH),
+        num_aps=2,
+        initial_ap_positions=list(INITIAL_AP_POSITIONS_2AP),
+        wall_top_left=[15.0, 34.0, 3.0],
+        wall_bottom_right=[34.0, 34.0, 1.0],
+        initial_focal_point=(20.0, 20.0, 1.5),
+        num_iterations=30,
+        learning_rate=0.5,
+        samples_per_tx=1_000_000,
+        max_depth=13,
+        fairness_loss_type="auto",
+        verbose=True,
+    )
+
+    # ==================================================================
     # COMPARISON TABLE
     # ==================================================================
     print("\n" + "=" * 80)
-    print("RUN SUMMARY — 2 APs + Reflector Grid Search")
+    print("RUN SUMMARY — 2 APs + Reflector: Grid Search vs Gradient Descent")
     print("=" * 80)
 
     configs = [
-        ("GS 2-AP + Reflector", gs_2ap_refl_info),
+        # ("GS 2-AP + Reflector", gs_2ap_refl_info),
+        ("GD 2-AP + Reflector", gd_2ap_refl_info),
     ]
 
     for label, info in configs:
@@ -1495,6 +1676,15 @@ def main():
                   f"/{info.get('num_iterations', '?')}")
         print(f"    Min RSS:        {info['best_metric_dbm']:.2f} dBm")
         print(f"    Time:           {info['time_elapsed']:.1f}s")
+        # Reflector details (if present)
+        if info.get("reflector_u") is not None:
+            print(f"    Reflector u={info['reflector_u']:.4f}, v={info['reflector_v']:.4f}")
+        if info.get("reflector_focal_point") is not None:
+            fp = info["reflector_focal_point"]
+            print(f"    Reflector focal: ({fp[0]:.2f}, {fp[1]:.2f}, {fp[2]:.2f})")
+        if info.get("reflector_position") is not None:
+            rp = info["reflector_position"]
+            print(f"    Reflector pos:   ({rp[0]:.2f}, {rp[1]:.2f}, {rp[2]:.2f})")
 
     # Quick summary line
     print("\n" + "-" * 80)

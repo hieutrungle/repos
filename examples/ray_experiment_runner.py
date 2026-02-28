@@ -48,7 +48,16 @@ except ModuleNotFoundError:
 
 
 VALID_METHODS = {"gd", "gs", "ga"}
-VALID_MODES = {"1ap", "2ap"}
+VALID_MODES = {"1ap", "2ap", "2ap_reflector"}
+
+# Default reflector geometry — matches ray_parallel_example.py defaults
+_DEFAULT_REFLECTOR = {
+    "wall_top_left": [15.0, 34.0, 3.0],
+    "wall_bottom_right": [34.0, 34.0, 1.0],
+    "reflector_size": [2.0, 2.0],
+    "focal_z": 1.5,
+    "target_quantile": 0.05,
+}
 
 
 class TeeStream:
@@ -137,10 +146,16 @@ def _default_trial_name(trial_idx: int, trial: dict[str, Any]) -> str:
                 f"b{_abbr_float(float(overrides.get('beta', 0.1)))}",
             ]
         )
+        if mode == "2ap_reflector":
+            flt = trial.get("gd_fairness_loss_type", "auto")
+            suffix_parts.append(f"flt{flt}")
     elif method == "gs":
         suffix_parts.append(f"gr{_abbr_float(float(trial.get('gs_grid_resolution', 1.0)))}")
-        if mode == "2ap":
+        if mode in {"2ap", "2ap_reflector"}:
             suffix_parts.append(f"r{int(trial.get('gs_num_rounds', exp.ALTERNATING_ROUNDS))}")
+        if mode == "2ap_reflector":
+            suffix_parts.append(f"or{int(trial.get('gs_outer_rounds', 3))}")
+            suffix_parts.append(f"q{_abbr_float(float(trial.get('gs_target_quantile', 0.05)))}")
     elif method == "ga":
         ga_params = trial.get("ga_params", {})
         suffix_parts.extend(
@@ -150,6 +165,8 @@ def _default_trial_name(trial_idx: int, trial: dict[str, Any]) -> str:
                 f"m{_abbr_float(float(ga_params.get('mutpb', exp.GA_PARAMS['mutpb'])))}",
             ]
         )
+        if mode == "2ap_reflector":
+            suffix_parts.append(f"q{_abbr_float(float(trial.get('ga_target_quantile', 0.05)))}")
 
     suffix = "_".join(suffix_parts)
     return f"trial_{trial_idx:03d}_{method}_{mode}_{suffix}"
@@ -163,6 +180,9 @@ def _build_trials(config: dict[str, Any]) -> list[dict[str, Any]]:
     all_trials: list[dict[str, Any]] = []
 
     for trial in explicit_trials:
+        # Skip comment-only entries (no method/mode)
+        if "method" not in trial and "mode" not in trial:
+            continue
         merged = _merge_dict(shared, trial)
         all_trials.append(merged)
 
@@ -215,6 +235,27 @@ def _build_trials(config: dict[str, Any]) -> list[dict[str, Any]]:
     return all_trials
 
 
+def _get_reflector_cfg(trial: dict[str, Any]) -> dict[str, Any]:
+    """Extract reflector geometry from trial, falling back to defaults."""
+    return {
+        "wall_top_left": trial.get(
+            "reflector_wall_top_left", _DEFAULT_REFLECTOR["wall_top_left"]
+        ),
+        "wall_bottom_right": trial.get(
+            "reflector_wall_bottom_right", _DEFAULT_REFLECTOR["wall_bottom_right"]
+        ),
+        "reflector_size": tuple(
+            trial.get("reflector_size", _DEFAULT_REFLECTOR["reflector_size"])
+        ),
+        "focal_z": float(
+            trial.get("reflector_focal_z", _DEFAULT_REFLECTOR["focal_z"])
+        ),
+        "target_quantile": float(
+            trial.get("reflector_target_quantile", _DEFAULT_REFLECTOR["target_quantile"])
+        ),
+    }
+
+
 def _run_trial_method(trial: dict[str, Any], output_dir: Path) -> dict[str, Any]:
     method = trial["method"]
     mode = trial["mode"]
@@ -223,42 +264,94 @@ def _run_trial_method(trial: dict[str, Any], output_dir: Path) -> dict[str, Any]
     num_pool_workers = int(trial.get("num_pool_workers", exp.NUM_POOL_WORKERS))
     gpu_fraction = float(trial.get("gpu_fraction", exp.GPU_FRACTION))
 
-    if method in {"gd", "gs"}:
+    # -----------------------------------------------------------------
+    # Gradient Descent
+    # -----------------------------------------------------------------
+    if method == "gd":
+        gd_num_tasks = int(trial.get("gd_num_tasks", 100))
+        gd_num_iterations = int(trial.get("gd_num_iterations", 50))
+        gd_samples_per_tx = int(trial.get("gd_samples_per_tx", 1_000_000))
+        gd_repulsion_weight = float(trial.get("gd_repulsion_weight", 0.3))
+        gd_fairness_loss_type = str(trial.get("gd_fairness_loss_type", "auto"))
+
         parallel_opt = exp.RayParallelOptimizer(
             num_workers=num_pool_workers,
             gpu_fraction=gpu_fraction,
         )
         try:
-            if method == "gd":
-                gd_num_tasks = int(trial.get("gd_num_tasks", 100))
-                gd_num_iterations = int(trial.get("gd_num_iterations", 50))
-                gd_samples_per_tx = int(trial.get("gd_samples_per_tx", 1_000_000))
-                gd_repulsion_weight = float(trial.get("gd_repulsion_weight", 0.3))
-
-                if mode == "1ap":
-                    return exp.example_parallel_gradient_descent(
-                        parallel_opt,
-                        num_aps=1,
-                        num_tasks=gd_num_tasks,
-                        num_iterations=gd_num_iterations,
-                        samples_per_tx=gd_samples_per_tx,
-                        output_dir=str(output_dir),
-                        scene_config=exp.SCENE_CONFIG,
-                        random_seed=seed,
-                        optimization_overrides=trial.get("gd_optimization_overrides"),
-                    )
-
-                return exp.example_parallel_gradient_descent(
+            if mode == "2ap_reflector":
+                rcfg = _get_reflector_cfg(trial)
+                return exp.example_parallel_gd_2ap_with_reflector(
                     parallel_opt,
-                    num_aps=2,
                     num_tasks=gd_num_tasks,
                     num_iterations=gd_num_iterations,
                     repulsion_weight=gd_repulsion_weight,
+                    fairness_loss_type=gd_fairness_loss_type,
+                    output_dir=str(output_dir),
+                    random_seed=seed,
+                    wall_top_left=rcfg["wall_top_left"],
+                    wall_bottom_right=rcfg["wall_bottom_right"],
+                    reflector_size=rcfg["reflector_size"],
+                    target_z=rcfg["focal_z"],
+                    optimization_overrides=trial.get("gd_optimization_overrides"),
+                )
+
+            if mode == "1ap":
+                return exp.example_parallel_gradient_descent(
+                    parallel_opt,
+                    num_aps=1,
+                    num_tasks=gd_num_tasks,
+                    num_iterations=gd_num_iterations,
                     samples_per_tx=gd_samples_per_tx,
                     output_dir=str(output_dir),
-                    scene_config=exp.SCENE_CONFIG_2AP,
+                    scene_config=exp.SCENE_CONFIG,
                     random_seed=seed,
                     optimization_overrides=trial.get("gd_optimization_overrides"),
+                )
+
+            # mode == "2ap"
+            return exp.example_parallel_gradient_descent(
+                parallel_opt,
+                num_aps=2,
+                num_tasks=gd_num_tasks,
+                num_iterations=gd_num_iterations,
+                repulsion_weight=gd_repulsion_weight,
+                samples_per_tx=gd_samples_per_tx,
+                output_dir=str(output_dir),
+                scene_config=exp.SCENE_CONFIG_2AP,
+                random_seed=seed,
+                optimization_overrides=trial.get("gd_optimization_overrides"),
+            )
+        finally:
+            parallel_opt.shutdown()
+
+    # -----------------------------------------------------------------
+    # Grid Search
+    # -----------------------------------------------------------------
+    if method == "gs":
+        parallel_opt = exp.RayParallelOptimizer(
+            num_workers=num_pool_workers,
+            gpu_fraction=gpu_fraction,
+        )
+        try:
+            if mode == "2ap_reflector":
+                rcfg = _get_reflector_cfg(trial)
+                return exp.example_parallel_grid_search_2ap_with_reflector(
+                    parallel_opt,
+                    grid_resolution=float(trial.get("gs_grid_resolution", 1.0)),
+                    num_rounds=int(trial.get("gs_num_rounds", exp.ALTERNATING_ROUNDS)),
+                    outer_rounds=int(trial.get("gs_outer_rounds", 3)),
+                    output_dir=str(output_dir),
+                    scene_config=exp.SCENE_CONFIG_2AP,
+                    wall_top_left=rcfg["wall_top_left"],
+                    wall_bottom_right=rcfg["wall_bottom_right"],
+                    reflector_size=rcfg["reflector_size"],
+                    target_z=rcfg["focal_z"],
+                    target_quantile=rcfg["target_quantile"],
+                    u_steps=int(trial.get("gs_u_steps", 3)),
+                    v_steps=int(trial.get("gs_v_steps", 3)),
+                    target_resolution=float(trial.get("gs_target_resolution", 10.0)),
+                    min_ap_separation=float(trial.get("gs_min_ap_separation", 10.0)),
                 )
 
             if mode == "1ap":
@@ -269,6 +362,7 @@ def _run_trial_method(trial: dict[str, Any], output_dir: Path) -> dict[str, Any]
                     scene_config=exp.SCENE_CONFIG,
                 )
 
+            # mode == "2ap"
             return exp.example_parallel_grid_search_2ap(
                 parallel_opt,
                 grid_resolution=float(trial.get("gs_grid_resolution", 1.0)),
@@ -279,6 +373,52 @@ def _run_trial_method(trial: dict[str, Any], output_dir: Path) -> dict[str, Any]
         finally:
             parallel_opt.shutdown()
 
+    # -----------------------------------------------------------------
+    # Genetic Algorithm
+    # -----------------------------------------------------------------
+    # method == "ga"
+    ga_params = _merge_dict(exp.GA_PARAMS, trial.get("ga_params"))
+
+    if mode == "2ap_reflector":
+        rcfg = _get_reflector_cfg(trial)
+        target_quantile = float(
+            trial.get("ga_target_quantile", rcfg["target_quantile"])
+        )
+        focal_z = float(trial.get("ga_focal_z", rcfg["focal_z"]))
+
+        # Build reflector-enabled scene config for GA workers
+        ga_scene_config = {
+            **exp.SCENE_CONFIG_2AP,
+            "reflector_enabled": True,
+            "reflector_size": rcfg["reflector_size"],
+            "wall_top_left": rcfg["wall_top_left"],
+            "wall_bottom_right": rcfg["wall_bottom_right"],
+            "focal_point": [20.0, 20.0, focal_z],
+            "device": "cpu",
+        }
+        ga_executor = exp.RayActorPoolExecutor(
+            scene_config=ga_scene_config,
+            num_workers=num_pool_workers,
+            gpu_fraction=gpu_fraction,
+            verbose=True,
+        )
+        try:
+            return exp.example_deap_ga_2ap_with_reflector(
+                ga_executor,
+                ga_params=ga_params,
+                min_ap_separation=float(trial.get("ga_min_ap_separation", 5.0)),
+                output_dir=str(output_dir),
+                random_seed=seed,
+                wall_top_left=rcfg["wall_top_left"],
+                wall_bottom_right=rcfg["wall_bottom_right"],
+                reflector_size=rcfg["reflector_size"],
+                focal_z=focal_z,
+                target_quantile=target_quantile,
+            )
+        finally:
+            ga_executor.shutdown()
+
+    # Non-reflector GA (1ap or 2ap)
     ga_executor = exp.RayActorPoolExecutor(
         scene_config=exp.SCENE_CONFIG if mode == "1ap" else exp.SCENE_CONFIG_2AP,
         num_workers=num_pool_workers,
@@ -286,7 +426,6 @@ def _run_trial_method(trial: dict[str, Any], output_dir: Path) -> dict[str, Any]
         verbose=True,
     )
     try:
-        ga_params = _merge_dict(exp.GA_PARAMS, trial.get("ga_params"))
         if mode == "1ap":
             return exp.example_deap_ga_1ap(
                 ga_executor,
@@ -308,6 +447,7 @@ def _run_trial_method(trial: dict[str, Any], output_dir: Path) -> dict[str, Any]
 
 def _extract_summary_row(trial: dict[str, Any], results: dict[str, Any], run_dir: Path) -> dict[str, Any]:
     method = trial["method"]
+    mode = trial["mode"]
 
     best_dbm: float | None
     time_s: float | None
@@ -319,15 +459,35 @@ def _extract_summary_row(trial: dict[str, Any], results: dict[str, Any], run_dir
         best_dbm = results["best_fitness_dbm"]
         time_s = results["total_time"]
 
-    return {
+    row: dict[str, Any] = {
         "trial": trial["name"],
         "method": trial["method"],
         "mode": trial["mode"],
         "random_seed": trial.get("random_seed", exp.RANDOM_SEED),
-        "best_dbm": best_dbm,
+        "best_p5_rss_dbm": best_dbm,
         "time_s": time_s,
         "run_dir": str(run_dir),
     }
+
+    # Reflector metadata
+    if mode == "2ap_reflector":
+        if method == "ga":
+            refl = results.get("best_reflector")
+            if refl:
+                row["reflector_u"] = refl.get("u")
+                row["reflector_v"] = refl.get("v")
+                row["focal_x"] = refl.get("focal_x")
+                row["focal_y"] = refl.get("focal_y")
+        elif method in {"gd", "gs"}:
+            br = results.get("best_result", {})
+            row["reflector_u"] = br.get("reflector_u")
+            row["reflector_v"] = br.get("reflector_v")
+            focal = br.get("reflector_focal_point") or br.get("reflector_target")
+            if focal and len(focal) >= 2:
+                row["focal_x"] = focal[0]
+                row["focal_y"] = focal[1]
+
+    return row
 
 
 def _save_summary_files(run_root: Path, rows: list[dict[str, Any]], detailed: list[dict[str, Any]]) -> None:

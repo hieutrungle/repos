@@ -1,0 +1,201 @@
+{
+  "_comment": "Smoke-test config — all methods with minimal parameters for fast validation. Run time: ~5-15 min total depending on GPU.",
+
+  "shared": {
+    "num_pool_workers": 2,
+    "gpu_fraction": 0.5,
+    "random_seed": 4,
+
+    "gd_num_tasks": 4,
+    "gd_num_iterations": 2,
+    "gd_samples_per_tx": 100000,
+    "gd_repulsion_weight": 0.2,
+    "gd_fairness_loss_type": "auto",
+
+    "ga_min_ap_separation": 7.0,
+
+    "reflector_wall_top_left": [15.0, 34.0, 3.0],
+    "reflector_wall_bottom_right": [34.0, 34.0, 1.0],
+    "reflector_size": [2.0, 2.0],
+    "reflector_focal_z": 1.5,
+    "reflector_target_quantile": 0.05
+  },
+
+  "trials": [
+    { "_comment": "--- AP-only baselines ---" },
+    {
+      "name": "smoke_gd_2ap",
+      "method": "gd",
+      "mode": "2ap",
+      "gd_optimization_overrides": {
+        "learning_rate": 0.5,
+        "temperature": 0.15,
+        "alpha": 0.95,
+        "beta": 0.05
+      }
+    },
+    {
+      "name": "smoke_gs_1ap",
+      "method": "gs",
+      "mode": "1ap",
+      "gs_grid_resolution": 5.0
+    },
+    {
+      "name": "smoke_gs_2ap",
+      "method": "gs",
+      "mode": "2ap",
+      "gs_grid_resolution": 5.0,
+      "gs_num_rounds": 1
+    },
+    {
+      "name": "smoke_ga_2ap",
+      "method": "ga",
+      "mode": "2ap",
+      "ga_params": {
+        "pop_size": 10,
+        "n_gen": 3,
+        "cxpb": 0.7,
+        "mutpb": 0.3,
+        "tournsize": 3,
+        "hof_size": 2
+      }
+    },
+
+    { "_comment": "--- Reflector-aware baselines ---" },
+    {
+      "name": "smoke_gd_2ap_reflector",
+      "method": "gd",
+      "mode": "2ap_reflector",
+      "gd_num_tasks": 4,
+      "gd_num_iterations": 2,
+      "gd_fairness_loss_type": "auto",
+      "gd_optimization_overrides": {
+        "learning_rate": 0.5,
+        "temperature": 0.15,
+        "shadow_quantile": 0.05,
+        "alpha": 0.95,
+        "beta": 0.05,
+        "coverage_threshold_dbm": -120.0,
+        "coverage_temperature": 2.0
+      }
+    },
+    {
+      "name": "smoke_gs_2ap_reflector",
+      "method": "gs",
+      "mode": "2ap_reflector",
+      "gs_grid_resolution": 5.0,
+      "gs_num_rounds": 1,
+      "gs_outer_rounds": 1,
+      "gs_u_steps": 2,
+      "gs_v_steps": 2,
+      "gs_target_resolution": 15.0,
+      "gs_min_ap_separation": 10.0,
+      "gs_target_quantile": 0.05
+    },
+    {
+      "name": "smoke_ga_2ap_reflector",
+      "method": "ga",
+      "mode": "2ap_reflector",
+      "ga_min_ap_separation": 5.0,
+      "ga_target_quantile": 0.05,
+      "ga_focal_z": 1.5,
+      "ga_params": {
+        "pop_size": 10,
+        "n_gen": 3,
+        "cxpb": 0.7,
+        "mutpb": 0.3,
+        "tournsize": 3,
+        "hof_size": 2
+      }
+    }
+  ],
+
+  "sweep_groups": [
+    {
+      "_comment": "Minimal GD reflector sweep — 2 LR values × 1 seed = 2 trials",
+      "name_prefix": "smoke_gd_refl_lr",
+      "method": "gd",
+      "mode": "2ap_reflector",
+      "random_seed": [4],
+      "base": {
+        "gd_num_tasks": 4,
+        "gd_num_iterations": 2,
+        "gd_samples_per_tx": 100000,
+        "gd_fairness_loss_type": "auto"
+      },
+      "grid": {
+        "gd_optimization_overrides.learning_rate": [0.3, 0.7]
+      }
+    },
+    {
+      "_comment": "Minimal GD fairness sweep — 2 types × 1 seed = 2 trials",
+      "name_prefix": "smoke_gd_refl_fairness",
+      "method": "gd",
+      "mode": "2ap_reflector",
+      "random_seed": [4],
+      "base": {
+        "gd_num_tasks": 4,
+        "gd_num_iterations": 2,
+        "gd_samples_per_tx": 100000
+      },
+      "grid": {
+        "gd_fairness_loss_type": ["auto", "percentile"]
+      }
+    },
+    {
+      "_comment": "Minimal GS reflector sweep — 2 resolutions × 1 seed = 2 trials",
+      "name_prefix": "smoke_gs_refl_res",
+      "method": "gs",
+      "mode": "2ap_reflector",
+      "random_seed": [4],
+      "base": {
+        "gs_num_rounds": 1,
+        "gs_outer_rounds": 1,
+        "gs_u_steps": 2,
+        "gs_v_steps": 2,
+        "gs_target_resolution": 15.0,
+        "gs_min_ap_separation": 10.0
+      },
+      "grid": {
+        "gs_grid_resolution": [3.0, 5.0]
+      }
+    },
+    {
+      "_comment": "Minimal GA reflector sweep — 2 pop sizes × 1 seed = 2 trials",
+      "name_prefix": "smoke_ga_refl_pop",
+      "method": "ga",
+      "mode": "2ap_reflector",
+      "random_seed": [4],
+      "grid": {
+        "ga_params.pop_size": [8, 12],
+        "ga_params.n_gen": [3]
+      }
+    },
+    {
+      "_comment": "Minimal AP-only GD sweep — 2 LR × 1 seed = 2 trials",
+      "name_prefix": "smoke_gd2ap_lr",
+      "method": "gd",
+      "mode": "2ap",
+      "random_seed": [4],
+      "base": {
+        "gd_num_tasks": 4,
+        "gd_num_iterations": 2,
+        "gd_samples_per_tx": 100000
+      },
+      "grid": {
+        "gd_optimization_overrides.learning_rate": [0.3, 0.7]
+      }
+    },
+    {
+      "_comment": "Minimal AP-only GA sweep — 2 pop × 1 seed = 2 trials",
+      "name_prefix": "smoke_ga2ap_pop",
+      "method": "ga",
+      "mode": "2ap",
+      "random_seed": [4],
+      "grid": {
+        "ga_params.pop_size": [8, 12],
+        "ga_params.n_gen": [3]
+      }
+    }
+  ]
+}

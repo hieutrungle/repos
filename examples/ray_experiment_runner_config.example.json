@@ -2,13 +2,27 @@
   "shared": {
     "num_pool_workers": 2,
     "gpu_fraction": 0.5,
+    "random_seed": 4,
+
     "gd_num_tasks": 100,
     "gd_num_iterations": 50,
     "gd_samples_per_tx": 1000000,
     "gd_repulsion_weight": 0.2,
-    "ga_min_ap_separation": 4.0
+    "gd_fairness_loss_type": "auto",
+
+    "ga_min_ap_separation": 7.0,
+
+    "reflector_wall_top_left": [15.0, 34.0, 3.0],
+    "reflector_wall_bottom_right": [34.0, 34.0, 1.0],
+    "reflector_size": [2.0, 2.0],
+    "reflector_focal_z": 1.5,
+    "reflector_target_quantile": 0.05
   },
+
   "trials": [
+    {
+      "_comment": "--- AP-only baselines (legacy) ---"
+    },
     {
       "name": "gd_2ap_seed4_baseline",
       "method": "gd",
@@ -17,8 +31,8 @@
       "gd_optimization_overrides": {
         "learning_rate": 0.5,
         "temperature": 0.15,
-        "alpha": 0.9,
-        "beta": 0.1
+        "alpha": 0.95,
+        "beta": 0.05
       }
     },
     {
@@ -40,10 +54,138 @@
         "mut_indpb": 0.2,
         "hof_size": 5
       }
+    },
+
+    {
+      "_comment": "--- Reflector-aware trials (2ap_reflector) ---"
+    },
+    {
+      "name": "gd_2ap_reflector_baseline",
+      "method": "gd",
+      "mode": "2ap_reflector",
+      "gd_num_tasks": 64,
+      "gd_num_iterations": 30,
+      "gd_repulsion_weight": 0.2,
+      "gd_fairness_loss_type": "auto",
+      "gd_optimization_overrides": {
+        "learning_rate": 0.5,
+        "temperature": 0.15,
+        "shadow_quantile": 0.05,
+        "alpha": 0.95,
+        "beta": 0.05,
+        "coverage_threshold_dbm": -120.0,
+        "coverage_temperature": 2.0
+      }
+    },
+    {
+      "name": "gs_2ap_reflector_baseline",
+      "method": "gs",
+      "mode": "2ap_reflector",
+      "gs_grid_resolution": 1.0,
+      "gs_num_rounds": 3,
+      "gs_outer_rounds": 3,
+      "gs_u_steps": 3,
+      "gs_v_steps": 3,
+      "gs_target_resolution": 10.0,
+      "gs_min_ap_separation": 10.0,
+      "gs_target_quantile": 0.05
+    },
+    {
+      "name": "ga_2ap_reflector_baseline",
+      "method": "ga",
+      "mode": "2ap_reflector",
+      "ga_min_ap_separation": 5.0,
+      "ga_target_quantile": 0.05,
+      "ga_focal_z": 1.5,
+      "ga_params": {
+        "pop_size": 150,
+        "n_gen": 50,
+        "cxpb": 0.7,
+        "mutpb": 0.3,
+        "tournsize": 10,
+        "cx_alpha": 0.5,
+        "mut_mu": 0.0,
+        "mut_sigma": 2.0,
+        "mut_sigma_pos": 2.0,
+        "mut_sigma_dir": 0.3,
+        "mut_indpb": 0.2,
+        "hof_size": 5
+      }
     }
   ],
+
   "sweep_groups": [
     {
+      "_comment": "Sweep GD learning rate and temperature with reflector",
+      "name_prefix": "gd_refl_lr_temp",
+      "method": "gd",
+      "mode": "2ap_reflector",
+      "random_seed": [51, 52, 53],
+      "base": {
+        "gd_num_tasks": 64,
+        "gd_num_iterations": 30,
+        "gd_fairness_loss_type": "auto"
+      },
+      "grid": {
+        "gd_optimization_overrides.learning_rate": [0.3, 0.5, 0.7],
+        "gd_optimization_overrides.temperature": [0.1, 0.15, 0.2],
+        "gd_optimization_overrides.alpha": [0.95],
+        "gd_optimization_overrides.beta": [0.05]
+      }
+    },
+    {
+      "_comment": "Sweep GD fairness loss type with reflector",
+      "name_prefix": "gd_refl_fairness",
+      "method": "gd",
+      "mode": "2ap_reflector",
+      "random_seed": [51, 52],
+      "base": {
+        "gd_num_tasks": 64,
+        "gd_num_iterations": 30
+      },
+      "grid": {
+        "gd_fairness_loss_type": ["auto", "softmin", "masked_softmin", "percentile"]
+      }
+    },
+    {
+      "_comment": "Sweep GS resolution and outer rounds with reflector",
+      "name_prefix": "gs_refl_res_rounds",
+      "method": "gs",
+      "mode": "2ap_reflector",
+      "random_seed": [51],
+      "grid": {
+        "gs_grid_resolution": [0.5, 1.0, 2.0],
+        "gs_outer_rounds": [2, 3],
+        "gs_u_steps": [3, 5],
+        "gs_v_steps": [3, 5]
+      }
+    },
+    {
+      "_comment": "Sweep GA pop size, generations, and mutation with reflector",
+      "name_prefix": "ga_refl_pop_mut",
+      "method": "ga",
+      "mode": "2ap_reflector",
+      "random_seed": [51, 52, 53],
+      "grid": {
+        "ga_params.pop_size": [100, 150, 200],
+        "ga_params.n_gen": [30, 50],
+        "ga_params.mutpb": [0.2, 0.3, 0.4]
+      }
+    },
+    {
+      "_comment": "Sweep GA crossover and tournament size with reflector",
+      "name_prefix": "ga_refl_cx_tourn",
+      "method": "ga",
+      "mode": "2ap_reflector",
+      "random_seed": [51, 52],
+      "grid": {
+        "ga_params.cxpb": [0.5, 0.7, 0.9],
+        "ga_params.tournsize": [5, 10, 15],
+        "ga_params.mut_sigma_pos": [1.0, 2.0, 3.0]
+      }
+    },
+    {
+      "_comment": "Legacy AP-only sweeps (unchanged)",
       "name_prefix": "gd2ap_lr_temp",
       "method": "gd",
       "mode": "2ap",

@@ -683,6 +683,172 @@ def example_parallel_grid_search_2ap_with_reflector(
     return best_overall_results
 
 
+# -- Example 2d: Parallel Gradient Descent — 2 APs + Reflector ----------------
+
+def example_parallel_gd_2ap_with_reflector(
+    parallel_opt: RayParallelOptimizer,
+    num_tasks: int = 6,
+    num_iterations: int = 30,
+    initial_positions: Optional[list] = None,
+    initial_focal_point: Optional[tuple] = None,
+    repulsion_weight: float = 1.0,
+    output_dir: str = OUTPUT_DIR,
+    scene_config: dict = None,
+    reflector_size: tuple[float, float] = (2.0, 2.0),
+    wall_top_left: list[float] = [15.0, 34.0, 3.0],
+    wall_bottom_right: list[float] = [34.0, 34.0, 1.0],
+    target_z: float = 1.5,
+    random_seed: int = RANDOM_SEED,
+    fairness_loss_type: str = "auto",
+    optimization_overrides: Optional[dict] = None,
+) -> dict:
+    """Run parallel gradient descent with joint AP + reflector optimisation.
+
+    Each task starts from a different random pair of AP positions but shares
+    the same initial reflector focal point.  The
+    :class:`GradientDescentAPOptimizer` jointly learns AP positions/orientations
+    **and** reflector wall placement ``(u, v)`` + focal point via SPSA.
+
+    Parameters
+    ----------
+    parallel_opt : RayParallelOptimizer
+        Initialised pool orchestrator.
+    num_tasks : int
+        Number of independent GD trajectories to run in parallel.
+    num_iterations : int
+        Gradient descent iterations per task.
+    initial_positions : list of (float, float), optional
+        Override starting AP positions for **all** tasks.  Defaults to
+        random positions per task.
+    initial_focal_point : tuple of (float, float, float), optional
+        Starting focal point for every task.  Defaults to centre of
+        bounds at ``target_z``.
+    repulsion_weight : float
+        Weight for pairwise AP repulsion loss (prevents merging).
+    output_dir : str
+        Directory for saved results and plots.
+    scene_config : dict
+        Scene configuration; reflector keys are injected automatically.
+    reflector_size, wall_top_left, wall_bottom_right : list
+        Reflector geometry passed to ``setup_building_floor_scene``.
+    target_z : float
+        Z-coordinate for initial focal point default.
+    random_seed : int
+        Seed for reproducible random starting positions.
+    fairness_loss_type : str
+        Fairness loss selector: ``"auto"``, ``"softmin"``,
+        ``"masked_softmin"``, or ``"percentile"``.
+    optimization_overrides : dict, optional
+        Extra keys merged into ``optimization_params`` (overrides defaults).
+
+    Returns
+    -------
+    dict
+        Standard ``RayParallelOptimizer.run()`` output with ``all_results``,
+        ``best_result``, ``aggregate_stats``, etc.
+    """
+    num_aps = 2
+
+    base_scene_config = SCENE_CONFIG_2AP if scene_config is None else scene_config
+    scene_config = {
+        **base_scene_config,
+        "reflector_enabled": True,
+        "reflector_size": reflector_size,
+        "wall_top_left": wall_top_left,
+        "wall_bottom_right": wall_bottom_right,
+        "focal_point": list(initial_focal_point) if initial_focal_point else [20.0, 20.0, target_z],
+        "device": "cuda",
+    }
+
+    if initial_focal_point is None:
+        initial_focal_point = (
+            (POSITION_BOUNDS["x_min"] + POSITION_BOUNDS["x_max"]) / 2,
+            (POSITION_BOUNDS["y_min"] + POSITION_BOUNDS["y_max"]) / 2,
+            target_z,
+        )
+
+    print("\n" + "=" * 80)
+    print(f"Parallel Gradient Descent — {num_aps} APs + Reflector, {num_tasks} tasks")
+    print("=" * 80)
+    print(f"  Iterations/task:     {num_iterations}")
+    print(f"  Repulsion weight:    {repulsion_weight}")
+    print(f"  Fairness loss:       {fairness_loss_type}")
+    print(f"  Initial focal point: {initial_focal_point}")
+
+    rng = np.random.default_rng(random_seed)
+
+    work_items = []
+    for i in range(num_tasks):
+        if initial_positions is not None:
+            positions = list(initial_positions)
+        else:
+            positions = [
+                (
+                    float(rng.uniform(POSITION_BOUNDS["x_min"], POSITION_BOUNDS["x_max"])),
+                    float(rng.uniform(POSITION_BOUNDS["y_min"], POSITION_BOUNDS["y_max"])),
+                )
+                for _ in range(num_aps)
+            ]
+        pos_str = "  ".join(f"({p[0]:.1f},{p[1]:.1f})" for p in positions)
+        print(f"  Task {i:2d}: {pos_str}")
+        work_items.append({
+            "initial_positions": positions,
+            "position_bounds": POSITION_BOUNDS,
+            "fixed_z": FIXED_Z,
+            "optimize_orientation": True,
+            "repulsion_weight": repulsion_weight,
+            "initial_focal_point": initial_focal_point,
+        })
+
+    # Optimization parameters — passed to optimizer.optimize()
+    optimization_params = {
+        **OPTIMIZATION_PARAMS,
+        "num_iterations": num_iterations,
+        "learning_rate": 0.5,
+        "use_soft_min": True,
+        "temperature": 0.15,
+        "shadow_quantile": 0.05,
+        "fairness_loss_type": fairness_loss_type,
+        "alpha": 0.95,
+        "beta": 0.05,
+        "coverage_threshold_dbm": -120.0,
+        "coverage_temperature": 2.0,
+    }
+    if optimization_overrides:
+        optimization_params.update(optimization_overrides)
+
+    results = parallel_opt.run(
+        scene_config=scene_config,
+        optimizer_method="gradient_descent",
+        work_items=work_items,
+        optimization_params=optimization_params,
+        verbose=True,
+    )
+
+    # Save results
+    os.makedirs(output_dir, exist_ok=True)
+    _save_results(results, os.path.join(output_dir, "gd_2ap_reflector_results.json"))
+
+    parallel_opt.save_results_plot(
+        results,
+        save_path=os.path.join(output_dir, "gd_2ap_reflector_parallel_results.png"),
+        metric_name="P5 RSS",
+        position_bounds=POSITION_BOUNDS,
+        rss_range_dbm=RSS_RANGE_DBM,
+    )
+
+    trajectory_dir = os.path.join(output_dir, "gd_2ap_reflector_trajectories")
+    parallel_opt.save_task_trajectory_plots(
+        results,
+        save_dir=trajectory_dir,
+        filename_prefix="gd_2ap_refl_task",
+        position_bounds=POSITION_BOUNDS,
+        rss_range_dbm=RSS_RANGE_DBM,
+    )
+
+    return results
+
+
 # -- Example 3a: DEAP GA — 1 AP -----------------------------------------------
 
 def example_deap_ga_1ap(
@@ -804,6 +970,116 @@ def example_deap_ga_2ap(
     return results
 
 
+# -- Example 3c: DEAP GA — 2 APs + Reflector ----------------------------------
+
+def example_deap_ga_2ap_with_reflector(
+    ga_executor: RayActorPoolExecutor,
+    ga_params: dict = None,
+    min_ap_separation: float = 5.0,
+    output_dir: str = OUTPUT_DIR,
+    random_seed: int = RANDOM_SEED,
+    # --- Reflector parameters ---
+    reflector_size: tuple[float, float] = (2.0, 2.0),
+    wall_top_left: list[float] = [15.0, 34.0, 3.0],
+    wall_bottom_right: list[float] = [34.0, 34.0, 1.0],
+    focal_z: float = 1.5,
+    focal_bounds: Optional[dict] = None,
+    target_quantile: float = 0.05,
+) -> dict:
+    """Run a 2-AP + Reflector Genetic Algorithm.
+
+    Extends ``example_deap_ga_2ap`` with 4 additional reflector genes
+    ``[u, v, focal_x, focal_y]`` appended to the 8-gene 2-AP chromosome,
+    yielding a **12-gene** chromosome:
+
+        ``[x1, y1, x2, y2, dx1, dy1, dx2, dy2, u, v, fx, fy]``
+
+    The fitness objective is the 5th-percentile RSS via
+    ``PercentileCoverageObjective``, consistent with the grid-search and
+    gradient-descent reflector-aware methods.
+
+    Args:
+        ga_executor: ``RayActorPoolExecutor`` bound to a 2-TX scene **with
+            reflector enabled** in the scene config.
+        ga_params: Override for evolutionary hyper-parameters.
+        min_ap_separation: Minimum allowed AP distance (metres).
+        output_dir: Directory for output files.
+        random_seed: Seed for reproducibility.
+        reflector_size: Panel dimensions (metres).
+        wall_top_left: Top-left corner of the wall bounding box.
+        wall_bottom_right: Bottom-right corner of the wall bounding box.
+        focal_z: Fixed z-coordinate for the focal point.
+        focal_bounds: Dict with keys ``fx_min``, ``fx_max``, ``fy_min``,
+            ``fy_max`` bounding focal-point search.  Defaults to
+            position bounds.
+        target_quantile: Percentile quantile for coverage objective.
+
+    Returns:
+        GA results dict (includes ``best_reflector`` and
+        ``percentile_target_quantile``).
+    """
+    if ga_params is None:
+        ga_params = GA_PARAMS
+
+    if focal_bounds is None:
+        focal_bounds = {
+            "fx_min": POSITION_BOUNDS["x_min"],
+            "fx_max": POSITION_BOUNDS["x_max"],
+            "fy_min": POSITION_BOUNDS["y_min"],
+            "fy_max": POSITION_BOUNDS["y_max"],
+        }
+
+    n_ap_genes = 8  # 2 APs × (x, y, dx, dy)
+    n_refl_genes = 4  # u, v, fx, fy
+
+    print("\n" + "=" * 80)
+    print(
+        f"DEAP Genetic Algorithm — 2 APs + Reflector "
+        f"({n_ap_genes + n_refl_genes}D chromosome)"
+    )
+    print("=" * 80)
+    print(f"  min_ap_separation = {min_ap_separation}m")
+    print(f"  target_quantile   = {target_quantile}")
+    print(f"  focal_z           = {focal_z}")
+    print(f"  wall_top_left     = {wall_top_left}")
+    print(f"  wall_bottom_right = {wall_bottom_right}")
+
+    ga_runner = GeneticAlgorithmRunner(
+        position_bounds=POSITION_BOUNDS,
+        fixed_z=FIXED_Z,
+        executor_map=ga_executor.map,
+        optimize_orientation=True,
+        num_aps=2,
+        min_ap_separation=min_ap_separation,
+        reflector_enabled=True,
+        focal_bounds=focal_bounds,
+        focal_z=focal_z,
+        percentile_target_quantile=target_quantile,
+    )
+
+    results = ga_runner.run(
+        optimization_params=OPTIMIZATION_PARAMS,
+        ga_params=ga_params,
+        seed=random_seed,
+        verbose=True,
+    )
+
+    os.makedirs(output_dir, exist_ok=True)
+    _save_ga_results(
+        results,
+        os.path.join(output_dir, "ga_2ap_reflector_results.json"),
+    )
+
+    ga_runner.save_evolution_plot(
+        results,
+        save_path=os.path.join(output_dir, "ga_2ap_reflector_evolution.png"),
+        position_bounds=POSITION_BOUNDS,
+        rss_range_dbm=RSS_RANGE_DBM,
+    )
+
+    return results
+
+
 # -- Utilities -----------------------------------------------------------------
 
 def _fmt_dir(d):
@@ -918,6 +1194,13 @@ def _save_ga_results(results: dict, path: str) -> None:
         serializable["best_positions"] = results["best_positions"]
         serializable["best_directions"] = results.get("best_directions")
         serializable["best_ap_separation"] = results.get("best_ap_separation")
+    # Reflector fields
+    if results.get("reflector_enabled"):
+        serializable["reflector_enabled"] = True
+        serializable["best_reflector"] = results.get("best_reflector")
+        serializable["percentile_target_quantile"] = results.get(
+            "percentile_target_quantile",
+        )
     with open(path, "w") as f:
         json.dump(serializable, f, indent=2, default=str)
     print(f"GA results saved to: {path}")
@@ -934,6 +1217,13 @@ def _print_gd_summary(label: str, results: dict) -> None:
     print(f"  Best iteration: {b.get('best_iteration', -1) + 1}")
     print(f"  Best position:  {_fmt_pos(b['best_position'])}")
     print(f"  Best direction: {_fmt_dir(b.get('best_direction'))}")
+    # Reflector info (joint optimisation)
+    if b.get("reflector_u") is not None:
+        print(f"  Reflector u,v:  ({b['reflector_u']:.4f}, {b['reflector_v']:.4f})")
+    if b.get("reflector_focal_point") is not None:
+        print(f"  Focal point:    {_fmt_pos(b['reflector_focal_point'])}")
+    elif b.get("reflector_target") is not None:
+        print(f"  Focal point:    {_fmt_pos(b['reflector_target'])}")
     print(f"  Best P5 RSS:   {b['best_metric_dbm']:.2f} dBm")
     print(f"  Wall-clock:     {results['total_time']:.2f}s")
     print(f"  Speedup:        {stats['speedup']:.2f}x")
@@ -972,10 +1262,12 @@ def _print_gs_summary(label: str, results: dict) -> None:
 
 
 def _print_ga_summary(label: str, results: dict) -> None:
-    """Print a detailed GA summary block (1-AP or multi-AP)."""
+    """Print a detailed GA summary block (1-AP or multi-AP, with reflector)."""
     num_aps = results.get("num_aps", 1)
+    refl_enabled = results.get("reflector_enabled", False)
+    refl_tag = " + reflector" if refl_enabled else ""
     print(f"\n{label} (pop={results['ga_params']['pop_size']}, "
-          f"gen={results['ga_params']['n_gen']}, APs={num_aps}):")
+          f"gen={results['ga_params']['n_gen']}, APs={num_aps}{refl_tag}):")
     if num_aps == 1:
         print(f"  Best position:  {_fmt_pos(results['best_position'])}")
         print(f"  Best direction: {_fmt_dir(results.get('best_direction'))}")
@@ -989,7 +1281,16 @@ def _print_ga_summary(label: str, results: dict) -> None:
                 print(f"  AP{i} direction: ({d[0]:+.4f}, {d[1]:+.4f}, {d[2]:+.4f})")
         sep = results.get('best_ap_separation', 0)
         print(f"  AP separation:  {sep:.2f}m")
+    # Reflector info
+    best_refl = results.get("best_reflector")
+    if best_refl:
+        print(f"  Reflector u,v:  ({best_refl['u']:.4f}, {best_refl['v']:.4f})")
+        print(f"  Focal point:    ({best_refl['focal_x']:.2f}, "
+              f"{best_refl['focal_y']:.2f}, {best_refl['focal_z']:.2f})")
     print(f"  Best P5 RSS:   {results['best_fitness_dbm']:.2f} dBm")
+    if refl_enabled:
+        pq = results.get('percentile_target_quantile', 0.05)
+        print(f"  Quantile:       {pq} (5th-percentile shadow-robust)")
     print(f"  Total evals:    {results['total_evaluations']}")
     print(f"  Wall-clock:     {results['total_time']:.2f}s")
 
@@ -1222,39 +1523,240 @@ def run_reflector_aware_grid_search_only(
     return {"gs_2ap": gs_results}
 
 
+def run_reflector_aware_comparison(
+    output_dir: str = OUTPUT_DIR,
+    num_pool_workers: int = NUM_POOL_WORKERS,
+    gpu_fraction: float = GPU_FRACTION,
+    # --- Grid search parameters ---
+    grid_resolution: float = 1.0,
+    gs_num_rounds: int = ALTERNATING_ROUNDS,
+    gs_outer_rounds: int = 3,
+    target_quantile: float = 0.05,
+    min_ap_separation: float = 10.0,
+    # --- Gradient descent parameters ---
+    gd_num_tasks: int = 64,
+    gd_num_iterations: int = 30,
+    gd_repulsion_weight: float = 0.2,
+    gd_fairness_loss_type: str = "auto",
+    gd_optimization_overrides: Optional[dict] = None,
+    # --- GA parameters ---
+    ga_params: Optional[dict] = None,
+    ga_min_ap_separation: float = 5.0,
+    # --- Reflector geometry (shared by GA Phase 3) ---
+    ga_wall_top_left: list[float] = [15.0, 34.0, 3.0],
+    ga_wall_bottom_right: list[float] = [34.0, 34.0, 1.0],
+    ga_focal_z: float = 1.5,
+    # --- Shared ---
+    random_seed: int = RANDOM_SEED,
+) -> dict:
+    """Run grid search, gradient descent, **and** genetic algorithm for
+    2 APs + reflector.
+
+    Executes the three methods **sequentially**, recycling the Ray pool
+    between phases to avoid GPU memory issues.
+
+    Phase 1 — Grid Search (alternating AP sweep + reflector sweep)
+    Phase 2 — Gradient Descent (joint AP + reflector via SPSA)
+    Phase 3 — Genetic Algorithm (DEAP, 12-gene chromosome with reflector)
+
+    A three-way comparison table is printed at the end.
+
+    Parameters
+    ----------
+    output_dir : str
+        Base directory for all saved results and plots.
+    num_pool_workers : int
+        Number of Ray workers (Scene loaded once per worker).
+    gpu_fraction : float
+        GPU memory fraction per worker.
+    grid_resolution : float
+        Grid spacing (metres) for AP grid search.
+    gs_num_rounds : int
+        AP alternating rounds per outer round (grid search).
+    gs_outer_rounds : int
+        Outer rounds alternating AP sweep and reflector sweep.
+    target_quantile : float
+        Percentile quantile for coverage objective.
+    min_ap_separation : float
+        Minimum distance (metres) between APs for grid search pruning.
+    gd_num_tasks : int
+        Number of parallel GD trajectories.
+    gd_num_iterations : int
+        Iterations per GD trajectory.
+    gd_repulsion_weight : float
+        AP repulsion weight for GD.
+    gd_fairness_loss_type : str
+        Fairness loss for GD: ``"auto"``, ``"softmin"``,
+        ``"masked_softmin"``, ``"percentile"``.
+    gd_optimization_overrides : dict, optional
+        Extra keys merged into GD ``optimization_params``.
+    ga_params : dict, optional
+        Override for GA evolutionary hyper-parameters.
+    ga_min_ap_separation : float
+        Minimum AP separation for GA constraint.
+    ga_wall_top_left : list[float]
+        Wall top-left corner for GA reflector.
+    ga_wall_bottom_right : list[float]
+        Wall bottom-right corner for GA reflector.
+    ga_focal_z : float
+        Fixed focal-point z-coordinate for GA reflector.
+    random_seed : int
+        Seed for reproducible starting positions.
+
+    Returns
+    -------
+    dict
+        ``{"gs_2ap": ..., "gd_2ap": ..., "ga_2ap": ...}``
+    """
+    ray.init(ignore_reinit_error=True)
+
+    all_results: dict = {}
+
+    # --- Phase 1: Grid Search (2-AP + reflector) ---
+    parallel_opt = RayParallelOptimizer(
+        num_workers=num_pool_workers,
+        gpu_fraction=gpu_fraction,
+    )
+    try:
+        gs_results = example_parallel_grid_search_2ap_with_reflector(
+            parallel_opt,
+            grid_resolution=grid_resolution,
+            num_rounds=gs_num_rounds,
+            outer_rounds=gs_outer_rounds,
+            output_dir=os.path.join(output_dir, "gs"),
+            scene_config=SCENE_CONFIG_2AP,
+            target_quantile=target_quantile,
+            min_ap_separation=min_ap_separation,
+        )
+        all_results["gs_2ap"] = gs_results
+    finally:
+        parallel_opt.shutdown()
+        print("Grid Search pool shut down.")
+
+    # --- Phase 2: Gradient Descent (2-AP + reflector, joint) ---
+    parallel_opt = RayParallelOptimizer(
+        num_workers=num_pool_workers,
+        gpu_fraction=gpu_fraction,
+    )
+    try:
+        gd_results = example_parallel_gd_2ap_with_reflector(
+            parallel_opt,
+            num_tasks=gd_num_tasks,
+            num_iterations=gd_num_iterations,
+            repulsion_weight=gd_repulsion_weight,
+            fairness_loss_type=gd_fairness_loss_type,
+            output_dir=os.path.join(output_dir, "gd"),
+            random_seed=random_seed,
+            optimization_overrides=gd_optimization_overrides,
+        )
+        all_results["gd_2ap"] = gd_results
+    finally:
+        parallel_opt.shutdown()
+        print("Gradient Descent pool shut down.")
+
+    # --- Phase 3: Genetic Algorithm (2-AP + reflector, DEAP) ---
+    # Build a reflector-enabled scene config for GA workers
+    ga_scene_config = {
+        **SCENE_CONFIG_2AP,
+        "reflector_enabled": True,
+        "reflector_size": (2.0, 2.0),
+        "wall_top_left": ga_wall_top_left,
+        "wall_bottom_right": ga_wall_bottom_right,
+        "focal_point": [20.0, 20.0, ga_focal_z],
+        "device": "cpu",
+    }
+    ga_executor = RayActorPoolExecutor(
+        scene_config=ga_scene_config,
+        num_workers=num_pool_workers,
+        gpu_fraction=gpu_fraction,
+        verbose=True,
+    )
+    try:
+        ga_results = example_deap_ga_2ap_with_reflector(
+            ga_executor,
+            ga_params=ga_params,
+            min_ap_separation=ga_min_ap_separation,
+            output_dir=os.path.join(output_dir, "ga"),
+            random_seed=random_seed,
+            wall_top_left=ga_wall_top_left,
+            wall_bottom_right=ga_wall_bottom_right,
+            focal_z=ga_focal_z,
+            target_quantile=target_quantile,
+        )
+        all_results["ga_2ap"] = ga_results
+    finally:
+        ga_executor.shutdown()
+        print("GA pool shut down.")
+
+    # --- Three-way comparison summary ---
+    print("\n" + "=" * 80)
+    print("COMPARISON — 2 APs + Reflector: Grid Search vs Gradient Descent vs GA")
+    print("=" * 80)
+    print(f"\nPool: {num_pool_workers} workers (Scene loaded once per worker)")
+
+    _print_gs_summary("Grid Search (2-AP + reflector)", gs_results)
+    _print_gd_summary("Gradient Descent (2-AP + reflector)", gd_results)
+    _print_ga_summary("Genetic Algorithm (2-AP + reflector)", ga_results)
+
+    gs_best_dbm = gs_results["best_result"]["best_metric_dbm"]
+    gd_best_dbm = gd_results["best_result"]["best_metric_dbm"]
+    ga_best_dbm = ga_results["best_fitness_dbm"]
+
+    print("\n" + "-" * 60)
+    print(f"  Grid Search best P5 RSS:      {gs_best_dbm:.2f} dBm")
+    print(f"  Gradient Descent best P5 RSS: {gd_best_dbm:.2f} dBm")
+    print(f"  Genetic Algo best P5 RSS:     {ga_best_dbm:.2f} dBm")
+
+    scores = {"GS": gs_best_dbm, "GD": gd_best_dbm, "GA": ga_best_dbm}
+    winner = max(scores, key=scores.get)
+    runner_up = sorted(scores, key=scores.get, reverse=True)[1]
+    print(
+        f"  Winner: {winner} "
+        f"(delta vs {runner_up}={abs(scores[winner] - scores[runner_up]):.2f} dB)"
+    )
+    print("-" * 60)
+
+    ray.shutdown()
+    return all_results
+
+
 def run_reflector_aware():
     """
     Deprecated compatibility wrapper.
 
-    Use run_reflector_aware_grid_search_only() instead.
+    Use run_reflector_aware_comparison() instead.
     """
     warnings.warn(
         "run_reflector_aware() is deprecated and will be removed in a future "
-        "release; use run_reflector_aware_grid_search_only() instead.",
+        "release; use run_reflector_aware_comparison() instead.",
         DeprecationWarning,
         stacklevel=2,
     )
-    return run_reflector_aware_grid_search_only()
+    return run_reflector_aware_comparison()
 
 
 def run_ap_only():
     """
     Deprecated legacy entrypoint.
 
-    Use run_reflector_aware() instead.
+    Use run_reflector_aware_comparison() instead.
     """
     warnings.warn(
         "run_ap_only() is deprecated and will be removed in a future release; "
-        "use run_reflector_aware_grid_search_only() instead.",
+        "use run_reflector_aware_comparison() instead.",
         DeprecationWarning,
         stacklevel=2,
     )
-    return run_reflector_aware_grid_search_only()
+    return run_reflector_aware_comparison()
 
 
 if __name__ == "__main__":
-    run_reflector_aware_grid_search_only(
-        num_rounds=ALTERNATING_ROUNDS,
-        outer_rounds=3,
+    run_reflector_aware_comparison(
+        gs_num_rounds=ALTERNATING_ROUNDS,
+        gs_outer_rounds=3,
         min_ap_separation=10.0,
+        gd_num_tasks=64,
+        gd_num_iterations=30,
+        gd_fairness_loss_type="auto",
+        ga_params=GA_PARAMS,
     )
