@@ -496,7 +496,14 @@ def _save_summary_files(run_root: Path, rows: list[dict[str, Any]], detailed: li
 
     summary_csv = run_root / "summary.csv"
     if rows:
-        fieldnames = list(rows[0].keys())
+        # Collect all unique keys across rows (reflector trials add extra columns)
+        seen: set[str] = set()
+        fieldnames: list[str] = []
+        for row in rows:
+            for key in row:
+                if key not in seen:
+                    seen.add(key)
+                    fieldnames.append(key)
         with summary_csv.open("w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
