@@ -29,6 +29,7 @@ import csv
 import json
 import re
 import sys
+import traceback
 from contextlib import redirect_stderr, redirect_stdout
 from copy import deepcopy
 from datetime import datetime
@@ -563,6 +564,7 @@ def run_experiments(config_path: Path, output_root: Path) -> None:
     detailed_results: list[dict[str, Any]] = []
 
     ray.init(ignore_reinit_error=True)
+    failed_trials: list[str] = []
     try:
         total = len(trials)
         for idx, trial in enumerate(trials, start=1):
@@ -571,40 +573,52 @@ def run_experiments(config_path: Path, output_root: Path) -> None:
             trial_dir.mkdir(parents=True, exist_ok=True)
 
             output_txt = trial_dir / "output.txt"
-            with output_txt.open("w", encoding="utf-8") as f:
-                tee_out = TeeStream(sys.stdout, f)
-                tee_err = TeeStream(sys.stderr, f)
-                with redirect_stdout(tee_out), redirect_stderr(tee_err):
-                    print("\n" + "-" * 80)
-                    print(
-                        f"[{idx}/{total}] {trial_name} | "
-                        f"method={trial['method']} | mode={trial['mode']} | "
-                        f"seed={trial.get('random_seed', exp.RANDOM_SEED)}"
-                    )
-                    print("-" * 80)
+            try:
+                with output_txt.open("w", encoding="utf-8") as f:
+                    tee_out = TeeStream(sys.stdout, f)
+                    tee_err = TeeStream(sys.stderr, f)
+                    with redirect_stdout(tee_out), redirect_stderr(tee_err):
+                        print("\n" + "-" * 80)
+                        print(
+                            f"[{idx}/{total}] {trial_name} | "
+                            f"method={trial['method']} | mode={trial['mode']} | "
+                            f"seed={trial.get('random_seed', exp.RANDOM_SEED)}"
+                        )
+                        print("-" * 80)
 
-                    result = _run_trial_method(trial, output_dir=trial_dir)
+                        result = _run_trial_method(trial, output_dir=trial_dir)
 
-                    trial_record = {
+                        trial_record = {
+                            "trial": trial_name,
+                            "config": trial,
+                            "result": result,
+                        }
+                        (trial_dir / "trial_record.json").write_text(
+                            json.dumps(trial_record, indent=2, default=str),
+                            encoding="utf-8",
+                        )
+
+                summary_row = _extract_summary_row(trial, result, trial_dir)
+                summary_rows.append(summary_row)
+                detailed_results.append(
+                    {
                         "trial": trial_name,
                         "config": trial,
                         "result": result,
+                        "summary": summary_row,
                     }
-                    (trial_dir / "trial_record.json").write_text(
-                        json.dumps(trial_record, indent=2, default=str),
-                        encoding="utf-8",
-                    )
-
-            summary_row = _extract_summary_row(trial, result, trial_dir)
-            summary_rows.append(summary_row)
-            detailed_results.append(
-                {
-                    "trial": trial_name,
-                    "config": trial,
-                    "result": result,
-                    "summary": summary_row,
-                }
-            )
+                )
+            except Exception as exc:
+                failed_trials.append(trial_name)
+                tb_str = traceback.format_exc()
+                print(f"\n*** Trial {trial_name} FAILED ***\n{tb_str}")
+                # Persist failure info so the user can inspect later
+                (trial_dir / "FAILED.txt").write_text(
+                    f"Trial: {trial_name}\nError: {exc}\n\n{tb_str}",
+                    encoding="utf-8",
+                )
+                # Save partial summaries after each failure
+                _save_summary_files(run_root, summary_rows, detailed_results)
 
     finally:
         ray.shutdown()
@@ -613,6 +627,9 @@ def run_experiments(config_path: Path, output_root: Path) -> None:
 
     print("\n" + "=" * 80)
     print("Experiment run complete")
+    if failed_trials:
+        print(f"FAILED trials ({len(failed_trials)}/{total}): {', '.join(failed_trials)}")
+    print(f"Successful: {total - len(failed_trials)}/{total}")
     print(f"Summary CSV: {run_root / 'summary.csv'}")
     print(f"Summary JSON: {run_root / 'summary.json'}")
     print(f"Detailed JSON: {run_root / 'all_trials_detailed.json'}")

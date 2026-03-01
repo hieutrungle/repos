@@ -548,12 +548,20 @@ def example_parallel_grid_search_2ap_with_reflector(
     start_time = time.time()
 
     def _coerce_percentile_metrics(run_results: dict) -> dict:
-        """Promote percentile score into best_metric fields when present."""
+        """Promote percentile score into best_metric fields when present.
+
+        Safely skips rows where ``percentile_score`` is ``None`` (e.g.
+        when the grid search produced no valid percentile metric for a
+        particular configuration).
+        """
         for row in run_results.get("all_results", []):
             grid_results = row.get("grid_results", {})
-            if "percentile_score" in grid_results:
-                row["best_metric"] = float(grid_results["percentile_score"])
-                row["best_metric_dbm"] = float(grid_results.get("percentile_score_dbm", row["best_metric_dbm"]))
+            pct_score = grid_results.get("percentile_score")
+            if pct_score is not None:
+                row["best_metric"] = float(pct_score)
+                pct_dbm = grid_results.get("percentile_score_dbm")
+                if pct_dbm is not None:
+                    row["best_metric_dbm"] = float(pct_dbm)
 
         if run_results.get("all_results"):
             best_idx = int(np.argmax([r["best_metric"] for r in run_results["all_results"]]))
