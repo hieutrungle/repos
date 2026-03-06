@@ -1,313 +1,390 @@
-# Ray Parallel Optimization
+# Ray Parallel Optimization Guide
 
-**Date**: January 31, 2026  
-**Status**: Implementation Complete
+**Date**: February 27, 2026
+**Status**: Implementation Complete (GD + GS + GA, reflector-aware)
 
-This document provides comprehensive guidance on using Ray for distributed parallel optimization of reflector positions.
+Comprehensive guide to using Ray for distributed parallel optimization of
+access-point (AP) positions and intelligent reflecting surface (IRS)
+reflector placement.
+
+---
 
 ## Table of Contents
 
 1. [Overview](#overview)
-2. [Why Ray?](#why-ray)
-3. [Architecture](#architecture)
-4. [Quick Start](#quick-start)
-5. [Advanced Usage](#advanced-usage)
-6. [Performance Tuning](#performance-tuning)
-7. [Troubleshooting](#troubleshooting)
-8. [API Reference](#api-reference)
+2. [Architecture](#architecture)
+3. [Quick Start](#quick-start)
+4. [Running Experiments](#running-experiments)
+5. [Optimization Methods](#optimization-methods)
+6. [Reflector-Aware Modes](#reflector-aware-modes)
+7. [Performance Tuning](#performance-tuning)
+8. [Troubleshooting](#troubleshooting)
+9. [API Reference](#api-reference)
 
 ---
 
 ## Overview
 
-The `RayParallelOptimizer` enables distributed parallel execution of optimization algorithms, allowing you to explore multiple starting positions simultaneously to find global optima in non-convex optimization landscapes.
+The Ray framework provides distributed parallel execution for three
+optimization methods:
+
+| Method | Class | Pattern | Use Case |
+|--------|-------|---------|----------|
+| **Gradient Descent** | `RayParallelOptimizer` | Multi-start random restarts | Continuous parameter search |
+| **Grid Search** | `RayParallelOptimizer` | One grid point per task | Exhaustive evaluation |
+| **Genetic Algorithm** | `RayActorPoolExecutor` + `GeneticAlgorithmRunner` | DEAP population evaluation | Global search with evolution |
 
 ### Key Features
 
-- **Process-level Isolation**: Each Ray actor has its own Scene instance
-- **True Parallelism**: Multiple "parallel universes" exploring different trajectories
-- **GPU Efficiency**: Configurable GPU fraction per worker (e.g., 0.1 = 10 workers per GPU)
-- **Optimizer Agnostic**: Works with any optimizer inheriting from `BaseAPOptimizer`
-- **Automatic Aggregation**: Winner selection from all parallel trajectories
-
----
-
-## Why Ray?
-
-### The Critical Distinction
-
-Ray is necessary when optimizing **physical scene geometry** (reflector positions, wall placements, obstacle locations) rather than just wave parameters or Tx/Rx coordinates.
-
-#### Vectorized Batching vs Ray Architecture
-
-| Aspect | Vectorized Batching | Ray Architecture |
-|--------|-------------------|------------------|
-| **Use Case** | Changing parameters within single scene | Modifying physical scene geometry |
-| **Examples** | Tx positions, phase shifts, beam angles | Reflector positions, walls, obstacles |
-| **Memory** | Shared scene, vectorized parameters | Independent scene copies per worker |
-| **Parallelism** | GPU vectorization (SIMD) | Process-level parallelism |
-| **Isolation** | None (shared state) | Complete (separate processes) |
-| **Best For** | Parameter sweeps, beamforming | Reflector/obstacle optimization |
-
-### When to Use Ray
-
-✅ **Use Ray When:**
-- Optimizing physical reflector positions
-- Moving walls or obstacles
-- Each optimization needs different scene geometry
-- Exploring multiple local minima in parallel
-- Need process-level isolation
-
-❌ **Don't Use Ray When:**
-- Only changing Tx/Rx positions (use vectorization)
-- Optimizing beamforming coefficients (use vectorization)
-- Single optimization trajectory is sufficient
-- Memory is extremely constrained
+- **ActorPool pattern**: Fixed pool of N workers processes M >> N tasks.
+- **Scene reuse**: Each worker loads the heavy Scene once, reuses it.
+- **GPU efficiency**: Configurable `gpu_fraction` per worker.
+- **Reflector-aware**: All methods support joint AP + reflector optimization.
+- **IoC architecture**: GA logic is fully decoupled from Ray.
+- **Experiment runner**: Config-driven batch execution with hyperparameter sweeps.
 
 ---
 
 ## Architecture
 
-### Three-Phase Workflow
+### Components
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    1. FORK PHASE                                 │
-│                 Spawn Ray Actors                                 │
-├─────────────────────────────────────────────────────────────────┤
-│  Orchestrator                                                    │
-│      │                                                           │
-│      ├──> Worker 0: Scene @ Position P0, Optimizer Init         │
-│      ├──> Worker 1: Scene @ Position P1, Optimizer Init         │
-│      ├──> Worker 2: Scene @ Position P2, Optimizer Init         │
-│      └──> ...                                                    │
-└─────────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────────┐
-│                    2. MAP PHASE                                  │
-│              Parallel Optimization                               │
-├─────────────────────────────────────────────────────────────────┤
-│  Worker 0                Worker 1                Worker N        │
-│  ┌────────────┐         ┌────────────┐         ┌────────────┐  │
-│  │ Scene P0   │         │ Scene P1   │         │ Scene PN   │  │
-│  │ Optimizer  │         │ Optimizer  │         │ Optimizer  │  │
-│  │  Iterate   │         │  Iterate   │         │  Iterate   │  │
-│  └────────────┘         └────────────┘         └────────────┘  │
-│       ↓                      ↓                      ↓           │
-│  Result R0              Result R1              Result RN        │
-└─────────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────────┐
-│                    3. REDUCE PHASE                               │
-│             Aggregation & Winner Selection                       │
-├─────────────────────────────────────────────────────────────────┤
-│  Orchestrator                                                    │
-│      │                                                           │
-│      ├─ Collect all results [R0, R1, ..., RN]                   │
-│      ├─ Find best: best_idx = argmax(metrics)                   │
-│      ├─ Compute statistics: mean, std, range                    │
-│      └─ Return winner + aggregate stats                         │
-└─────────────────────────────────────────────────────────────────┘
+src/reflector_position/optimizers/
+  ray_parallel_optimizer.py   # OptimizationWorker actor + RayParallelOptimizer orchestrator
+  ray_evaluator.py            # RayActorPoolExecutor (generic pool.map for DEAP)
+  deap_logic.py               # GeneticAlgorithmRunner (pure DEAP, no Ray imports)
+  optimizer_factory.py        # OptimizerFactory.create() — used by workers
+
+examples/
+  ray_parallel_example.py     # All optimization functions (GD, GS, GA) for 1ap/2ap/2ap_reflector
+  ray_experiment_runner.py    # Config-driven batch runner with sweep groups
+  ray_experiment_runner_config.example.json    # Full production config (259 trials)
+  ray_experiment_runner_config.smoke_test.json # Minimal config for validation (19 trials)
+  run_ga_modular.py           # Standalone GA entry point (IoC demo)
 ```
 
-### Ray Actor Structure
+### Data Flow
 
-Each `OptimizationWorker` is a Ray actor with:
-
-1. **Isolated Memory**: Own copy of Scene, optimizer, tensors
-2. **GPU Allocation**: Configurable GPU fraction (e.g., 0.1)
-3. **Independent Execution**: No communication with other workers ("Asocial")
-4. **Result Return**: Sends final result back to orchestrator
+```
+                      ray_experiment_runner.py
+                              |
+                  (reads JSON config, expands sweeps)
+                              |
+                    ray_parallel_example.py
+                     /        |         \
+                GD (SPSA)   GS (grid)    GA (DEAP)
+                    |         |            |
+             RayParallel  RayParallel  RayActorPool
+              Optimizer    Optimizer    Executor
+                    \         |         /
+                     OptimizationWorker (Ray Actor)
+                              |
+                    OptimizerFactory.create()
+                              |
+                    Scene + Optimizer + Ray tracing
+```
 
 ---
 
 ## Quick Start
 
-### Installation
-
-Ensure Ray is installed:
+### Prerequisites
 
 ```bash
+source .venv/bin/activate
 pip install ray[default]
+
+# Verify imports
+python -c "import ray; from reflector_position.optimizers.ray_parallel_optimizer import RayParallelOptimizer; print('OK')"
 ```
 
-### Basic Example
+### Minimal Example (Gradient Descent)
 
 ```python
 import ray
-from reflector_position.optimizers import (
+from reflector_position.optimizers.ray_parallel_optimizer import (
     RayParallelOptimizer,
     generate_random_initial_positions,
 )
 
-# Initialize Ray
-ray.init()
+ray.init(ignore_reinit_error=True)
 
-# Configuration
-NUM_WORKERS = 8
-bounds = {"x_min": 0.0, "x_max": 20.0, "y_min": 0.0, "y_max": 20.0}
-
-# Generate diverse starting positions
-initial_positions = generate_random_initial_positions(
-    num_positions=NUM_WORKERS,
-    bounds=bounds,
-    fixed_z=3.8,
-    seed=42,
-)
-
-# Create parallel optimizer
-parallel_opt = RayParallelOptimizer(
-    num_workers=NUM_WORKERS,
-    gpu_fraction=0.25,  # 4 workers per GPU
-    optimizer_method="gradient_descent",
-)
-
-# Scene configuration
 scene_config = {
-    "xml_path": "l_shape_scene.xml",
-    "reflector_name": "reflector",
+    "scene_path": "/path/to/building_floor.xml",
+    "frequency": 5.18e9,
+    "tx_power_dbm": 5.0,
 }
 
-# Optimization parameters
-opt_params = {
-    "num_iterations": 50,
-    "learning_rate": 0.5,
-    "samples_per_tx": 1_000_000,
-    "max_depth": 13,
-}
+bounds = {"x_min": 5.5, "x_max": 34.5, "y_min": 5.5, "y_max": 34.5}
+positions = generate_random_initial_positions(32, bounds, seed=42)
 
-# Run parallel optimization
-results = parallel_opt.optimize(
+parallel_opt = RayParallelOptimizer(num_workers=4, gpu_fraction=0.5)
+
+work_items = [
+    {"initial_position": (pos[0], pos[1]), "position_bounds": bounds}
+    for pos in positions
+]
+
+results = parallel_opt.run(
     scene_config=scene_config,
-    initial_positions=initial_positions,
-    optimization_params=opt_params,
-    verbose=True,
+    optimizer_method="gradient_descent",
+    work_items=work_items,
+    optimization_params={
+        "num_iterations": 30,
+        "learning_rate": 0.5,
+        "samples_per_tx": 1_000_000,
+        "max_depth": 13,
+        "verbose": False,
+    },
 )
 
-# Access best result
 best = results["best_result"]
 print(f"Best position: {best['best_position']}")
-print(f"Best metric: {best['best_metric']:.4f}")
+print(f"Best P5 RSS:   {best['best_metric_dbm']:.2f} dBm")
+print(f"Speedup:       {results['aggregate_stats']['speedup']:.1f}x")
 
-# Plot results
-parallel_opt.plot_results(results)
-
-# Cleanup
 parallel_opt.shutdown()
+ray.shutdown()
+```
+
+### Minimal Example (Genetic Algorithm)
+
+```python
+import ray
+from reflector_position.optimizers.ray_evaluator import RayActorPoolExecutor
+from reflector_position.optimizers.deap_logic import GeneticAlgorithmRunner
+
+ray.init(ignore_reinit_error=True)
+
+scene_config = {
+    "scene_path": "/path/to/building_floor.xml",
+    "frequency": 5.18e9,
+    "tx_power_dbm": 5.0,
+    "tx_positions": [(7.0, 7.0, 3.8), (23.0, 23.0, 3.8)],
+}
+
+executor = RayActorPoolExecutor(
+    scene_config=scene_config,
+    num_workers=2,
+    gpu_fraction=0.5,
+)
+
+ga = GeneticAlgorithmRunner(
+    position_bounds={"x_min": 5.5, "x_max": 34.5, "y_min": 5.5, "y_max": 34.5},
+    fixed_z=3.8,
+    executor_map=executor.map,
+    optimize_orientation=True,
+    num_aps=2,
+    min_ap_separation=5.0,
+)
+
+results = ga.run(
+    optimization_params={"samples_per_tx": 1_000_000, "max_depth": 13, "verbose": False},
+    ga_params={"pop_size": 150, "n_gen": 50, "cxpb": 0.7, "mutpb": 0.3},
+    random_seed=4,
+)
+
+print(f"Best fitness: {results['best_fitness_dbm']:.2f} dBm")
+executor.shutdown()
 ray.shutdown()
 ```
 
 ---
 
-## Advanced Usage
+## Running Experiments
 
-### 1. Parallel Grid Search
+The **experiment runner** is the recommended way to execute hyperparameter
+sweeps. See [RAY_EXPERIMENT_RUNNER.md](../guides/RAY_EXPERIMENT_RUNNER.md)
+for full documentation.
 
-Divide the search space into regions, one per worker:
+### Quick Smoke Test
 
-```python
-# Divide space into 4 quadrants
-quadrant_bounds = [
-    {"x_min": 0.0, "x_max": 10.0, "y_min": 0.0, "y_max": 10.0},   # Q1
-    {"x_min": 10.0, "x_max": 20.0, "y_min": 0.0, "y_max": 10.0},  # Q2
-    {"x_min": 0.0, "x_max": 10.0, "y_min": 10.0, "y_max": 20.0},  # Q3
-    {"x_min": 10.0, "x_max": 20.0, "y_min": 10.0, "y_max": 20.0}, # Q4
-]
+```bash
+# Preview expanded trials (no GPU needed)
+python examples/ray_experiment_runner.py \
+  --config examples/ray_experiment_runner_config.smoke_test.json \
+  --generate-only
 
-worker_configs = [
-    {"search_bounds": bounds, "grid_resolution": 2.0}
-    for bounds in quadrant_bounds
-]
-
-parallel_opt = RayParallelOptimizer(
-    num_workers=4,
-    gpu_fraction=0.25,
-    optimizer_method="grid_search",
-)
-
-# Dummy initial positions (not used for grid search)
-dummy_positions = [np.array([10.0, 10.0, 3.8])] * 4
-
-results = parallel_opt.optimize(
-    scene_config=scene_config,
-    initial_positions=dummy_positions,
-    optimization_params=opt_params,
-    optimizer_configs=worker_configs,  # Different config per worker
-    verbose=True,
-)
+# Run all 19 smoke-test trials
+python examples/ray_experiment_runner.py \
+  --config examples/ray_experiment_runner_config.smoke_test.json \
+  --output-root results_smoke_test/experiments
 ```
 
-### 2. Hyperparameter Tuning
+### Full Production Run
 
-Test different hyperparameters in parallel:
+```bash
+# 259 trials across GD, GS, GA with AP-only and reflector modes
+python examples/ray_experiment_runner.py \
+  --config examples/ray_experiment_runner_config.example.json \
+  --output-root results/experiments
+```
 
-```python
-learning_rates = [0.1, 0.3, 0.5, 0.7, 1.0, 1.5]
-NUM_WORKERS = len(learning_rates)
+### Config Structure
 
-base_position = np.array([10.0, 10.0, 3.8])
-initial_positions = [base_position.copy() for _ in range(NUM_WORKERS)]
-
-# Run separate optimization for each learning rate
-for i, lr in enumerate(learning_rates):
-    opt_params = {
-        "num_iterations": 30,
-        "learning_rate": lr,
-        "samples_per_tx": 500_000,
+```jsonc
+{
+  "shared": {
+    "num_pool_workers": 2,
+    "gpu_fraction": 0.5,
+    "random_seed": 4,
+    "gd_num_tasks": 100,
+    "gd_num_iterations": 50,
+    "ga_min_ap_separation": 7.0,
+    "reflector_wall_top_left": [15.0, 34.0, 3.0],
+    "reflector_wall_bottom_right": [34.0, 34.0, 1.0],
+    "reflector_size": [2.0, 2.0]
+  },
+  "trials": [
+    {
+      "name": "gd_2ap_baseline",
+      "method": "gd",
+      "mode": "2ap",
+      "gd_optimization_overrides": { "learning_rate": 0.5 }
     }
-    
-    single_opt = RayParallelOptimizer(num_workers=1, gpu_fraction=0.5)
-    result = single_opt.optimize(
-        scene_config=scene_config,
-        initial_positions=[initial_positions[i]],
-        optimization_params=opt_params,
-    )
-    
-    print(f"LR {lr}: Metric = {result['best_result']['best_metric']:.4f}")
-    single_opt.shutdown()
+  ],
+  "sweep_groups": [
+    {
+      "name_prefix": "gd_lr_sweep",
+      "method": "gd",
+      "mode": "2ap_reflector",
+      "random_seed": [51, 52, 53],
+      "grid": {
+        "gd_optimization_overrides.learning_rate": [0.3, 0.5, 0.7],
+        "gd_optimization_overrides.temperature": [0.1, 0.15, 0.2]
+      }
+    }
+  ]
+}
 ```
 
-**Note**: For more sophisticated hyperparameter tuning, consider using [Ray Tune](https://docs.ray.io/en/latest/tune/index.html).
+Sweep groups generate a Cartesian product: 3 LR × 3 temp × 3 seeds = **27 trials**.
 
-### 3. Multi-Stage Optimization
+### Config Files
 
-Coarse search followed by fine refinement:
+| Config | Trials | Purpose |
+|--------|--------|---------|
+| `ray_experiment_runner_config.example.json` | 259 | Full production sweep across GD, GS, GA |
+| `ray_experiment_runner_config.smoke_test.json` | 19 | Fast validation (~5-15 min) |
 
-```python
-# Stage 1: Coarse parallel search
-coarse_positions = generate_random_initial_positions(
-    num_positions=32,
-    bounds={"x_min": 0, "x_max": 20, "y_min": 0, "y_max": 20},
-    seed=42,
-)
+### Output Structure
 
-coarse_opt = RayParallelOptimizer(num_workers=32, gpu_fraction=0.1)
-coarse_results = coarse_opt.optimize(
-    scene_config=scene_config,
-    initial_positions=coarse_positions,
-    optimization_params={"num_iterations": 20, "learning_rate": 1.0},
-)
-coarse_opt.shutdown()
-
-# Stage 2: Fine search around top 8 positions
-top_positions = sorted(
-    coarse_results["all_results"],
-    key=lambda x: x["best_metric"],
-    reverse=True,
-)[:8]
-
-fine_positions = [r["best_position"] for r in top_positions]
-
-fine_opt = RayParallelOptimizer(num_workers=8, gpu_fraction=0.25)
-fine_results = fine_opt.optimize(
-    scene_config=scene_config,
-    initial_positions=fine_positions,
-    optimization_params={"num_iterations": 50, "learning_rate": 0.1},
-)
-fine_opt.shutdown()
-
-print(f"Final best: {fine_results['best_result']['best_position']}")
 ```
+results/experiments/ray_experiments_20260227_143052/
+  used_config.json              # Copy of input config
+  summary.csv                   # One row per trial
+  summary.json                  # Same data as JSON
+  all_trials_detailed.json      # Full results per trial
+  gd_2ap_baseline/              # Per-trial directory
+    output.txt                  # Captured stdout/stderr
+    trial_record.json           # Config + result
+    gd_2ap_results.json         # Method-specific output
+```
+
+---
+
+## Optimization Methods
+
+### Gradient Descent (SPSA)
+
+- Multi-start: M random initial positions processed by N workers.
+- Each task runs independent gradient descent with SPSA (Simultaneous
+  Perturbation Stochastic Approximation).
+- Supports AP position, orientation, and repulsion loss for multi-AP.
+
+**Key parameters:**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `gd_num_tasks` | 100 | Number of random-restart trajectories |
+| `gd_num_iterations` | 50 | Steps per trajectory |
+| `gd_samples_per_tx` | 1,000,000 | Ray-tracing samples per step |
+| `gd_repulsion_weight` | 0.3 | Multi-AP repulsion loss weight |
+| `learning_rate` | 0.5 | SPSA step size (in `gd_optimization_overrides`) |
+| `temperature` | 0.15 | Soft-min temperature |
+| `gd_fairness_loss_type` | `"auto"` | `auto`, `softmin`, `masked_softmin`, `percentile` |
+
+### Grid Search (Alternating)
+
+- 1-AP: exhaustive grid over (x, y) positions.
+- 2-AP: alternating optimisation — sweep AP1 with AP2 fixed, then swap.
+- 2-AP + Reflector: outer loop over reflector (u, v, focal-target),
+  inner loop alternates APs.
+
+**Key parameters:**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `gs_grid_resolution` | 1.0 | Grid spacing in metres |
+| `gs_num_rounds` | 3 | Alternating sweeps per outer round |
+| `gs_outer_rounds` | 3 | AP-sweep / reflector-sweep outer loops |
+| `gs_u_steps` / `gs_v_steps` | 3 | Reflector wall-surface grid divisions |
+| `gs_target_resolution` | 10.0 | Focal-target grid spacing (metres) |
+| `gs_min_ap_separation` | 10.0 | Min distance between APs |
+
+### Genetic Algorithm (DEAP)
+
+- Population-based evolutionary search via the DEAP library.
+- Chromosome encodes AP positions, orientations, and (optionally) reflector params.
+- Fitness = P5 RSS (5th-percentile) in linear Watts (maximised).
+- Each generation's population is evaluated in parallel via `RayActorPoolExecutor`.
+
+**Key parameters:**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `pop_size` | 150 | Population size |
+| `n_gen` | 50 | Number of generations |
+| `cxpb` | 0.7 | Crossover probability |
+| `mutpb` | 0.3 | Mutation probability |
+| `tournsize` | 10 | Tournament selection size |
+| `mut_sigma_pos` | 2.0 | Position gene mutation sigma (metres) |
+| `mut_sigma_dir` | 0.3 | Direction gene mutation sigma (radians) |
+| `ga_min_ap_separation` | 5.0 | Min AP-AP distance (penalty-based) |
+
+---
+
+## Reflector-Aware Modes
+
+### Mode Summary
+
+| Mode | APs | Reflector | GA Chromosome | Description |
+|------|-----|-----------|---------------|-------------|
+| `1ap` | 1 | No | 4 genes: `[x, y, dx, dy]` | Single AP placement |
+| `2ap` | 2 | No | 8 genes: `[x1,y1,x2,y2, d1x,d1y, d2x,d2y]` | Dual AP placement |
+| `2ap_reflector` | 2 | Yes | 12 genes: `[..8 AP.., u, v, fx, fy]` | Dual AP + IRS reflector |
+
+### Reflector Parameterisation
+
+The reflector is parameterised by its position on a wall surface and a
+focal point:
+
+- **u** in [0, 1]: lateral wall-surface coordinate
+- **v** in [0, 1]: vertical wall-surface coordinate
+- **focal_point** (x, y, z): the point the reflector aims at
+  (z fixed at `reflector_focal_z`, typically 1.5 m)
+
+### Reflector Geometry Config
+
+These keys are used in the experiment runner config and apply to all
+methods in `2ap_reflector` mode:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `reflector_wall_top_left` | `[x,y,z]` | `[15.0, 34.0, 3.0]` | Top-left corner of reflector wall |
+| `reflector_wall_bottom_right` | `[x,y,z]` | `[34.0, 34.0, 1.0]` | Bottom-right corner |
+| `reflector_size` | `[w, h]` | `[2.0, 2.0]` | Panel size in metres |
+| `reflector_focal_z` | `float` | `1.5` | Focal point z-height |
+| `reflector_target_quantile` | `float` | `0.05` | P5 RSS objective quantile |
+
+### How Each Method Optimises the Reflector
+
+| Method | Approach |
+|--------|----------|
+| **GD** | Reflector u, v, and focal point are differentiable parameters updated by SPSA alongside AP positions. |
+| **GS** | Outer loop grids over (u, v) × focal-target positions; inner loop alternates AP placement. |
+| **GA** | 4 extra genes appended to chromosome; evolved jointly with AP genes via crossover and mutation. |
 
 ---
 
@@ -315,138 +392,75 @@ print(f"Final best: {fine_results['best_result']['best_position']}")
 
 ### GPU Fraction Selection
 
-Choose `gpu_fraction` based on your GPU memory:
+| GPU Memory | Workers per GPU | `gpu_fraction` | Scene |
+|------------|----------------|----------------|-------|
+| 12 GB | 2 | 0.5 | Complex |
+| 12 GB | 4 | 0.25 | Simple |
+| 24 GB | 4 | 0.25 | Complex |
+| 24 GB | 8 | 0.125 | Simple |
 
-| GPU Memory | Workers per GPU | gpu_fraction | Scene Complexity |
-|------------|----------------|--------------|------------------|
-| 12GB | 4 | 0.25 | Simple |
-| 12GB | 8 | 0.125 | Simple |
-| 24GB | 8 | 0.125 | Complex |
-| 24GB | 16 | 0.0625 | Simple |
-| 48GB | 16 | 0.0625 | Complex |
-
-**Rule of Thumb**: Start with `gpu_fraction=0.25` (4 workers/GPU) and increase workers until you hit OOM errors.
+**Rule**: Start with `gpu_fraction=0.5` (2 workers/GPU) and increase workers
+until OOM.
 
 ### Worker Count Guidelines
 
-**Optimal Number of Workers**:
-- **Exploration**: 16-32 workers for diverse initial positions
-- **Refinement**: 4-8 workers for local search
-- **Hyperparameter**: N workers for N hyperparameter combinations
-- **Grid Search**: 4-16 workers for spatial subdivision
-
-**Diminishing Returns**: Beyond 32-64 workers, the orchestration overhead may outweigh parallelism benefits.
-
-### Memory Optimization
-
-**Reduce Memory Usage**:
-1. Lower `samples_per_tx` (500K instead of 1M)
-2. Simplify scene meshes
-3. Use lower `max_depth` (10 instead of 13)
-4. Reduce number of concurrent workers
-
-**Monitor Memory**:
-```python
-import GPUtil
-
-# Before optimization
-GPUtil.showUtilization()
-
-# Run optimization
-results = parallel_opt.optimize(...)
-
-# After optimization
-GPUtil.showUtilization()
-```
+- **Exploration** (GD multi-start): 32-64 tasks, 2-4 workers.
+- **Grid Search**: task count = grid points; 2-4 workers.
+- **GA**: workers evaluate the population each generation; 2-4 workers.
+- Diminishing returns beyond 8 workers per GPU due to memory contention.
 
 ### Speedup Analysis
 
-Expected speedup with N workers:
-
 ```
-Speedup = (Total Worker Time) / (Wall-clock Time)
+Speedup = Total Sequential Time / Wall-Clock Time
 ```
 
-**Ideal**: Speedup ≈ N (linear scaling)  
-**Typical**: Speedup ≈ 0.8 * N (80% efficiency due to overhead)  
-**Poor**: Speedup << N (bottleneck in orchestration or I/O)
+Typically 0.8 × N efficiency (80% of ideal linear scaling).
+Check `results["aggregate_stats"]["speedup"]` from `RayParallelOptimizer.run()`.
 
-The `aggregate_stats["speedup"]` in results provides this metric.
+### Memory Optimization
+
+- Lower `samples_per_tx` (100K for smoke tests, 1M for production).
+- Reduce `max_depth` (10 instead of 13).
+- Simplify scene geometry.
+- Monitor with `nvidia-smi` during runs.
 
 ---
 
 ## Troubleshooting
 
-### Common Issues
+### Out of Memory (OOM)
 
-#### 1. Out of Memory (OOM)
+**Symptom**: `RuntimeError: CUDA out of memory`
 
-**Symptoms**: `RuntimeError: CUDA out of memory`
+**Fix**: Decrease `num_pool_workers`, lower `gpu_fraction`, or reduce
+`samples_per_tx` / `max_depth`.
 
-**Solutions**:
-- Reduce `gpu_fraction` (more workers per GPU)
-- Decrease `num_workers`
-- Lower `samples_per_tx` or `max_depth`
-- Simplify scene geometry
+### Ray Actor Startup Timeout
 
-#### 2. Ray Actor Startup Timeout
+**Symptom**: Worker group startup timed out.
 
-**Symptoms**: `The worker group startup timed out after 30.0 seconds`
+**Fix**: Reduce `num_pool_workers` to match available resources. Set
+`RAY_TRAIN_WORKER_GROUP_START_TIMEOUT_S` if needed.
 
-**Causes**:
-- Insufficient cluster resources
-- Ray autoscaler still provisioning nodes
+### Slow Convergence
 
-**Solutions**:
-- Set `RAY_TRAIN_WORKER_GROUP_START_TIMEOUT_S` environment variable
-- Reduce `num_workers` to match available resources
-- Wait for autoscaler to provision nodes (expected in first run)
+**Symptom**: All trajectories converging to poor local minima.
 
-#### 3. Slow Convergence
+**Fix**: Increase `gd_num_tasks` for more diverse starts. Use the GA for
+global search, then refine with GD.
 
-**Symptoms**: All workers converging to similar (poor) local minima
+### Import Errors in Workers
 
-**Causes**:
-- Insufficient diversity in initial positions
-- Learning rate too high (overshooting) or too low (stuck)
+**Symptom**: `ModuleNotFoundError` in Ray actors.
 
-**Solutions**:
-- Increase variance in `generate_random_initial_positions` seed
-- Test different learning rates (hyperparameter search)
-- Use multi-stage optimization (coarse → fine)
+**Fix**: Install the package in editable mode (`pip install -e .`) or use
+`ray.init(runtime_env={"pip": [...]})`.
 
-#### 4. Import Errors in Workers
+### Ray Dashboard
 
-**Symptoms**: `ModuleNotFoundError` in Ray actors
-
-**Causes**:
-- Package not installed in worker environment
-- Import path issues
-
-**Solutions**:
-- Ensure all dependencies in `requirements.txt`
-- Use `ray.init(runtime_env={"pip": ["package1", "package2"]})`
-- Install package in editable mode: `pip install -e .`
-
-### Debugging Tips
-
-**Enable Ray Logging**:
-```python
-import ray
-ray.init(logging_level="DEBUG")
-```
-
-**Check Ray Dashboard**:
-```bash
-# Ray dashboard URL printed during ray.init()
-# Navigate to: http://127.0.0.1:8265
-```
-
-**Test Single Worker First**:
-```python
-# Before running 32 workers, test with 1
-parallel_opt = RayParallelOptimizer(num_workers=1, gpu_fraction=1.0)
-```
+Access the Ray Dashboard at `http://127.0.0.1:8265` (shown during
+`ray.init()`) to monitor actor utilisation and resource allocation.
 
 ---
 
@@ -454,237 +468,144 @@ parallel_opt = RayParallelOptimizer(num_workers=1, gpu_fraction=1.0)
 
 ### `RayParallelOptimizer`
 
-Main orchestrator class for distributed parallel optimization.
-
-#### Constructor
+Orchestrator for GD and GS parallel optimization.
 
 ```python
-RayParallelOptimizer(
-    num_workers: int = 32,
-    gpu_fraction: float = 0.1,
-    optimizer_method: str = "gradient_descent"
-)
+class RayParallelOptimizer:
+    def __init__(self, num_workers=4, gpu_fraction=0.25):
+        """
+        Args:
+            num_workers: Pool size (persistent actors).
+            gpu_fraction: GPU fraction per worker (0.5 = 2 workers/GPU).
+        """
+
+    def run(self, scene_config, optimizer_method, work_items, optimization_params, verbose=True):
+        """
+        Run M work items across N workers (Pool -> Map -> Reduce).
+
+        Args:
+            scene_config: Dict with 'scene_path' and optional params.
+            optimizer_method: 'gradient_descent' or 'grid_search' or 'grid_search_point'.
+            work_items: List of optimizer kwargs dicts (one per task).
+            optimization_params: Dict of params for optimizer.optimize().
+
+        Returns:
+            Dict with 'all_results', 'best_result', 'best_task_id',
+            'total_time', 'aggregate_stats', 'pool_info'.
+        """
+
+    def shutdown(self):
+        """Kill all actors and release GPU memory."""
 ```
 
-**Parameters**:
-- `num_workers`: Number of parallel Ray actors
-- `gpu_fraction`: GPU fraction per worker (0.1 = 10 workers per GPU)
-- `optimizer_method`: Base optimizer to parallelize (`"gradient_descent"`, `"grid_search"`)
+### `RayActorPoolExecutor`
 
-#### `optimize()`
-
-Run parallel optimization across all workers.
+Generic execution engine for DEAP GA integration.
 
 ```python
-optimize(
-    scene_config: Dict[str, Any],
-    initial_positions: List[np.ndarray],
-    optimization_params: Dict[str, Any],
-    optimizer_configs: Optional[List[Dict[str, Any]]] = None,
-    verbose: bool = True
-) -> Dict[str, Any]
+class RayActorPoolExecutor:
+    def __init__(self, scene_config, num_workers=4, gpu_fraction=0.25, verbose=True):
+        """
+        Spawn persistent OptimizationWorker actors.
+
+        Args:
+            scene_config: Dict with 'scene_path' (required).
+            num_workers: Pool size.
+            gpu_fraction: GPU fraction per worker.
+        """
+
+    def map(self, func, iterable):
+        """
+        Map func over items using pool.map (ordered, synchronous).
+
+        Compatible with DEAP's toolbox.register("map", executor.map).
+
+        Args:
+            func: Converts item -> (task_id, method, kwargs, params) tuple.
+            iterable: Items to process (e.g. DEAP individuals).
+
+        Returns:
+            Ordered list of result dicts (result[i] <-> iterable[i]).
+        """
+
+    def shutdown(self):
+        """Kill all worker actors."""
 ```
 
-**Parameters**:
-- `scene_config`: Scene configuration (XML path, reflector name)
-- `initial_positions`: List of starting positions [x, y, z] (length = num_workers)
-- `optimization_params`: Parameters for `optimizer.optimize()` call
-- `optimizer_configs`: Optional per-worker optimizer configs
-- `verbose`: Print progress information
+### `GeneticAlgorithmRunner`
 
-**Returns**: Dictionary with:
-- `all_results`: List of results from all workers
-- `best_result`: Result from best worker
-- `best_worker_id`: ID of best worker
-- `total_time`: Wall-clock time
-- `aggregate_stats`: Statistics (mean, std, speedup)
-
-#### `plot_results()`
-
-Visualize parallel optimization results.
+Pure DEAP evolutionary algorithm (no Ray imports).
 
 ```python
-plot_results(
-    results: Dict[str, Any],
-    metric_name: str = "Min RSS (dBm)"
-) -> None
+class GeneticAlgorithmRunner:
+    def __init__(self, position_bounds, fixed_z, executor_map,
+                 optimize_orientation=True, num_aps=1,
+                 min_ap_separation=2.0, reflector_enabled=False, ...):
+        """
+        Args:
+            position_bounds: Dict with x_min, x_max, y_min, y_max.
+            fixed_z: AP height.
+            executor_map: Callable for parallel evaluation (injected).
+            num_aps: 1 or 2.
+            reflector_enabled: Whether to add 4 reflector genes.
+        """
+
+    def run(self, optimization_params, ga_params, random_seed=42):
+        """
+        Run evolutionary optimization.
+
+        Args:
+            optimization_params: Ray-tracing params (samples_per_tx, max_depth).
+            ga_params: DEAP params (pop_size, n_gen, cxpb, mutpb, ...).
+            random_seed: Seed for reproducibility.
+
+        Returns:
+            Dict with 'best_individual', 'best_fitness_dbm',
+            'hall_of_fame', 'logbook', 'total_time', ...
+        """
 ```
 
-**Parameters**:
-- `results`: Results dictionary from `optimize()`
-- `metric_name`: Label for metric in plots
-
-**Plots**:
-1. Distribution of final metrics
-2. Final positions scatter (colored by metric)
-3. Execution time per worker
-4. Summary statistics
-
-#### `shutdown()`
-
-Shutdown Ray cluster.
-
-```python
-shutdown() -> None
-```
-
----
-
-### `OptimizationWorker`
-
-Ray actor that runs independent optimization trajectory.
-
-**Note**: Typically not used directly; created internally by `RayParallelOptimizer`.
-
-#### Constructor
+### `OptimizationWorker` (Ray Actor)
 
 ```python
 @ray.remote
-OptimizationWorker(
-    worker_id: int,
-    scene_config: Dict[str, Any],
-    optimizer_method: str,
-    optimizer_config: Dict[str, Any],
-    optimization_params: Dict[str, Any],
-    gpu_fraction: float = 0.1
-)
+class OptimizationWorker:
+    def __init__(self, worker_id, scene_config):
+        """Load Scene once. Optionally load ReflectorController."""
+
+    def optimize(self, task_id, optimizer_method, optimizer_kwargs, optimization_params):
+        """
+        Create a fresh optimizer and run one task.
+
+        Returns:
+            Dict with task_id, worker_id, best_position, best_metric_dbm,
+            best_direction, reflector_u, reflector_v, time_elapsed, history, ...
+        """
 ```
-
-#### `optimize()`
-
-Run optimization and return results.
-
-```python
-optimize() -> Dict[str, Any]
-```
-
-**Returns**: Dictionary with:
-- `worker_id`: Worker identifier
-- `best_position`: Optimized position [x, y, z]
-- `best_metric`: Best metric achieved
-- `time_elapsed`: Optimization time
-- `history`: Optimization history (if available)
-
----
 
 ### Helper Functions
 
-#### `generate_random_initial_positions()`
-
-Generate diverse initial positions for parallel optimization.
-
 ```python
-generate_random_initial_positions(
-    num_positions: int,
-    bounds: Dict[str, float],
-    fixed_z: float = 3.8,
-    seed: Optional[int] = None
-) -> List[np.ndarray]
-```
+def generate_random_initial_positions(num_positions, bounds, fixed_z=3.8, seed=None):
+    """Generate random positions within bounds."""
 
-**Parameters**:
-- `num_positions`: Number of positions to generate
-- `bounds`: Dictionary with `x_min`, `x_max`, `y_min`, `y_max`
-- `fixed_z`: Fixed z-coordinate (height)
-- `seed`: Random seed for reproducibility
+def generate_grid_positions(bounds, grid_resolution, fixed_z=3.8):
+    """Generate grid positions for exhaustive search."""
 
-**Returns**: List of position arrays [x, y, z]
+def generate_alternating_grid_tasks(bounds, grid_resolution, fixed_ap_positions, ...):
+    """Generate work items for alternating 2-AP grid search."""
 
-**Example**:
-```python
-positions = generate_random_initial_positions(
-    num_positions=32,
-    bounds={"x_min": 0, "x_max": 20, "y_min": 0, "y_max": 20},
-    fixed_z=3.8,
-    seed=42,
-)
+def generate_reflector_grid_tasks(wall_top_left, wall_bottom_right, u_steps, v_steps, ...):
+    """Generate work items for reflector grid search."""
 ```
 
 ---
 
-## Production Deployment
+## See Also
 
-### Batch Job Execution
-
-For production workloads, use Ray Jobs:
-
-```python
-# Save configuration and run as job
-import json
-
-config = {
-    "num_workers": 32,
-    "scene_config": {"xml_path": "scene.xml"},
-    "bounds": {"x_min": 0, "x_max": 20, "y_min": 0, "y_max": 20},
-    "optimization_params": {...},
-}
-
-with open("ray_job_config.json", "w") as f:
-    json.dump(config, f)
-
-# Submit job
-# ray job submit --working-dir . -- python ray_optimization_job.py
-```
-
-### Resource Configuration
-
-Specify compute requirements in cluster config:
-
-```yaml
-# cluster_config.yaml
-cluster_name: reflector-opt
-
-max_workers: 8
-
-available_node_types:
-  ray.worker.gpu:
-    node_config:
-      InstanceType: g5.4xlarge  # 1x A10G GPU
-    min_workers: 0
-    max_workers: 8
-    resources: {"GPU": 1}
-```
-
-Launch cluster:
-```bash
-ray up cluster_config.yaml
-ray attach cluster_config.yaml
-```
-
-### Checkpointing
-
-Save intermediate results for fault tolerance:
-
-```python
-import os
-
-def optimize_with_checkpoints(parallel_opt, checkpoint_dir="checkpoints"):
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    
-    results = parallel_opt.optimize(...)
-    
-    # Save checkpoint
-    checkpoint_path = os.path.join(checkpoint_dir, "latest.pkl")
-    import pickle
-    with open(checkpoint_path, "wb") as f:
-        pickle.dump(results, f)
-    
-    return results
-```
-
----
-
-## Summary
-
-The `RayParallelOptimizer` provides a production-ready solution for distributed parallel optimization of reflector positions. Key takeaways:
-
-1. **Use Ray for scene geometry optimization** (reflectors, walls, obstacles)
-2. **Start with 8-16 workers** and scale up based on memory
-3. **Set `gpu_fraction=0.25`** as a baseline (4 workers per GPU)
-4. **Generate diverse initial positions** to avoid local minima
-5. **Monitor speedup** to ensure efficient parallelism
-
-For questions or issues, refer to:
-- [Ray Documentation](https://docs.ray.io)
-- [Examples](../examples/ray_parallel_example.py)
-- [RAY_ARCHITECTURE.md](RAY_ARCHITECTURE.md)
+- [RAY_ARCHITECTURE.md](RAY_ARCHITECTURE.md) — Why Ray instead of vectorisation.
+- [RAY_IMPLEMENTATION_SUMMARY.md](RAY_IMPLEMENTATION_SUMMARY.md) — File structure
+  and implementation status.
+- [RAY_EXPERIMENT_RUNNER.md](../guides/RAY_EXPERIMENT_RUNNER.md) — Config-driven
+  runner: config schema, all trial parameters, sweep groups, and recipes.
+- [GA_DEAP_IMPLEMENTATION.md](GA_DEAP_IMPLEMENTATION.md) — DEAP GA internals.

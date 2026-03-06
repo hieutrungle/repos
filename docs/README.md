@@ -10,6 +10,7 @@ User-focused guides for installation, usage, and quick reference:
 - **[INSTALL.md](guides/INSTALL.md)** - Installation instructions and dependency setup
 - **[USAGE.md](guides/USAGE.md)** - Detailed usage guide with examples
 - **[QUICKREF.md](guides/QUICKREF.md)** - Quick reference for common tasks
+- **[RAY_EXPERIMENT_RUNNER.md](guides/RAY_EXPERIMENT_RUNNER.md)** - Comprehensive guide: config schema, all trial parameters (GD/GS/GA), reflector geometry, sweep groups, output format, and workflow recipes
 
 ### 🏗️ Architecture (Project Structure)
 Technical documentation about the codebase:
@@ -23,9 +24,9 @@ Technical documentation about the codebase:
 In-depth explanations of optimization approaches and research methodology:
 
 - **[OPTIMIZATION_WORKFLOW.md](methodology/OPTIMIZATION_WORKFLOW.md)** - Ray-based distributed optimization architecture for physical object placement
-- **[RAY_ARCHITECTURE.md](methodology/RAY_ARCHITECTURE.md)** - Why Ray is needed for reflector optimization (vs vectorization)
-- **[RAY_PARALLEL_GUIDE.md](methodology/RAY_PARALLEL_GUIDE.md)** - Complete guide to using Ray for parallel optimization with examples
-- **[RAY_IMPLEMENTATION_SUMMARY.md](methodology/RAY_IMPLEMENTATION_SUMMARY.md)** - Implementation summary and usage patterns
+- **[RAY_ARCHITECTURE.md](methodology/RAY_ARCHITECTURE.md)** - Why Ray is needed for reflector optimization (vs vectorisation); ActorPool pattern, IoC architecture, and resource management
+- **[RAY_PARALLEL_GUIDE.md](methodology/RAY_PARALLEL_GUIDE.md)** - Complete guide to Ray parallel optimization: GD, GS, GA methods; reflector-aware modes; API reference; performance tuning; experiment runner usage
+- **[RAY_IMPLEMENTATION_SUMMARY.md](methodology/RAY_IMPLEMENTATION_SUMMARY.md)** - Implementation summary: core infrastructure, all optimization functions, experiment runner, config files, and file structure
 - **[GA_DEAP_IMPLEMENTATION.md](methodology/GA_DEAP_IMPLEMENTATION.md)** - Genetic Algorithm (DEAP) with Ray-parallel fitness evaluation and IoC architecture
 - **[BASELINES.md](methodology/BASELINES.md)** - Baseline comparison methods (GA, PSO, AO) for benchmarking
 - **[FUTURE_ROADMAP.md](methodology/FUTURE_ROADMAP.md)** - Planned features and research extensions
@@ -48,6 +49,7 @@ Comprehensive testing documentation and guides:
 - **Install the package** → [guides/INSTALL.md](guides/INSTALL.md)
 - **Run an optimization** → [guides/USAGE.md](guides/USAGE.md)
 - **Use parallel optimization (Ray)** → [methodology/RAY_PARALLEL_GUIDE.md](methodology/RAY_PARALLEL_GUIDE.md)
+- **Run unified Ray hyperparameter tuning** → [guides/RAY_EXPERIMENT_RUNNER.md](guides/RAY_EXPERIMENT_RUNNER.md)
 - **Run genetic algorithm (DEAP)** → [methodology/GA_DEAP_IMPLEMENTATION.md](methodology/GA_DEAP_IMPLEMENTATION.md)
 - **Test the code** → [tests/README.md](tests/README.md)
 - **Understand the code structure** → [architecture/PROJECT_STRUCTURE.md](architecture/PROJECT_STRUCTURE.md)
@@ -103,7 +105,10 @@ See [STATUS.md](../STATUS.md) in the repository root for:
 See the [examples/](../examples/) directory for:
 - `quick_test.py` - Fast gradient descent test
 - `full_comparison.py` - Compare grid search vs gradient descent
-- `ray_parallel_example.py` - Ray-parallel gradient descent (64 tasks) and grid search (441 points) via ActorPool
+- `ray_parallel_example.py` - All optimization functions (GD, GS, GA) for 1ap/2ap/2ap_reflector modes via ActorPool
+- `ray_experiment_runner.py` - Config-driven batch runner for GD/GS/GA hyperparameter sweeps with reflector support
+- `ray_experiment_runner_config.example.json` - Full production config (259 trials across GD, GS, GA + reflector)
+- `ray_experiment_runner_config.smoke_test.json` - Minimal smoke-test config (19 trials, ~5-15 min)
 - `run_ga_modular.py` - **Modular GA** — DEAP genetic algorithm with Ray-parallel fitness evaluation (IoC pattern)
 - `config_example.py` - Configuration template
 

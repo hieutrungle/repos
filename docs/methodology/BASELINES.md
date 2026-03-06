@@ -1,198 +1,225 @@
 # Baseline Comparison Methods
 
+**Last Updated**: February 27, 2026
+**Status**: Grid Search ✅ | Genetic Algorithm ✅ | PSO 📋 | AO 📋
+
 ## Overview
 
-To validate the effectiveness of Differentiable Ray Tracing (DRT) for AP and reflector positioning, we compare against established optimization baselines. This document outlines recommended baseline methods for Tier-1 publication venues.
+To validate the effectiveness of Differentiable Ray Tracing (DRT) for AP and reflector positioning, we compare against established optimization baselines. This document outlines all implemented and planned baselines.
 
 ## Why Multiple Baselines Matter
 
-Grid Search alone is insufficient as a baseline because it is widely considered "naive" and scales poorly (O(n^d) complexity). For venues like *IEEE Transactions on Wireless Communications*, you need baselines that represent the "state of the art" for non-convex optimization.
-
-## Recommended Baselines
-
-### 1. Genetic Algorithm (GA) - **Gold Standard Baseline** ✅ IMPLEMENTED
-
-**Priority**: **COMPLETE** — Implemented using DEAP library with Ray-parallel fitness evaluation.
-
-**Full Implementation Details**: See [GA_DEAP_IMPLEMENTATION.md](GA_DEAP_IMPLEMENTATION.md)
-
-#### Why Use GA?
-- **Industry Standard**: In 2024-2025 literature, GA is the default "heuristic" benchmark for placement problems (RIS, UAV, Base Station)
-- **Handles Mixed Variables**: Works well with discrete and continuous variables without needing gradients
-- **Established Credibility**: If you beat GA, you beat the industry standard for heuristic optimization
-
-#### Implementation Details
-- **Population Size**: 50 individuals (random sets of AP + RIS coordinates)
-- **Generations**: 50-100
-- **Fitness Function**: Same `coverage_loss` used for DRT method
-- **Selection**: Tournament or roulette wheel
-- **Crossover**: Uniform or single-point for coordinates
-- **Mutation**: Gaussian noise with adaptive rate
-
-#### Expected Performance
-- **Strengths**: Eventually finds good solutions, robust to local minima
-- **Weaknesses**: Requires thousands of forward-pass simulations (Population × Generations)
-
-#### Key Argument
-> "While GA eventually finds good solutions, it requires thousands of forward-pass simulations (Population × Generations). Our DRT method converges in ~100 steps with gradient guidance."
-
-#### Python Implementation ✅
-Using `DEAP` framework (implemented in `src/reflector_position/optimizers/deap_logic.py`):
-```python
-from reflector_position.optimizers import RayActorPoolExecutor, GeneticAlgorithmRunner
-import ray
-
-ray.init()
-executor = RayActorPoolExecutor(scene_config={...}, num_workers=4, gpu_fraction=0.25)
-
-ga = GeneticAlgorithmRunner(
-    position_bounds={"x_min": 5, "x_max": 25, "y_min": 5, "y_max": 25},
-    fixed_z=3.8,
-    executor_map=executor.map,  # Dependency Injection
-)
-
-results = ga.run(
-    optimization_params={"samples_per_tx": 1_000_000, "max_depth": 13},
-    ga_params={"pop_size": 50, "n_gen": 20},
-    seed=42,
-)
-
-print(f"Best: {results['best_position']}  RSS: {results['best_fitness_dbm']:.2f} dBm")
-executor.shutdown()
-ray.shutdown()
-```
+Grid Search alone is insufficient for Tier-1 venue publications (e.g. *IEEE TWC*). You need baselines that represent the state of the art for non-convex wireless placement optimisation. Currently two are complete (GS, GA), and two are planned (PSO, AO).
 
 ---
 
-### 2. Particle Swarm Optimization (PSO) - **Faster Heuristic**
+## Implemented Baselines
 
-**Priority**: **RECOMMENDED** - Stronger baseline for continuous position optimization.
+### 1. Grid Search (GS) — Exhaustive Baseline ✅
 
-#### Why Use PSO?
-- **Fast Convergence**: Often faster than GA for continuous coordinate problems
-- **Conceptual Similarity**: Models "particles" flying through solution space (similar to batching but without physics-aware gradients)
-- **Strong Continuous Optimizer**: Better suited for position optimization than GA
+**Implementation**: `src/reflector_position/optimizers/grid_search.py`
 
-#### Implementation Details
-- **Particles**: 30-50
-- **Iterations**: 50-100
-- **Inertia Weight**: 0.7-0.9 (controls exploration vs exploitation)
-- **Cognitive Coefficient**: 1.5-2.0 (personal best attraction)
-- **Social Coefficient**: 1.5-2.0 (global best attraction)
+#### Modes
 
-#### Expected Performance
-- **Strengths**: Fast convergence for continuous problems, simple implementation
-- **Weaknesses**: Can converge prematurely, no gradient information
+| Mode | Sweep Space | Complexity |
+|------|------------|------------|
+| `1ap` | Position grid × 8 cardinal directions | O(grid² × 8) |
+| `2ap` | Alternating — fix AP0, sweep AP1, swap | O(grid² × 8 × 2 rounds) |
+| `2ap_reflector` | Above + outer reflector sweep (u × v × focal_xy) | O(grid² × 8 × u × v × f²) |
 
-#### Key Argument
-> "PSO moves blindly based on stochastic velocity vectors. DRT moves purposefully based on the gradient of the radio environment."
+#### Key Properties
+- **Evaluator**: `SinglePointGridSearchOptimizer` — places AP(s) at a fixed grid point, sweeps 8 cardinal orientations, returns best RSS metric
+- **Objective**: 5th-percentile RSS (linear Watts) via `PercentileCoverageObjective`
+- **Reflector sweep**: `generate_reflector_grid_tasks()` produces the Cartesian product of uniform `(u, v)` surface coordinates and `(x, y)` focal-point targets
+- **Parallelism**: Embarrassingly parallel — one Ray actor per grid point
+- **Direction sweep**: 8 cardinal/intercardinal unit vectors on the XY plane (N, NE, E, SE, S, SW, W, NW)
 
-#### Python Implementation
-Use `PySwarm` or `scikit-opt`:
+#### Worker Interface
+Each grid point is submitted as a task to `OptimizationWorker.optimize()` with:
 ```python
-from pyswarm import pso
-
-def objective(x):
-    return coverage_loss(x)
-
-lb = [0, 0, 0, 0, 0, 0]  # Lower bounds
-ub = [10, 10, 3, 10, 10, 3]  # Upper bounds
-xopt, fopt = pso(objective, lb, ub, swarmsize=50, maxiter=100)
+{
+    "method": "grid_search_point",
+    "evaluation_positions": [(x, y)],
+    "evaluation_orientations": [(dx, dy, dz)],  # or None → sweep
+    "reflector_u": 0.3,         # optional
+    "reflector_v": 0.7,         # optional
+    "reflector_target": (20, 15, 1.5),  # optional
+    "percentile_target_quantile": 0.05,
+}
 ```
+
+#### Strengths & Weaknesses
+- **Strength**: Guaranteed to find the global optimum within the grid resolution
+- **Weakness**: Exponential scaling — intractable for high-dimensional joint optimisation; discrete resolution limits solution quality
 
 ---
 
-### 3. Alternating Optimization (AO) - **Mathematical Baseline**
+### 2. Genetic Algorithm (GA) — Evolutionary Baseline ✅
 
-**Priority**: **OPTIONAL** - Represents traditional analytical approach.
+**Implementation**: `src/reflector_position/optimizers/deap_logic.py` + `ray_evaluator.py`
 
-#### Why Use AO?
-- **Standard Analytical Method**: The traditional way to solve coupled non-convex problems
-- **Theoretical Foundation**: Well-established in optimization literature
-- **Demonstrates Joint Optimization Value**: Shows the benefit of optimizing all variables together
+**Full Details**: See [GA_DEAP_IMPLEMENTATION.md](GA_DEAP_IMPLEMENTATION.md)
 
-#### Implementation Details
-- **Approach**: Optimize one variable while holding others fixed
-- **Cycle**: Optimize AP position → RIS position → Phase Shifts → Repeat
-- **Iterations**: 10-20 cycles
-- **Per-Variable Optimizer**: Gradient descent or grid search
+#### Key Properties
 
-#### Expected Performance
-- **Strengths**: Simple to implement, guaranteed not to increase objective
-- **Weaknesses**: Gets stuck in local minima, slow convergence
+| Property | Value |
+|----------|-------|
+| Library | DEAP 1.4+ |
+| Architecture | IoC — `GeneticAlgorithmRunner` (pure DEAP) + `RayActorPoolExecutor` |
+| Chromosome | 4 / 8 / 12 genes (1ap / 2ap / 2ap_reflector) |
+| Fitness | Maximise P5 RSS (5th-percentile, linear Watts) |
+| Crossover | Blend (`cxBlend`, α=0.5) |
+| Mutation | Split Gaussian — σ_pos=2.0, σ_dir=0.3, σ_reflector=0.1 |
+| Selection | Tournament (k=10) |
+| Population | 150 individuals, 50 generations |
 
-#### Key Argument
-> "AO often gets stuck in local minima because it decouples variables that are physically coupled. Our DRT method optimizes them jointly (or hierarchically) with full gradient awareness."
-
-#### Python Implementation
-```python
-def alternating_optimization(ap_init, ris_init, max_cycles=20):
-    ap_pos = ap_init
-    ris_pos = ris_init
-    
-    for cycle in range(max_cycles):
-        # Fix RIS, optimize AP
-        ap_pos = optimize_ap_fixed_ris(ap_pos, ris_pos)
-        
-        # Fix AP, optimize RIS
-        ris_pos = optimize_ris_fixed_ap(ap_pos, ris_pos)
-        
-        if converged(ap_pos, ris_pos):
-            break
-    
-    return ap_pos, ris_pos
+#### Reflector-Aware Encoding (12 genes)
 ```
+[x1, y1, x2, y2, dx1, dy1, dx2, dy2, refl_u, refl_v, focal_x, focal_y]
+```
+- UV genes ∈ [0, 1] — wall-surface parameterisation
+- Focal genes bounded by `focal_bounds` dict
+- `focal_z` fixed at receiver height (1.5 m)
+- Separation constraint on AP pairs (penalty fitness 1e-100)
+
+#### Evaluation Flow
+1. `_format_individual()` converts genes → worker kwargs (positions, orientations, reflector params)
+2. `executor.map()` calls `OptimizationWorker.optimize()` per individual
+3. Worker evaluates via `SinglePointGridSearchOptimizer` → P5 RSS
+4. Fitness and reflector attributes stored on the DEAP individual
+
+#### Strengths & Weaknesses
+- **Strength**: Population-based — more robust to local minima; handles mixed variables; black-box (no gradient needed)
+- **Weakness**: Requires O(pop × gen) forward simulations — typically 150 × 50 = 7,500 evaluations
+
+---
+
+### 3. Gradient Descent (GD) — Physics-Aware DRT Method ✅
+
+**Implementation**: `src/reflector_position/optimizers/gradient_descent.py`
+
+#### Key Properties
+
+| Property | Value |
+|----------|-------|
+| Framework | Sionna + DrJit auto-differentiation |
+| Modes | `1ap`, `2ap`, `2ap_reflector` |
+| AP parameters | `tx_position`, `look_at_direction` (differentiable) |
+| Reflector parameters | `reflector_u_raw`, `reflector_v_raw`, `focal_point_raw` (sigmoid-bounded, SPSA) |
+| Loss functions | `softmin`, `masked_softmin`, `percentile` (fairness-mode configurable) |
+| Multi-start | N random seeds → ActorPool → pick best |
+
+#### Reflector Gradient Estimation
+DrJit AD cannot differentiate through SceneObject vertex manipulation (mesh repositioning). The solution:
+
+- **AP parameters**: Full auto-diff via DrJit tape
+- **Reflector parameters**: SPSA (Simultaneous Perturbation Stochastic Approximation)
+  - 2-point finite-difference: perturb all reflector params, forward pass twice, estimate gradient
+  - Learning rate multiplier: `REFLECTOR_LR_MULTIPLIER = 0.5` (relative to AP LR)
+  - Direction LR multiplier: `DIR_LR_MULTIPLIER = 10.0`
+
+#### Trainable Parameters (sigmoid-bounded)
+
+| Parameter | Raw Variable | Bounds |
+|-----------|-------------|--------|
+| AP position | `tx_position` | Soft-bounded by optimiser step |
+| Look-at direction | `look_at_direction` | Free (normalised) |
+| Reflector U | `reflector_u_raw` | sigmoid → [0, 1] |
+| Reflector V | `reflector_v_raw` | sigmoid → [0, 1] |
+| Focal point | `focal_point_raw` | sigmoid → [fx_min, fx_max] etc. |
+
+#### Strengths & Weaknesses
+- **Strength**: Exploits physics-based gradients — converges in ~100 steps; infinite position resolution
+- **Weakness**: Susceptible to local minima (mitigated by multi-start); SPSA adds noise for reflector params
+
+---
+
+## Planned Baselines
+
+### 4. Particle Swarm Optimization (PSO)
+
+**Timeline**: Phase 3 (planned)
+
+#### Why PSO?
+- Fast convergence for continuous coordinate problems
+- Standard benchmark in UAV/RIS placement literature
+- Complements GA as a swarm-based (vs. evolutionary) heuristic
+
+#### Planned Configuration
+- **Particles**: 30–50
+- **Iterations**: 50–100
+- **Inertia weight**: 0.7–0.9
+- **Cognitive/social coefficients**: 1.5–2.0 each
+
+#### Integration Plan
+- Follow the same IoC pattern: `PSORunner` + `executor.map`
+- Fitness via `SinglePointGridSearchOptimizer` (same as GA)
+- Report total evaluations = particles × iterations
+
+---
+
+### 5. Alternating Optimization (AO)
+
+**Timeline**: Phase 4 (planned)
+
+#### Why AO?
+- Standard analytical method for coupled non-convex problems
+- Demonstrates the benefit of joint optimisation (DRT advantage)
+
+#### Planned Approach
+- Cycle: fix reflector → optimize APs (GD) → fix APs → optimize reflector (GD) → repeat
+- 10–20 cycles with convergence check
 
 ---
 
 ## Baseline Comparison Table
 
-| Baseline | Type | Complexity | Strength | Weakness (Your Advantage) |
-|----------|------|-----------|----------|---------------------------|
-| **Grid Search** | Naive | Exponential O(n^d) | Guaranteed to find best in grid | Intractable for >2 devices; discrete resolution; poor scaling |
-| **Genetic Algorithm** | Heuristic | High (Pop × Gen × Eval) | Robust; handles mixed variables | "Black box" optimization; thousands of simulations; blind to physics |
-| **PSO** | Heuristic | Medium (Particles × Iter × Eval) | Fast for continuous; simple | Premature convergence; blind exploration; no gradient info |
-| **Alternating Opt.** | Analytical | Low (Cycles × Per-Var) | Theoretical guarantees | Decouples coupled variables; local minima trapping |
-| **Proposed DRT** | Physics-Aware | Low (w.r.t resolution) | Exploits gradients; 100x fewer sims; infinite resolution; parallel exploration | Requires differentiable simulator |
+| Baseline | Type | Evaluations | Gradients | Reflector | Status |
+|----------|------|-------------|-----------|-----------|--------|
+| **Grid Search** | Exhaustive | O(grid² × dirs) | None | Outer sweep | ✅ |
+| **Genetic Algorithm** | Evolutionary | O(pop × gen) | None | 4 extra genes | ✅ |
+| **Gradient Descent** | Physics-aware | O(iters × starts) | AD + SPSA | Joint (sigmoid-bounded) | ✅ |
+| **PSO** | Swarm | O(particles × iters) | None | — | 📋 |
+| **AO** | Analytical | O(cycles × per-var) | Per-subproblem | Decoupled | 📋 |
 
-## Strategic Recommendations
+### Comparison Axes
 
-### For IEEE Transactions on Wireless Communications
-**Must Include**: Grid Search + Genetic Algorithm  
-**Recommended**: Add PSO for stronger continuous baseline  
-**Optional**: Add AO if discussing joint optimization benefits
+| Metric | Grid Search | GA | GD (Ours) |
+|--------|-------------|-----|-----------|
+| **Objective** | P5 RSS | P5 RSS | Fairness loss (P5) |
+| **Solution quality** | Limited by grid | Stochastic convergence | Gradient-guided |
+| **Compute cost** | Highest (exhaustive) | High (pop × gen) | Lowest (gradient) |
+| **Local minima** | N/A (exhaustive) | More robust | Susceptible (multi-start) |
+| **Reflector handling** | Outer sweep | Co-evolved | Joint SPSA |
+| **Resolution** | Discrete (grid spacing) | Continuous (mutation) | Continuous (gradient) |
 
-### For ACM MobiCom / IEEE INFOCOM
-**Must Include**: All four baselines (Grid Search, GA, PSO, AO)  
-**Additional**: Consider Deep RL baseline if time permits
+---
 
-### Evaluation Metrics
-Compare baselines on:
-1. **Convergence Speed**: Iterations to reach 95% of optimal
-2. **Solution Quality**: Final coverage percentage
-3. **Computational Cost**: Total ray tracing calls
-4. **Robustness**: Success rate across different random seeds
+## Evaluation Metrics
 
-### Example Results Table
-```
-| Method | Coverage (%) | Iterations | Ray Traces | Time (s) |
-|--------|-------------|-----------|-----------|----------|
-| Grid Search | 87.3 | 1 | 10,000 | 450 |
-| GA | 91.2 | 100 | 5,000 | 320 |
-| PSO | 89.8 | 80 | 2,400 | 180 |
-| AO | 85.6 | 15 | 300 | 95 |
-| DRT (Ours) | 94.1 | 50 | 100 | 45 |
-```
+All baselines are compared on the same metrics:
+1. **P5 RSS (dBm)**: Primary — 5th-percentile received signal strength
+2. **Mean RSS (dBm)**: Secondary — average coverage
+3. **Total evaluations**: Number of ray-tracing forward passes
+4. **Wall-clock time**: Including scene loading and overhead
+5. **Robustness**: Variance across random seeds (10+ runs for stochastic methods)
+
+---
 
 ## Implementation Priority
 
-**Phase 1** (Complete): Grid Search baseline ✅  
-**Phase 2** (Complete): Genetic Algorithm (DEAP) with Ray-parallel evaluation ✅  
-**Phase 3** (Next): PSO for stronger comparison  
-**Phase 4** (Future): Alternating Optimization for joint optimization claims
+| Phase | Baseline | Status |
+|-------|----------|--------|
+| Phase 1 | Grid Search | ✅ Complete |
+| Phase 2 | Gradient Descent (DRT) | ✅ Complete |
+| Phase 2 | Genetic Algorithm (DEAP + IoC) | ✅ Complete |
+| Phase 3 | PSO | 📋 Planned |
+| Phase 4 | AO | 📋 Planned |
+
+---
 
 ## References
 
-- **GA for RIS**: [Multiple RIS-Assisted UAV Communications](https://ieeexplore.ieee.org) - Uses GA for placement
-- **PSO for AP Placement**: [UAV Base Station Placement](https://ieeexplore.ieee.org) - PSO benchmark
-- **AO for Joint Optimization**: [RIS Phase Shift and Positioning](https://ieeexplore.ieee.org) - Standard AO approach
+- **GA for RIS Placement**: Uses GA as the standard heuristic benchmark in RIS/UAV literature
+- **PSO for AP Placement**: Standard swarm-based benchmark for continuous positioning
+- **AO for Joint Optimisation**: Traditional approach for coupled non-convex problems

@@ -1,0 +1,64 @@
+{
+  "scene_config": {
+    "scene_path": "/home/hieule/blender/models/building_floor/building_floor.xml",
+    "frequency": 5180000000.0,
+    "tx_power_dbm": 5.0,
+    "tx_positions": [
+      [7.0, 7.0, 3.8],
+      [23.0, 23.0, 3.8]
+    ],
+    "reflector_enabled": true,
+    "reflector_size": [2.0, 2.0],
+    "wall_top_left": [15.0, 34.0, 3.0],
+    "wall_bottom_right": [34.0, 34.0, 1.0],
+    "focal_point": [20.0, 20.0, 1.5],
+    "device": "cuda"
+  },
+  "output_dir": "results/experiments/",
+  "position_bounds": {
+    "x_min": 5.5,
+    "x_max": 34.5,
+    "y_min": 5.5,
+    "y_max": 34.5
+  },
+  "fixed_z": 3.8,
+  "num_pool_workers": 2,
+  "gpu_fraction": 0.5,
+  "random_seed": 4,
+  "num_aps": 2,
+  "min_ap_separation": 10.0,
+  "optimize_orientation": true,
+  "reflector_enabled": true,
+  "focal_z": 1.5,
+  "ga_params": {
+    "pop_size": 100,
+    "n_gen": 20,
+    "cxpb": 0.7,
+    "mutpb": 0.3,
+    "tournsize": 20,
+    "hof_size": 30
+  },
+  "ga_optimization_params": {
+    "samples_per_tx": 1000000,
+    "max_depth": 13,
+    "verbose": false
+  },
+  "k_seeds": 5,
+  "d_corr": 1.5,
+  "gd_hyperparams": {
+    "num_iterations": 50,
+    "learning_rate": 0.05,
+    "samples_per_tx": 1000000,
+    "max_depth": 13,
+    "use_soft_min": true,
+    "temperature": 0.02,
+    "shadow_quantile": 0.05,
+    "fairness_loss_type": "softmin",
+    "alpha": 0.95,
+    "beta": 0.05,
+    "coverage_threshold_dbm": -120.0,
+    "coverage_temperature": 2.0,
+    "verbose": false
+  },
+  "verbose": true
+}
