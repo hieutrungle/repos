@@ -18,6 +18,7 @@ import copy
 
 from ..metrics import (
     compute_min_rss_metric,
+    compute_p5_rss_metric,
     compute_soft_min_rss_metric,
     compute_coverage_metric,
     rss_to_dbm,
@@ -132,7 +133,7 @@ class GradientDescentAPOptimizer:
         if use_soft_min:
             min_rss = compute_soft_min_rss_metric(rss, temperature=temperature)
         else:
-            min_rss = compute_min_rss_metric(rss)
+            min_rss = compute_p5_rss_metric(rss)
 
         # Convert to dBm scale for better loss landscape
         log_min_rss = rss_to_dbm(min_rss)
@@ -240,7 +241,7 @@ class GradientDescentAPOptimizer:
             # Compute metrics for logging
             # Compute radio map separately for visualization (without gradient tracking)
             
-            min_rss = compute_min_rss_metric(rss.clone().detach().cpu())
+            min_rss = compute_p5_rss_metric(rss.clone().detach().cpu())
             min_rss_dbm = rss_to_dbm(min_rss)
             coverage = compute_coverage_metric(rss, coverage_threshold_dbm)
 
@@ -260,7 +261,7 @@ class GradientDescentAPOptimizer:
                 print(
                     f"Iter {iteration+1:3d}/{num_iterations} | "
                     f"Pos: ({current_pos[0]:.2f}, {current_pos[1]:.2f}) | "
-                    f"Min RSS: {min_rss_dbm:.2f} dBm | "
+                    f"P5 RSS: {min_rss_dbm:.2f} dBm | "
                     f"Coverage: {coverage:.1f}% | "
                     f"Loss: {loss.item():.2e} | "
                     f"Grad norm: {grad_norm:.2e} | "
@@ -310,11 +311,11 @@ class GradientDescentAPOptimizer:
         ax.legend()
         ax.grid(True, alpha=0.3)
 
-        # 2. Min RSS over iterations
+        # 2. P5 RSS over iterations
         ax = axes[0, 1]
         ax.plot(self.history["min_rss_dbm_values"], "b-", linewidth=2)
         ax.set_xlabel("Iteration")
-        ax.set_ylabel("Min RSS (dBm)")
+        ax.set_ylabel("P5 RSS (dBm)")
         ax.set_title("Minimum RSS Evolution")
         ax.grid(True, alpha=0.3)
 

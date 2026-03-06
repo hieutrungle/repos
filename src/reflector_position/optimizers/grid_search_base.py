@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 import sionna.rt
 
 from ..utils import compute_radio_map_with_tx_position
-from ..metrics import compute_min_rss_metric, compute_coverage_metric, rss_to_dbm
+from ..metrics import compute_min_rss_metric, compute_p5_rss_metric, compute_coverage_metric, rss_to_dbm
 
 
 class GridSearchAPOptimizer:
@@ -131,7 +131,7 @@ class GridSearchAPOptimizer:
 
                 # Compute metrics using torch (keep on GPU)
                 rss_tensor = torch.from_numpy(np.array(rm.rss)).to(self.device)
-                min_rss = compute_min_rss_metric(rss_tensor)
+                min_rss = compute_p5_rss_metric(rss_tensor)
                 min_rss_dbm = rss_to_dbm(min_rss)
                 coverage = compute_coverage_metric(rss_tensor, coverage_threshold_dbm)
 
@@ -191,7 +191,7 @@ class GridSearchAPOptimizer:
             values = np.array(self.results["min_rss_dbm_values"])
             title = "Grid Search: Minimum RSS (dBm)"
             cmap = "viridis"
-            label = "Min RSS (dBm)"
+            label = "P5 RSS (dBm)"
         elif metric == "coverage":
             values = np.array(self.results["coverage_values"])
             title = "Grid Search: Coverage (%)"

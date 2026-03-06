@@ -21,10 +21,17 @@ Multi-AP support:
     fixed         fixed          1  (direct evaluation)
     ============  ============  ====================================
 
+Reflector grid search:
+    ``generate_reflector_grid_tasks()`` generates work items for sweeping
+    a passive reflector's wall position (*u*, *v*) and focal-point target
+    (*x*, *y*) while keeping APs fixed.
+
 Helper functions:
     * ``generate_grid_positions()`` — 1-AP legacy grid point generation.
     * ``generate_alternating_grid_tasks()`` — multi-AP alternating
       optimisation task generation for ``RayParallelOptimizer``.
+    * ``generate_reflector_grid_tasks()`` — reflector placement + focal
+      target sweep with fixed APs.
 """
 
 import itertools
@@ -37,7 +44,17 @@ import sionna.rt
 from sionna.rt import RadioMapSolver
 
 from .base_optimizer import BaseAPOptimizer
-from ..metrics import compute_min_rss_metric, compute_coverage_metric, rss_to_dbm
+from ..metrics import (
+    compute_min_rss_metric,
+    compute_p5_rss_metric,
+    compute_coverage_metric,
+    rss_to_dbm,
+    PercentileCoverageObjective,
+    MaskedSoftMinLoss,
+    normalized_softmin_loss,
+    differentiable_coverage_loss,
+)
+from ..reflector_model import ReflectorController
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +113,7 @@ def generate_alternating_grid_tasks(
     fixed_orientations: List[Optional[Tuple[float, float, float]]],
     grid_resolution: float = 1.0,
     fixed_z: float = 3.8,
+    min_ap_separation: float = 0.0,
 ) -> List[Dict]:
     """
     Generate work-item dicts for alternating-optimisation grid search.
@@ -118,6 +136,8 @@ def generate_alternating_grid_tasks(
             typically ``None`` to sweep it, but the caller may override.
         grid_resolution: Grid spacing in metres for the active AP.
         fixed_z: Fixed z-coordinate (height) for all APs.
+        min_ap_separation: Minimum 2-D distance (metres) allowed between the
+            active AP candidate and every other AP. Set to 0 to disable.
 
     Returns:
         List of kwargs dicts, each compatible with
@@ -147,6 +167,18 @@ def generate_alternating_grid_tasks(
             else:
                 positions.append(tuple(float(c) for c in fixed_positions[i]))  # type: ignore[arg-type]
 
+        # Enforce AP separation constraint (if enabled)
+        if min_ap_separation > 0.0:
+            active_pos = positions[active_ap_idx]
+            violates = any(
+                np.hypot(active_pos[0] - positions[j][0], active_pos[1] - positions[j][1])
+                < min_ap_separation
+                for j in range(num_aps)
+                if j != active_ap_idx
+            )
+            if violates:
+                continue
+
         # Mirror the fixed_orientations list as-is
         orientations: List[Optional[Tuple[float, float, float]]] = list(
             fixed_orientations
@@ -157,6 +189,126 @@ def generate_alternating_grid_tasks(
             "evaluation_orientations": orientations,
             "fixed_z": fixed_z,
         })
+
+    if not work_items:
+        raise ValueError(
+            "No valid alternating-grid tasks after applying min_ap_separation="
+            f"{min_ap_separation}. Consider relaxing the constraint or using "
+            "coarser/further-apart initial AP positions."
+        )
+
+    return work_items
+
+
+# ---------------------------------------------------------------------------
+# Reflector grid task generation
+# ---------------------------------------------------------------------------
+
+def generate_reflector_grid_tasks(
+    fixed_ap_positions: List[Tuple[float, float, float]],
+    fixed_ap_orientations: List[Tuple[float, float, float]],
+    u_steps: int = 5,
+    v_steps: int = 5,
+    target_bounds: Optional[Dict[str, float]] = None,
+    target_resolution: float = 2.0,
+    target_z: float = 1.5,
+) -> List[Dict[str, Any]]:
+    """Generate work items for reflector wall-position × focal-target sweep.
+
+    Produces the Cartesian product of a uniform *(u, v)* grid on the
+    reflector's wall surface and a uniform *(x, y)* grid of focal-point
+    targets at a fixed height.  APs are kept at the positions and
+    orientations supplied — they are **not** swept.
+
+    Parameters
+    ----------
+    fixed_ap_positions : list of (float, float, float)
+        World-space ``(x, y, z)`` positions for each AP (frozen).
+    fixed_ap_orientations : list of (float, float, float)
+        Look-at direction ``(dx, dy, dz)`` for each AP (frozen).
+    u_steps : int
+        Number of uniformly-spaced *u* samples in [0, 1] (inclusive).
+    v_steps : int
+        Number of uniformly-spaced *v* samples in [0, 1] (inclusive).
+    target_bounds : dict, optional
+        Focal-target search area with keys ``x_min``, ``x_max``,
+        ``y_min``, ``y_max``.  Defaults to the full building floor
+        ``(5 – 35, 5 – 35)``.
+    target_resolution : float
+        Grid spacing (metres) for the focal-target XY grid.
+    target_z : float
+        Fixed z-coordinate for all focal-target points (receiver height).
+
+    Returns
+    -------
+    list of dict
+        Each dictionary contains:
+
+        * ``evaluation_positions``  — frozen AP ``(x, y)`` tuples
+        * ``evaluation_orientations`` — frozen AP ``(dx, dy, dz)`` tuples
+        * ``fixed_z``  — AP height (taken from first AP's z)
+        * ``reflector_u``  — wall u ∈ [0, 1]
+        * ``reflector_v``  — wall v ∈ [0, 1]
+        * ``reflector_target`` — ``(tx, ty, tz)`` focal point
+
+    Example
+    -------
+    >>> tasks = generate_reflector_grid_tasks(
+    ...     fixed_ap_positions=[(10.0, 20.0, 3.8)],
+    ...     fixed_ap_orientations=[(0.0, 1.0, 0.0)],
+    ...     u_steps=3, v_steps=3,
+    ...     target_bounds={"x_min": 5, "x_max": 35, "y_min": 5, "y_max": 35},
+    ...     target_resolution=5.0,
+    ... )
+    >>> print(f"{len(tasks)} reflector work items")
+    """
+    if target_bounds is None:
+        target_bounds = {
+            "x_min": 5.0,
+            "x_max": 35.0,
+            "y_min": 5.0,
+            "y_max": 35.0,
+        }
+
+    # u, v grids — inclusive endpoints
+    u_values = np.linspace(0.0, 1.0, u_steps)
+    v_values = np.linspace(0.0, 1.0, v_steps)
+
+    # Focal-target XY grid
+    tx_range = np.arange(
+        target_bounds["x_min"],
+        target_bounds["x_max"] + target_resolution / 2,
+        target_resolution,
+    )
+    ty_range = np.arange(
+        target_bounds["y_min"],
+        target_bounds["y_max"] + target_resolution / 2,
+        target_resolution,
+    )
+
+    # Frozen AP info (strip z for evaluation_positions, keep z separately)
+    fixed_z = float(fixed_ap_positions[0][2]) if fixed_ap_positions else 3.8
+    eval_positions: List[Tuple[float, float]] = [
+        (float(p[0]), float(p[1])) for p in fixed_ap_positions
+    ]
+    eval_orientations: List[Tuple[float, float, float]] = [
+        tuple(float(c) for c in o) for o in fixed_ap_orientations  # type: ignore[misc]
+    ]
+
+    # Cartesian product: (u, v, target_x, target_y)
+    work_items: List[Dict[str, Any]] = []
+    for u_val in u_values:
+        for v_val in v_values:
+            for tx in tx_range:
+                for ty in ty_range:
+                    work_items.append({
+                        "evaluation_positions": eval_positions,
+                        "evaluation_orientations": eval_orientations,
+                        "fixed_z": fixed_z,
+                        "reflector_u": float(u_val),
+                        "reflector_v": float(v_val),
+                        "reflector_target": (float(tx), float(ty), float(target_z)),
+                    })
 
     return work_items
 
@@ -193,6 +345,13 @@ class SinglePointGridSearchOptimizer(BaseAPOptimizer):
     Cartesian product of sweep directions is explored via
     ``itertools.product``, ensuring *joint* orientation optimisation.
 
+    **Reflector support:**  When ``reflector_controller``, ``reflector_u``,
+    ``reflector_v``, and ``reflector_target`` are supplied the optimiser
+    positions and orients the passive reflector before every radio-map
+    evaluation.  The reflector geometry is pushed into the Mitsuba
+    scene-graph via ``apply_to_scene()`` so the ray-tracer sees the
+    updated placement.
+
     **Backward compatibility:**  The legacy single-AP parameters
     ``evaluation_position`` and ``evaluation_orientation`` are still
     accepted and automatically wrapped into length-1 lists.
@@ -211,6 +370,13 @@ class SinglePointGridSearchOptimizer(BaseAPOptimizer):
         evaluation_orientation: Optional[Tuple[float, float, float]] = None,
         fixed_z: float = 3.8,
         position_bounds: Optional[Dict[str, float]] = None,
+        # ---- Reflector parameters (optional) ----
+        reflector_controller: Optional[ReflectorController] = None,
+        reflector_u: Optional[float] = None,
+        reflector_v: Optional[float] = None,
+        reflector_target: Optional[Tuple[float, float, float]] = None,
+        # ---- Objective function (optional) ----
+        percentile_objective: Optional[PercentileCoverageObjective] = None,
     ):
         """
         Initialise single-point (possibly multi-AP) grid search evaluator.
@@ -231,6 +397,17 @@ class SinglePointGridSearchOptimizer(BaseAPOptimizer):
                 ``None``.
             fixed_z: Height (z-coordinate) for all APs.
             position_bounds: Optional bounds (unused, for interface compat).
+            reflector_controller: Optional :class:`ReflectorController`
+                instance.  When provided the reflector is configured
+                before every ray-trace evaluation.
+            reflector_u: Wall *u* coordinate ∈ [0, 1] for the reflector.
+            reflector_v: Wall *v* coordinate ∈ [0, 1] for the reflector.
+            reflector_target: 3-D focal point ``(x, y, z)`` the
+                reflector should aim at.
+            percentile_objective: Optional :class:`PercentileCoverageObjective`.
+                When provided, an additional ``percentile_score`` key is
+                included in the metrics dict and used as the primary
+                ranking criterion during optimization.
         """
         super().__init__(scene=scene, fixed_z=fixed_z, position_bounds=position_bounds)
 
@@ -282,6 +459,15 @@ class SinglePointGridSearchOptimizer(BaseAPOptimizer):
             "direction_sweep": [],           # per-combo metrics
         }
 
+        # ---- Reflector (optional) ----
+        self._reflector_ctrl = reflector_controller
+        self._reflector_u = reflector_u
+        self._reflector_v = reflector_v
+        self._reflector_target = reflector_target
+
+        # ---- Objective function (optional) ----
+        self._percentile_objective = percentile_objective
+
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
@@ -312,12 +498,20 @@ class SinglePointGridSearchOptimizer(BaseAPOptimizer):
         samples_per_tx: int,
         max_depth: int,
         coverage_threshold_dbm: float,
+        # -- Composite loss parameters for GA/GD alignment --
+        use_soft_min: bool = True,
+        temperature: float = 0.1,
+        shadow_quantile: float = 0.05,
+        fairness_loss_type: str = "auto",
+        alpha: float = 0.6,
+        beta: float = 0.4,
+        coverage_temperature: float = 2.0,
     ) -> Dict[str, float]:
         """Run one radio-map evaluation and return scalar metrics.
 
         Returns:
-            Dictionary with ``rss`` (Watts), ``rss_dbm``, and ``coverage``
-            (percentage) keys.
+            Dictionary with ``rss`` (Watts), ``rss_dbm``, ``coverage``
+            (percentage), and ``softmin_fitness`` keys.
         """
         rm = self._solver(
             self.scene,
@@ -329,15 +523,116 @@ class SinglePointGridSearchOptimizer(BaseAPOptimizer):
         )
         rss_tensor = torch.from_numpy(np.array(rm.rss)).to(self.device)
 
-        min_rss = compute_min_rss_metric(rss_tensor)
+        min_rss = compute_p5_rss_metric(rss_tensor)
         min_rss_dbm = rss_to_dbm(min_rss)
         coverage = compute_coverage_metric(rss_tensor, coverage_threshold_dbm)
 
-        return {
+        result: Dict[str, float] = {
             "rss": min_rss.cpu().item(),
             "rss_dbm": min_rss_dbm.cpu().item(),
             "coverage": coverage.cpu().item(),
         }
+
+        # Percentile objective (when configured)
+        if self._percentile_objective is not None:
+            pct_score = self._percentile_objective(rss_tensor)
+            # ``PercentileCoverageObjective`` may return a vector for
+            # multi-plane / batched RSS maps (e.g., shape (B, H, W)).
+            # Reduce to a scalar ranking score using the worst-case batch
+            # element for robust optimisation.
+            if pct_score.numel() > 1:
+                pct_score = torch.min(pct_score)
+            result["percentile_score"] = pct_score.detach().cpu().item()
+            result["percentile_score_dbm"] = (
+                rss_to_dbm(pct_score).detach().cpu().item()
+            )
+
+        # -- Composite loss (same landscape as GD) for GA alignment --------
+        # Compute: total_loss = alpha * fairness_loss + beta * coverage_loss
+        # Return: softmin_fitness = -total_loss  (GA maximises this).
+        effective_type = fairness_loss_type
+        if effective_type == "auto" and not use_soft_min:
+            effective_type = "percentile"
+        if effective_type == "auto":
+            effective_type = (
+                "masked_softmin"
+                if self._reflector_ctrl is not None
+                else "softmin"
+            )
+
+        if effective_type == "masked_softmin":
+            fairness_loss = MaskedSoftMinLoss(
+                shadow_quantile=shadow_quantile,
+                temperature=temperature,
+            )(rss_tensor)
+        elif effective_type == "softmin":
+            fairness_loss = normalized_softmin_loss(
+                rss_tensor.flatten().unsqueeze(0),
+                temperature=temperature,
+            )
+        elif effective_type == "percentile":
+            p5 = compute_p5_rss_metric(rss_tensor)
+            fairness_loss = -rss_to_dbm(p5) / 100.0
+        else:
+            fairness_loss = normalized_softmin_loss(
+                rss_tensor.flatten().unsqueeze(0),
+                temperature=temperature,
+            )
+
+        cov_loss = differentiable_coverage_loss(
+            rss_tensor,
+            threshold_dbm=coverage_threshold_dbm,
+            temperature=coverage_temperature,
+        )
+
+        total_loss = alpha * fairness_loss + beta * cov_loss
+        result["softmin_fitness"] = -float(total_loss.item())
+
+        return result
+
+    # ------------------------------------------------------------------
+    # Reflector scene-graph update
+    # ------------------------------------------------------------------
+
+    def _apply_reflector(self, tx_positions: List[List[float]]) -> None:
+        """Position and orient the passive reflector before ray-tracing.
+
+        Converts the stored *u*, *v*, and *target* values to PyTorch
+        tensors on ``self.device``, writes them into the
+        :class:`ReflectorController`, computes the specular-reflection
+        orientation, and pushes the result into the Mitsuba scene graph.
+
+        This is a no-op when no ``reflector_controller`` was provided at
+        construction time.
+        """
+        ctrl = self._reflector_ctrl
+        if ctrl is None:
+            return
+
+        dev = ctrl.device  # use the controller's device, not the optimizer's
+
+        # Wall position (u, v) ------------------------------------------------
+        ctrl.u = torch.tensor(
+            self._reflector_u, dtype=torch.float32, device=dev,
+        )
+        ctrl.v = torch.tensor(
+            self._reflector_v, dtype=torch.float32, device=dev,
+        )
+
+        # Update Tx reference for reflection math (use first AP) ---------------
+        ctrl.set_tx_position(
+            np.asarray(tx_positions[0], dtype=np.float32),
+        )
+
+        # Focal-point target ---------------------------------------------------
+        target_tensor = torch.tensor(
+            self._reflector_target, dtype=torch.float32, device=dev,
+        )
+        ctrl.set_focal_point(target_tensor, requires_grad=False)
+        ctrl.orient_to_target()
+
+        # Push updated geometry into Mitsuba -----------------------------------
+        ctrl.apply_to_scene()
 
     # ------------------------------------------------------------------
     # Orientation sweep machinery
@@ -391,6 +686,14 @@ class SinglePointGridSearchOptimizer(BaseAPOptimizer):
         max_depth: int = 13,
         coverage_threshold_dbm: float = -100.0,
         verbose: bool = False,
+        # -- Composite loss parameters forwarded to _compute_metrics --
+        use_soft_min: bool = True,
+        temperature: float = 0.1,
+        shadow_quantile: float = 0.05,
+        fairness_loss_type: str = "auto",
+        alpha: float = 0.6,
+        beta: float = 0.4,
+        coverage_temperature: float = 2.0,
     ) -> Tuple[Any, Any, float]:
         """
         Evaluate the configuration (one or more APs).
@@ -405,6 +708,13 @@ class SinglePointGridSearchOptimizer(BaseAPOptimizer):
             max_depth: Maximum ray-tracing depth.
             coverage_threshold_dbm: Threshold for coverage calculation.
             verbose: Print per-combo progress.
+            use_soft_min: Whether to use soft-min (vs. percentile) fairness.
+            temperature: Temperature (τ) for soft-min fairness losses.
+            shadow_quantile: Fraction of lowest cells to mask.
+            fairness_loss_type: Fairness loss selector.
+            alpha: Weight for fairness loss.
+            beta: Weight for coverage loss.
+            coverage_temperature: Sigmoid temperature for coverage loss.
 
         Returns:
             For **single-AP** (backward compat):
@@ -431,24 +741,53 @@ class SinglePointGridSearchOptimizer(BaseAPOptimizer):
         ]
         best_names: List[Optional[str]] = [None] * self.num_aps
         best_metrics: Dict[str, float] = {"rss": 0, "rss_dbm": 0, "coverage": 0}
+        # Use percentile_score as primary ranking when objective is set
+        use_percentile = self._percentile_objective is not None
+        best_ranking_score = -float("inf")
 
         for combo_idx, (directions, dir_names) in enumerate(combos):
             self._configure_transmitters(tx_positions, directions)
-            metrics = self._compute_metrics(
-                samples_per_tx, max_depth, coverage_threshold_dbm,
-            )
+
+            # Apply reflector geometry (no-op if no controller supplied)
+            self._apply_reflector(tx_positions)
+
+            # Wrap evaluation in no_grad to save GPU memory and maximize
+            # throughput during derivative-free (GA / grid search) runs.
+            with torch.no_grad():
+                metrics = self._compute_metrics(
+                    samples_per_tx,
+                    max_depth,
+                    coverage_threshold_dbm,
+                    use_soft_min=use_soft_min,
+                    temperature=temperature,
+                    shadow_quantile=shadow_quantile,
+                    fairness_loss_type=fairness_loss_type,
+                    alpha=alpha,
+                    beta=beta,
+                    coverage_temperature=coverage_temperature,
+                )
 
             # Store per-combo sweep data
-            self.results["direction_sweep"].append({
+            sweep_entry: Dict[str, Any] = {
                 "combo_idx": combo_idx,
                 "direction_names": list(dir_names),
                 "directions": [d.tolist() for d in directions],
                 "min_rss": metrics["rss"],
                 "min_rss_dbm": metrics["rss_dbm"],
                 "coverage": metrics["coverage"],
-            })
+            }
+            if use_percentile:
+                sweep_entry["percentile_score"] = metrics["percentile_score"]
+                sweep_entry["percentile_score_dbm"] = metrics["percentile_score_dbm"]
+            self.results["direction_sweep"].append(sweep_entry)
 
-            if metrics["rss"] > best_rss:
+            # Ranking: prefer percentile score when objective is configured
+            ranking = (
+                metrics["percentile_score"] if use_percentile
+                else metrics["rss"]
+            )
+            if ranking > best_ranking_score:
+                best_ranking_score = ranking
                 best_rss = metrics["rss"]
                 best_dirs = [d.copy() for d in directions]
                 best_names = list(dir_names)
@@ -462,7 +801,7 @@ class SinglePointGridSearchOptimizer(BaseAPOptimizer):
                 )
                 print(
                     f"    [{combo_idx + 1}/{num_combos}] {dir_str}: "
-                    f"Min RSS = {metrics['rss_dbm']:.2f} dBm, "
+                    f"P5 RSS = {metrics['rss_dbm']:.2f} dBm, "
                     f"Coverage = {metrics['coverage']:.1f}%"
                 )
 
@@ -476,6 +815,31 @@ class SinglePointGridSearchOptimizer(BaseAPOptimizer):
         # Legacy aliases for single-AP consumers
         self.results["best_orientation"] = best_dirs[0].tolist()
         self.results["best_orientation_name"] = best_names[0]
+        # Percentile results (when configured)
+        if use_percentile:
+            self.results["percentile_score"] = best_metrics.get(
+                "percentile_score", None
+            )
+            self.results["percentile_score_dbm"] = best_metrics.get(
+                "percentile_score_dbm", None
+            )
+
+        # Composite loss fitness for GA/GD alignment
+        if "softmin_fitness" in best_metrics:
+            self.results["softmin_fitness"] = best_metrics["softmin_fitness"]
+
+        # Reflector metadata (when configured)
+        if self._reflector_ctrl is not None:
+            self.results["reflector_u"] = self._reflector_u
+            self.results["reflector_v"] = self._reflector_v
+            self.results["reflector_target"] = self._reflector_target
+            self.results["reflector_position"] = (
+                self._reflector_ctrl.get_position().tolist()
+            )
+            if self._reflector_ctrl.focal_point is not None:
+                self.results["reflector_focal_point"] = (
+                    self._reflector_ctrl.focal_point.detach().cpu().tolist()
+                )
 
         elapsed = time.time() - start_time
 
@@ -527,7 +891,7 @@ class SinglePointGridSearchOptimizer(BaseAPOptimizer):
         ap_summary = " | ".join(parts)
         print(
             f"  {ap_summary}: "
-            f"Min RSS = {rss_dbm:.2f} dBm, "
+            f"P5 RSS = {rss_dbm:.2f} dBm, "
             f"Coverage = {cov:.1f}%, "
             f"Time = {elapsed:.2f}s ({num_combos} combos)"
         )

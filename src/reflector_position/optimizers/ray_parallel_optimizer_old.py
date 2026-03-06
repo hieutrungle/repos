@@ -426,15 +426,15 @@ class RayParallelOptimizer:
         if verbose:
             print(f"  Winner: Worker #{best_result['worker_id']}")
             print(f"  Position: {best_result['best_position']}")
-            print(f"  Min RSS: {best_result['best_metric_dbm']:.2f} dBm")
+            print(f"  P5 RSS: {best_result['best_metric_dbm']:.2f} dBm")
             print()
             print("  Aggregate Statistics:")
             print(
-                f"    Min RSS range: [{aggregate_stats['min_metric_dbm']:.2f}, "
+                f"    P5 RSS range: [{aggregate_stats['min_metric_dbm']:.2f}, "
                 f"{aggregate_stats['max_metric_dbm']:.2f}] dBm"
             )
             print(
-                f"    Mean Min RSS: {aggregate_stats['mean_metric_dbm']:.2f} "
+                f"    Mean P5 RSS: {aggregate_stats['mean_metric_dbm']:.2f} "
                 f"+/- {aggregate_stats['std_metric_dbm']:.2f} dBm"
             )
             print(f"    Mean time per worker: {aggregate_stats['mean_time_per_worker']:.2f}s")
@@ -454,7 +454,7 @@ class RayParallelOptimizer:
         self,
         results: Dict[str, Any],
         save_path: str,
-        metric_name: str = "Min RSS",
+        metric_name: str = "P5 RSS",
     ) -> None:
         """
         Save visualization of parallel optimization results to a file.
@@ -484,7 +484,7 @@ class RayParallelOptimizer:
         metrics_dbm = [r["best_metric_dbm"] for r in all_results]
         best_dbm = best_result["best_metric_dbm"]
 
-        # 1. Distribution of final Min RSS (dBm)
+        # 1. Distribution of final P5 RSS (dBm)
         ax = axes[0, 0]
         ax.hist(metrics_dbm, bins=max(5, len(metrics_dbm) // 2), edgecolor="black", alpha=0.7)
         ax.axvline(
@@ -496,11 +496,11 @@ class RayParallelOptimizer:
         )
         ax.set_xlabel(f"{metric_name} (dBm)")
         ax.set_ylabel("Number of Workers")
-        ax.set_title("Distribution of Min RSS Across Workers")
+        ax.set_title("Distribution of P5 RSS Across Workers")
         ax.legend()
         ax.grid(True, alpha=0.3)
 
-        # 2. Final positions scatter (color = Min RSS dBm)
+        # 2. Final positions scatter (color = P5 RSS dBm)
         ax = axes[0, 1]
         positions = np.array([r["best_position"] for r in all_results])
         scatter = ax.scatter(
@@ -521,7 +521,7 @@ class RayParallelOptimizer:
         )
         ax.set_xlabel("X Position (m)")
         ax.set_ylabel("Y Position (m)")
-        ax.set_title("Final Positions (color = Min RSS dBm)")
+        ax.set_title("Final Positions (color = P5 RSS dBm)")
         plt.colorbar(scatter, ax=ax, label=f"{metric_name} (dBm)")
         ax.legend()
         ax.grid(True, alpha=0.3)
@@ -550,9 +550,9 @@ class RayParallelOptimizer:
             f"Best Position: [{best_result['best_position'][0]:.2f}, "
             f"{best_result['best_position'][1]:.2f}, "
             f"{best_result['best_position'][2]:.2f}]\n"
-            f"Best Min RSS: {best_dbm_val:.2f} dBm\n"
+            f"Best P5 RSS: {best_dbm_val:.2f} dBm\n"
             f"\n"
-            f"Min RSS Statistics (dBm):\n"
+            f"P5 RSS Statistics (dBm):\n"
             f"  Mean: {stats['mean_metric_dbm']:.2f} +/- {stats['std_metric_dbm']:.2f}\n"
             f"  Range: [{stats['min_metric_dbm']:.2f}, {stats['max_metric_dbm']:.2f}]\n"
             f"\n"

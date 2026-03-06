@@ -38,8 +38,9 @@ def setup_building_floor_scene(
     # --- reflector parameters (all optional) ---
     reflector_enabled: bool = False,
     reflector_size: Tuple[float, float] = (2.0, 2.0),
-    wall_top_left: Optional[Union[np.ndarray, List[float]]] = None,
-    wall_bottom_right: Optional[Union[np.ndarray, List[float]]] = None,
+    wall_origin: Optional[Union[np.ndarray, List[float]]] = None,
+    wall_u_axis: Optional[Union[np.ndarray, List[float]]] = None,
+    wall_v_axis: Optional[Union[np.ndarray, List[float]]] = None,
     focal_point: Optional[Union[np.ndarray, List[float]]] = None,
     device: str = "cuda",
 ) -> Union[sionna.rt.Scene, Tuple[sionna.rt.Scene, ReflectorController]]:
@@ -67,11 +68,12 @@ def setup_building_floor_scene(
         If *True* a reflector mesh + controller are created and returned.
     reflector_size : tuple of float
         ``(width, height)`` of the reflector in metres.
-    wall_top_left : array-like, shape (3,), optional
-        Top-left corner ``(x1, y1, z_top)`` of the wall bounding box the
-        reflector can slide on.
-    wall_bottom_right : array-like, shape (3,), optional
-        Bottom-right corner ``(x2, y2, z_bottom)`` of the wall bounding box.
+    wall_origin : array-like, shape (3,), optional
+        Corner of the wall rectangle the reflector can slide on.
+    wall_u_axis : array-like, shape (3,), optional
+        Lateral basis vector of the wall rectangle.
+    wall_v_axis : array-like, shape (3,), optional
+        Vertical basis vector of the wall rectangle.
     focal_point : array-like, shape (3,), optional
         Initial 3-D focal point for beam-forming orientation.
     device : str
@@ -167,8 +169,9 @@ def setup_building_floor_scene(
 
     controller = ReflectorController(
         reflector=reflector_obj,
-        wall_top_left=np.asarray(wall_top_left, dtype=np.float32) if wall_top_left is not None else None,
-        wall_bottom_right=np.asarray(wall_bottom_right, dtype=np.float32) if wall_bottom_right is not None else None,
+        wall_origin=np.asarray(wall_origin, dtype=np.float32) if wall_origin is not None else None,
+        wall_u_axis=np.asarray(wall_u_axis, dtype=np.float32) if wall_u_axis is not None else None,
+        wall_v_axis=np.asarray(wall_v_axis, dtype=np.float32) if wall_v_axis is not None else None,
         tx_position=tx_pos_arr,
         focal_point=np.asarray(focal_point, dtype=np.float32) if focal_point is not None else None,
         device=device,

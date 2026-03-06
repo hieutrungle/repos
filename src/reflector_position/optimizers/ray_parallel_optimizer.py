@@ -27,7 +27,7 @@ Usage pattern:
 
 import os
 import time
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 
 import numpy as np
 import ray
@@ -106,9 +106,10 @@ class OptimizationWorker:
         self._run_count = 0
 
         # Load Scene instance (CRITICAL: each worker gets its own Scene)
-        self.scene = self._load_scene(scene_config)
+        # and optional reflector controller.
+        self.scene, self.reflector_controller = self._load_scene(scene_config)
 
-    def _load_scene(self, scene_config: Dict[str, Any]):
+    def _load_scene(self, scene_config: Dict[str, Any]) -> Tuple[Any, Optional[Any]]:
         """
         Load a fully configured Scene instance using setup_building_floor_scene.
 
@@ -124,15 +125,23 @@ class OptimizationWorker:
         """
         from reflector_position.scene_setup import setup_building_floor_scene
 
-        scene = setup_building_floor_scene(
+        loaded = setup_building_floor_scene(
             scene_path=str(scene_config["scene_path"]),
             frequency=scene_config.get("frequency", 5.18e9),
             tx_positions=scene_config.get("tx_positions", None),
             tx_power_dbm=scene_config.get("tx_power_dbm", 5.0),
             rx_position=scene_config.get("rx_position", (16.0, 6.5, 1.5)),
+            reflector_enabled=scene_config.get("reflector_enabled", False),
+            reflector_size=tuple(scene_config.get("reflector_size", (2.0, 2.0))),
+            wall_top_left=scene_config.get("wall_top_left", None),
+            wall_bottom_right=scene_config.get("wall_bottom_right", None),
+            focal_point=scene_config.get("focal_point", None),
+            device=scene_config.get("device", "cuda"),
         )
-
-        return scene
+        if isinstance(loaded, tuple) and len(loaded) == 2:
+            scene, reflector_controller = loaded
+            return scene, reflector_controller
+        return loaded, None
 
     def optimize(
         self,
@@ -166,18 +175,38 @@ class OptimizationWorker:
                 - task_id: Task identifier
                 - worker_id: Physical actor that processed this task
                 - best_position: Optimized position [x, y, z] as list
-                - best_metric: Best metric value (linear Watts)
-                - best_metric_dbm: Best metric value in dBm
+                - best_metric: Best 5th-percentile RSS value (linear Watts)
+                - best_metric_dbm: Best 5th-percentile RSS value in dBm
                 - time_elapsed: Optimization time in seconds
                 - history: Optimization history (gradient descent)
                 - grid_results: Grid search results (grid search)
         """
         self._run_count += 1
 
+        optimizer_kwargs_local = dict(optimizer_kwargs)
+
+        # Attach per-worker reflector controller (do not serialize controller
+        # through every task payload).
+        if self.reflector_controller is not None and "reflector_controller" not in optimizer_kwargs_local:
+            optimizer_kwargs_local["reflector_controller"] = self.reflector_controller
+
+        # Construct percentile objective inside the worker from a scalar
+        # quantile to avoid shipping torch module objects per task.
+        if (
+            "percentile_target_quantile" in optimizer_kwargs_local
+            and "percentile_objective" not in optimizer_kwargs_local
+        ):
+            from reflector_position.metrics import PercentileCoverageObjective
+
+            optimizer_kwargs_local["percentile_objective"] = PercentileCoverageObjective(
+                target_quantile=float(optimizer_kwargs_local.pop("percentile_target_quantile")),
+                mode="maximize",
+            )
+
         optimizer = OptimizerFactory.create(
             method=optimizer_method,
             scene=self.scene,
-            **optimizer_kwargs,
+            **optimizer_kwargs_local,
         )
 
         # Detect multi-AP configuration
@@ -202,7 +231,7 @@ class OptimizationWorker:
 
         # For gradient descent: find the BEST position across all iterations,
         # not just the final one, since the goal is to find the best
-        # possible min RSS value.
+        # possible 5th-percentile RSS value.
         best_position = final_position
         best_metric = final_metric
         best_iteration = -1  # -1 means "final" (no history or non-GD)
@@ -280,6 +309,22 @@ class OptimizationWorker:
             "time_elapsed": elapsed_time,
         }
 
+        # Reflector state: for grid search the reflector (u, v, target) is
+        # specified per work item; for GD the optimizer *learns* them.
+        # Prefer the optimizer's snapshot when available.
+        if hasattr(optimizer, "_snapshot_reflector") and callable(optimizer._snapshot_reflector):
+            refl_snap = optimizer._snapshot_reflector()
+            output["reflector_u"] = refl_snap.get("u")
+            output["reflector_v"] = refl_snap.get("v")
+            output["reflector_focal_point"] = refl_snap.get("focal_point")
+            output["reflector_position"] = refl_snap.get("position")
+            # Keep backward-compat key used by grid search callers
+            output["reflector_target"] = refl_snap.get("focal_point")
+        else:
+            output["reflector_u"] = optimizer_kwargs_local.get("reflector_u")
+            output["reflector_v"] = optimizer_kwargs_local.get("reflector_v")
+            output["reflector_target"] = optimizer_kwargs_local.get("reflector_target")
+
         # Include history if optimizer tracks it (gradient descent has history)
         if hasattr(optimizer, "history"):
             history = {}
@@ -317,6 +362,22 @@ class OptimizationWorker:
                 else:
                     gs_results[k] = v
             output["grid_results"] = gs_results
+
+            # Promote key reflector metadata to top-level result for easier
+            # plotting/summary consumption.
+            for key in (
+                "reflector_position",
+                "reflector_u",
+                "reflector_v",
+                "reflector_target",
+                "reflector_focal_point",
+            ):
+                if key in gs_results and (key not in output or output.get(key) is None):
+                    output[key] = gs_results[key]
+
+            # Promote composite-loss fitness for GA/GD objective alignment.
+            if "softmin_fitness" in gs_results and "softmin_fitness" not in output:
+                output["softmin_fitness"] = gs_results["softmin_fitness"]
 
         return output
 
@@ -559,7 +620,8 @@ class RayParallelOptimizer:
 
         # ActorPool.map_unordered distributes tasks to idle workers automatically.
         # If there are more tasks than workers, excess tasks are queued.
-        all_results = list(self._pool.map_unordered(
+        all_results = []
+        result_iter = self._pool.map_unordered(
             lambda actor, cfg: actor.optimize.remote(
                 cfg["task_id"],
                 cfg["optimizer_method"],
@@ -567,7 +629,13 @@ class RayParallelOptimizer:
                 cfg["optimization_params"],
             ),
             task_configs,
-        ))
+        )
+
+        progress_every = max(1, num_tasks // 20)  # ~5% updates
+        for completed, result in enumerate(result_iter, start=1):
+            all_results.append(result)
+            if verbose and (completed == 1 or completed % progress_every == 0 or completed == num_tasks):
+                print(f"  Progress: {completed}/{num_tasks} tasks completed")
 
         if verbose:
             print(f"  All {len(all_results)} tasks completed")
@@ -577,7 +645,7 @@ class RayParallelOptimizer:
         if verbose:
             print("Phase 3/3: Aggregating results and selecting winner...")
 
-        # Find best task (maximize metric - higher min_rss is better)
+        # Find best task (maximize metric - higher p5_rss is better)
         best_idx = int(np.argmax([r["best_metric"] for r in all_results]))
         best_result = all_results[best_idx]
 
@@ -607,6 +675,20 @@ class RayParallelOptimizer:
             "speedup": float(np.sum(times) / total_time) if total_time > 0 else 0.0,
         }
 
+        # Optional percentile statistics (if produced by grid search objective)
+        percentile_dbm_values = []
+        for r in all_results:
+            g = r.get("grid_results", {})
+            if "percentile_score_dbm" in g and g["percentile_score_dbm"] is not None:
+                percentile_dbm_values.append(float(g["percentile_score_dbm"]))
+        if percentile_dbm_values:
+            aggregate_stats.update({
+                "mean_percentile_dbm": float(np.mean(percentile_dbm_values)),
+                "std_percentile_dbm": float(np.std(percentile_dbm_values)),
+                "min_percentile_dbm": float(np.min(percentile_dbm_values)),
+                "max_percentile_dbm": float(np.max(percentile_dbm_values)),
+            })
+
         # Worker utilization: how many tasks each worker processed
         worker_task_counts = {}
         for r in all_results:
@@ -626,7 +708,7 @@ class RayParallelOptimizer:
             if _n_aps > 1:
                 print(f"  Num APs: {_n_aps}")
             print(f"  Position: {_fmt_pos(best_result['best_position'])}")
-            print(f"  Min RSS: {best_result['best_metric_dbm']:.2f} dBm")
+            print(f"  P5 RSS: {best_result['best_metric_dbm']:.2f} dBm")
             _bd = best_result.get("best_direction")
             if _bd:
                 print(f"  Direction: {_fmt_dir(_bd)}")
@@ -636,13 +718,22 @@ class RayParallelOptimizer:
             print()
             print("  Aggregate Statistics:")
             print(
-                f"    Min RSS range: [{aggregate_stats['min_metric_dbm']:.2f}, "
+                f"    P5 RSS range: [{aggregate_stats['min_metric_dbm']:.2f}, "
                 f"{aggregate_stats['max_metric_dbm']:.2f}] dBm"
             )
             print(
-                f"    Mean Min RSS: {aggregate_stats['mean_metric_dbm']:.2f} "
+                f"    Mean P5 RSS: {aggregate_stats['mean_metric_dbm']:.2f} "
                 f"+/- {aggregate_stats['std_metric_dbm']:.2f} dBm"
             )
+            if "mean_percentile_dbm" in aggregate_stats:
+                print(
+                    f"    5th percentile range: [{aggregate_stats['min_percentile_dbm']:.2f}, "
+                    f"{aggregate_stats['max_percentile_dbm']:.2f}] dBm"
+                )
+                print(
+                    f"    Mean 5th percentile: {aggregate_stats['mean_percentile_dbm']:.2f} "
+                    f"+/- {aggregate_stats['std_percentile_dbm']:.2f} dBm"
+                )
             print()
             print("  Performance:")
             print(f"    Mean time per task: {aggregate_stats['mean_time_per_task']:.2f}s")
@@ -677,7 +768,7 @@ class RayParallelOptimizer:
 
         Creates a 2x2 figure for each task that has history data:
         1. Position trajectory (start, end, best marked)
-        2. Min RSS over iterations (best iteration highlighted)
+        2. P5 RSS over iterations (best iteration highlighted)
         3. Coverage over iterations
         4. Gradient norm (log scale)
 
@@ -691,7 +782,7 @@ class RayParallelOptimizer:
             position_bounds: Optional dict with 'x_min', 'x_max', 'y_min', 'y_max'
                 to set consistent axis limits on position plots across all tasks.
             rss_range_dbm: Optional tuple (min_dbm, max_dbm) to set consistent
-                y-axis limits on Min RSS plots across all tasks and methods.
+                y-axis limits on P5 RSS plots across all tasks and methods.
 
         Returns:
             List of saved file paths.
@@ -747,7 +838,7 @@ class RayParallelOptimizer:
             fig, axes = plt.subplots(2, 2, figsize=(14, 11))
             fig.suptitle(
                 f"Task #{task_id} — Gradient Descent Trajectory\n"
-                f"Best Min RSS: {task_result['best_metric_dbm']:.2f} dBm "
+                f"Best P5 RSS: {task_result['best_metric_dbm']:.2f} dBm "
                 f"at iteration {best_iter + 1}"
                 f"{orientation_lines}",
                 fontsize=11,
@@ -816,7 +907,7 @@ class RayParallelOptimizer:
             ax.grid(True, alpha=0.3)
             ax.set_aspect("equal", adjustable="box")
 
-            # 2. Min RSS over iterations
+            # 2. P5 RSS over iterations
             ax = axes[0, 1]
             if min_rss_dbm_values:
                 iters = list(range(1, len(min_rss_dbm_values) + 1))
@@ -833,8 +924,8 @@ class RayParallelOptimizer:
             if rss_range_dbm:
                 ax.set_ylim(rss_range_dbm[0], rss_range_dbm[1])
             ax.set_xlabel("Iteration")
-            ax.set_ylabel("Min RSS (dBm)")
-            ax.set_title("Minimum RSS Evolution")
+            ax.set_ylabel("5th Percentile RSS (dBm)")
+            ax.set_title("5th Percentile RSS Evolution")
             ax.legend(fontsize=9)
             ax.grid(True, alpha=0.3)
 
@@ -898,7 +989,7 @@ class RayParallelOptimizer:
         self,
         results: Dict[str, Any],
         save_path: str,
-        metric_name: str = "Min RSS",
+        metric_name: str = "P5 RSS",
         position_bounds: Optional[Dict[str, float]] = None,
         rss_range_dbm: Optional[tuple] = None,
     ) -> None:
@@ -906,8 +997,8 @@ class RayParallelOptimizer:
         Save visualization of parallel optimization results to a file.
 
         Creates a 2x2 figure:
-        1. Min RSS distribution across tasks (dBm)
-        2. Final positions scatter plot (color = Min RSS dBm)
+        1. P5 RSS distribution across tasks (dBm)
+        2. Final positions scatter plot (color = P5 RSS dBm)
         3. Time per task bar chart
         4. Summary statistics text
 
@@ -918,7 +1009,7 @@ class RayParallelOptimizer:
             position_bounds: Optional dict with 'x_min', 'x_max', 'y_min', 'y_max'
                 to set consistent axis limits on the positions scatter plot.
             rss_range_dbm: Optional tuple (min_dbm, max_dbm) to set consistent
-                axis limits on Min RSS histogram and colorbar across methods.
+                axis limits on P5 RSS histogram and colorbar across methods.
         """
         import matplotlib
 
@@ -934,7 +1025,24 @@ class RayParallelOptimizer:
         metrics_dbm = [r["best_metric_dbm"] for r in all_results]
         best_dbm = best_result["best_metric_dbm"]
 
-        # 1. Distribution of final Min RSS (dBm)
+        percentile_dbm = [
+            r.get("grid_results", {}).get("percentile_score_dbm")
+            for r in all_results
+        ]
+        percentile_dbm = [float(v) for v in percentile_dbm if v is not None]
+        has_percentile = len(percentile_dbm) > 0
+        best_pct_dbm = best_result.get("grid_results", {}).get("percentile_score_dbm")
+
+        best_reflector_pos = (
+            best_result.get("reflector_position")
+            or best_result.get("grid_results", {}).get("reflector_position")
+        )
+        best_reflector_target = (
+            best_result.get("reflector_target")
+            or best_result.get("grid_results", {}).get("reflector_target")
+        )
+
+        # 1. Distribution of final P5 RSS (dBm)
         ax = axes[0, 0]
         hist_range = rss_range_dbm if rss_range_dbm else None
         ax.hist(
@@ -952,11 +1060,11 @@ class RayParallelOptimizer:
             ax.set_xlim(rss_range_dbm[0], rss_range_dbm[1])
         ax.set_xlabel(f"{metric_name} (dBm)")
         ax.set_ylabel("Number of Tasks")
-        ax.set_title("Distribution of Min RSS Across Tasks")
+        ax.set_title("Distribution of P5 RSS Across Tasks")
         ax.legend()
         ax.grid(True, alpha=0.3)
 
-        # 2. Final positions scatter (color = Min RSS dBm)
+        # 2. Final positions scatter (color = P5 RSS dBm)
         ax = axes[0, 1]
         sample_pos = all_results[0]["best_position"]
         _is_multi_ap = (
@@ -1013,6 +1121,26 @@ class RayParallelOptimizer:
                         arrowprops=dict(arrowstyle="->", color="red", lw=2.5),
                         zorder=7,
                     )
+            # Overlay reflector placement and focal target for best task
+            if best_reflector_pos is not None:
+                rp = np.asarray(best_reflector_pos)
+                ax.plot(
+                    rp[0], rp[1], marker="X", color="magenta", markersize=14,
+                    markeredgecolor="black", label="Reflector", zorder=8,
+                )
+            if best_reflector_target is not None:
+                rt = np.asarray(best_reflector_target)
+                ax.plot(
+                    rt[0], rt[1], marker="P", color="orange", markersize=13,
+                    markeredgecolor="black", label="Focal Point", zorder=8,
+                )
+            if best_reflector_pos is not None and best_reflector_target is not None:
+                rp = np.asarray(best_reflector_pos)
+                rt = np.asarray(best_reflector_target)
+                ax.plot(
+                    [rp[0], rt[0]], [rp[1], rt[1]], "--", color="magenta",
+                    linewidth=1.5, alpha=0.8, label="Reflector→Focal", zorder=7,
+                )
         else:
             positions = np.array([r["best_position"] for r in all_results])
             scatter = ax.scatter(
@@ -1047,12 +1175,31 @@ class RayParallelOptimizer:
                     arrowprops=dict(arrowstyle="->", color="red", lw=2.5),
                     zorder=7,
                 )
+            if best_reflector_pos is not None:
+                rp = np.asarray(best_reflector_pos)
+                ax.plot(
+                    rp[0], rp[1], marker="X", color="magenta", markersize=14,
+                    markeredgecolor="black", label="Reflector", zorder=8,
+                )
+            if best_reflector_target is not None:
+                rt = np.asarray(best_reflector_target)
+                ax.plot(
+                    rt[0], rt[1], marker="P", color="orange", markersize=13,
+                    markeredgecolor="black", label="Focal Point", zorder=8,
+                )
+            if best_reflector_pos is not None and best_reflector_target is not None:
+                rp = np.asarray(best_reflector_pos)
+                rt = np.asarray(best_reflector_target)
+                ax.plot(
+                    [rp[0], rt[0]], [rp[1], rt[1]], "--", color="magenta",
+                    linewidth=1.5, alpha=0.8, label="Reflector→Focal", zorder=7,
+                )
         if position_bounds:
             ax.set_xlim(position_bounds["x_min"], position_bounds["x_max"])
             ax.set_ylim(position_bounds["y_min"], position_bounds["y_max"])
         ax.set_xlabel("X Position (m)")
         ax.set_ylabel("Y Position (m)")
-        ax.set_title("Final Positions (color = Min RSS dBm)")
+        ax.set_title("Final Positions (color = P5 RSS dBm)")
         plt.colorbar(scatter, ax=ax, label=f"{metric_name} (dBm)")
         ax.legend()
         ax.grid(True, alpha=0.3)
@@ -1085,20 +1232,29 @@ class RayParallelOptimizer:
             f"\n"
             f"Best Task: #{best_result['task_id']} "
             f"(Worker #{best_result['worker_id']})\n"
-            f"Best Position: {_fmt_pos(best_result['best_position'])}\n"
-            f"Best Direction: {_fmt_dir(best_result.get('best_direction'))}\n"
-            f"Best Min RSS: {best_dbm_val:.2f} dBm\n"
+            f"Best AP Position(s): {_fmt_pos(best_result['best_position'])}\n"
+            f"Best AP Direction(s): {_fmt_dir(best_result.get('best_direction'))}\n"
+            f"Best Reflector Position: {_fmt_pos(best_reflector_pos)}\n"
+            f"Best Reflector Focal Point: {_fmt_pos(best_reflector_target)}\n"
+            f"Best P5 RSS: {best_dbm_val:.2f} dBm\n"
+        )
+        if best_pct_dbm is not None:
+            summary += f"Best 5th Percentile: {float(best_pct_dbm):.2f} dBm\n"
+        summary += (
             f"\n"
-            f"Min RSS Statistics (dBm):\n"
+            f"P5 RSS Statistics (dBm):\n"
             f"  Mean: {stats['mean_metric_dbm']:.2f} +/- {stats['std_metric_dbm']:.2f}\n"
             f"  Range: [{stats['min_metric_dbm']:.2f}, {stats['max_metric_dbm']:.2f}]\n"
-            # f"\n"
-            # f"Performance:\n"
-            # f"  Avg time/task: {stats['mean_time_per_task']:.2f}s\n"
-            # f"  Sequential: {stats['total_sequential_time']:.2f}s\n"
-            # f"  Wall-clock: {stats['total_wall_clock_time']:.2f}s\n"
-            # f"  Speedup: {stats['speedup']:.2f}x"
         )
+        if has_percentile:
+            summary += (
+                f"\n"
+                f"5th Percentile Statistics (dBm):\n"
+                f"  Mean: {stats.get('mean_percentile_dbm', float('nan')):.2f} +/- "
+                f"{stats.get('std_percentile_dbm', float('nan')):.2f}\n"
+                f"  Range: [{stats.get('min_percentile_dbm', float('nan')):.2f}, "
+                f"{stats.get('max_percentile_dbm', float('nan')):.2f}]\n"
+            )
         ax.text(
             0.1,
             0.5,
@@ -1138,16 +1294,13 @@ def generate_random_initial_positions(
     fixed_z: float = 3.8,
     seed: Optional[int] = None,
 ) -> List[np.ndarray]:
-    """
-    Generate random initial positions for parallel optimization.
-
-    Creates diverse starting points for exploring the optimization
-    landscape, helping avoid getting trapped in poor local minima.
+    """Generate random initial positions for parallel optimization tasks.
 
     Args:
-        num_positions: Number of positions to generate.
-        bounds: Dictionary with 'x_min', 'x_max', 'y_min', 'y_max'.
-        fixed_z: Fixed z-coordinate (height).
+        num_positions: Number of random positions to generate.
+        bounds: Dictionary with spatial bounds keys
+            ``x_min``, ``x_max``, ``y_min``, ``y_max``.
+        fixed_z: Fixed height (z-coordinate) for all generated positions.
         seed: Random seed for reproducibility.
 
     Returns:

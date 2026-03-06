@@ -11,19 +11,25 @@ from .optimizers import (
     BaseAPOptimizer,
     SinglePointGridSearchOptimizer,
     generate_alternating_grid_tasks,
+    generate_reflector_grid_tasks,
     GradientDescentAPOptimizer,
     OptimizerFactory,
     create_optimizer,
 )
 from .scene_setup import setup_building_floor_scene, create_camera
+from .reflector_model import ReflectorController, create_flat_reflector_mesh
 from .metrics import (
     POWER_EPSILON,
     compute_min_rss_metric,
+    compute_p5_rss_metric,
     compute_soft_min_rss_metric,
     normalized_softmin_loss,
+    MaskedSoftMinLoss,
     compute_coverage_metric,
+    differentiable_coverage_loss,
     rss_to_dbm,
     dbm_to_rss,
+    PercentileCoverageObjective,
 )
 from .utils import compute_radio_map_with_tx_position
 from .config import (
@@ -39,20 +45,27 @@ __all__ = [
     "BaseAPOptimizer",
     "SinglePointGridSearchOptimizer",
     "generate_alternating_grid_tasks",
+    "generate_reflector_grid_tasks",
     "GradientDescentAPOptimizer",
     "OptimizerFactory",
     "create_optimizer",
     # Scene setup
     "setup_building_floor_scene",
     "create_camera",
+    # Reflector
+    "ReflectorController",
+    "create_flat_reflector_mesh",
     # Metrics
     "POWER_EPSILON",
     "compute_min_rss_metric",
+    "compute_p5_rss_metric",
     "compute_soft_min_rss_metric",
     "normalized_softmin_loss",
     "compute_coverage_metric",
+    "differentiable_coverage_loss",
     "rss_to_dbm",
     "dbm_to_rss",
+    "PercentileCoverageObjective",
     # Utils
     "compute_radio_map_with_tx_position",
     # Config

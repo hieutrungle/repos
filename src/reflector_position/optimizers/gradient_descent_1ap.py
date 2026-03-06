@@ -21,6 +21,7 @@ from .base_optimizer import BaseAPOptimizer
 from ..metrics import (
     POWER_EPSILON,
     compute_min_rss_metric,
+    compute_p5_rss_metric,
     compute_soft_min_rss_metric,
     normalized_softmin_loss,
     compute_coverage_metric,
@@ -248,7 +249,7 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
             )
         else:
             # --- Legacy hard-min loss (kept for comparison) ----------------
-            min_rss = compute_min_rss_metric(rss)
+            min_rss = compute_p5_rss_metric(rss)
             log_min_rss = rss_to_dbm(min_rss)
             loss = -log_min_rss / 100.0  # Scale down for stability
 
@@ -518,7 +519,7 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
             #     rss = torch.from_numpy(rss)
 
             # Compute metrics for logging
-            min_rss = compute_min_rss_metric(rss.cpu())
+            min_rss = compute_p5_rss_metric(rss.cpu())
             min_rss_dbm = rss_to_dbm(min_rss)
             coverage = compute_coverage_metric(rss, coverage_threshold_dbm)
 
@@ -547,7 +548,7 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
                     f"Pos: ({current_pos[0]:.2f}, {current_pos[1]:.2f}) | "
                     f"Dir: ({current_dir[0]:.3f}, {current_dir[1]:.3f}, {current_dir[2]:.3f}) | "
                     f"LookAt: ({look_at_target[0]:.2f}, {look_at_target[1]:.2f}, {look_at_target[2]:.2f}) | "
-                    f"Min RSS: {min_rss_dbm:.2f} dBm | "
+                    f"P5 RSS: {min_rss_dbm:.2f} dBm | "
                     f"Cov: {coverage:.1f}% | "
                     f"Loss: {loss.item():.2e} | "
                     f"∇pos: {pos_grad_norm:.2e} | "
@@ -642,11 +643,11 @@ class GradientDescentAPOptimizer(BaseAPOptimizer):
         ax.legend()
         ax.grid(True, alpha=0.3)
 
-        # 2. Min RSS over iterations
+        # 2. P5 RSS over iterations
         ax = axes[0, 1]
         ax.plot(self.history["min_rss_dbm_values"], "b-", linewidth=2)
         ax.set_xlabel("Iteration")
-        ax.set_ylabel("Min RSS (dBm)")
+        ax.set_ylabel("P5 RSS (dBm)")
         ax.set_title("Minimum RSS Evolution")
         ax.grid(True, alpha=0.3)
 

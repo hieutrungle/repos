@@ -2,8 +2,8 @@
 Metrics for evaluating radio map quality and coverage.
 
 This module provides functions for computing various metrics from radio maps,
-including minimum RSS, soft minimum RSS, normalized SoftMin loss, and coverage
-area calculations.
+including minimum RSS, soft minimum RSS, normalized SoftMin loss, coverage
+area calculations, and percentile-based robustness objectives.
 
 Constants:
     POWER_EPSILON: Minimum power floor (Watts) used throughout the module to
@@ -13,11 +13,12 @@ Constants:
 """
 
 import torch
+import torch.nn as nn
 
 # ---------------------------------------------------------------------------
 # Global epsilon — single source of truth for all power-floor comparisons
 # ---------------------------------------------------------------------------
-POWER_EPSILON: float = 1e-15
+POWER_EPSILON: float = 1e-16
 """Minimum receivable power (Watts).  Values below this are treated as
 numerical noise and excluded from optimisation metrics.  Also added inside
 ``log10`` / ``log`` calls to prevent ``-inf``."""
@@ -27,8 +28,10 @@ def compute_min_rss_metric(rss_map: torch.Tensor) -> torch.Tensor:
     """
     Compute the minimum RSS value in the radio map (in linear scale).
 
-    This is the optimization objective: we want to maximize the minimum RSS
-    to improve worst-case coverage.
+    .. deprecated::
+        Use :func:`compute_p5_rss_metric` instead.  The hard minimum is
+        dominated by dead-zone artefacts (e.g. reflector shadows) and is
+        no longer used as the primary optimisation objective.
 
     Args:
         rss_map: Radio map RSS tensor (in Watts) - PyTorch tensor
@@ -45,6 +48,34 @@ def compute_min_rss_metric(rss_map: torch.Tensor) -> torch.Tensor:
 
     # Return minimum RSS (we want to maximize this)
     return torch.min(valid_rss)
+
+
+def compute_p5_rss_metric(rss_map: torch.Tensor) -> torch.Tensor:
+    """
+    Compute the 5th-percentile RSS value in the radio map (linear Watts).
+
+    This is the **primary optimisation objective**: maximise the 5th-percentile
+    RSS to improve worst-case coverage while ignoring the small fraction of
+    grid cells that fall inside physical dead zones (e.g. reflector shadows).
+
+    The 5th percentile is robust against the ~2-5 % of cells typically
+    shadowed by a passive reflector, unlike the hard minimum which is
+    always trapped inside the dead zone.
+
+    Args:
+        rss_map: Radio map RSS tensor (in Watts) - PyTorch tensor.  Any
+            shape; will be flattened internally.
+
+    Returns:
+        5th-percentile RSS value (scalar tensor, linear Watts).
+    """
+    valid_mask = rss_map > POWER_EPSILON
+    valid_rss = rss_map[valid_mask]
+
+    if valid_rss.numel() == 0:
+        return torch.tensor(0.0, dtype=torch.float32)
+
+    return torch.quantile(valid_rss.float(), 0.05)
 
 
 def compute_soft_min_rss_metric(
@@ -217,3 +248,345 @@ def normalized_softmin_loss(
 
     # -- Step 4: Mean over batch -------------------------------------------
     return loss_per_sample.mean()
+
+
+# ---------------------------------------------------------------------------
+# Masked SoftMin Loss (shadow-aware, for reflector environments)
+# ---------------------------------------------------------------------------
+
+class MaskedSoftMinLoss(nn.Module):
+    """Shadow-aware differentiable soft-min loss for reflector environments.
+
+    Standard soft-min losses treat every grid cell equally, which fails when
+    a passive reflector creates a permanent RF dead zone (shadow) covering
+    2-5 % of the map.  This module **masks out** the lowest-signal cells
+    before computing the soft-min, so the optimiser focuses on improvable
+    coverage rather than the immovable shadow.
+
+    Architectural Constraints
+    -------------------------
+    1. **Differentiable masking via** ``detach()``:  The quantile threshold
+       used to identify shadow cells is computed with
+       ``torch.quantile(...).detach()``.  Gradients flow through the
+       *values* of surviving cells but **not** through the mask boundary,
+       preventing the optimiser from gaming the masking criterion.
+
+    2. **Loss minimisation = maximising minimum signal**:  The returned value
+       is ``-soft_min`` so that ``minimise(loss) ≡ maximise(soft_min) ≡
+       maximise(worst-case signal strength)``.
+
+    3. **Temperature tuning & numerical stability**:  The ``temperature``
+       parameter *τ* controls how closely the soft-min approximates the true
+       ``min()``.  Lower *τ* → sharper approximation (same convention as
+       :func:`normalized_softmin_loss`).  The ratio
+       ``max(|score|) / τ`` must stay below ~80 to avoid overflow inside
+       ``logsumexp``.  For dBm-normalised scores in [0, 1], *τ* ∈ [0.02, 0.2]
+       is generally safe.  A ``RuntimeWarning`` is emitted when the ratio
+       approaches the stability threshold.
+
+    Parameters
+    ----------
+    shadow_quantile : float
+        Fraction of lowest-signal cells to exclude (the reflector shadow).
+        Must be in (0, 1).  Default **0.05** (excludes bottom 5 %).
+    temperature : float
+        Soft-min sharpness (τ).  Lower → closer to true ``min()``.
+        Same convention as :func:`normalized_softmin_loss`.
+        Default **0.1**.
+    floor_dbm : float
+        dBm value mapped to normalised score 0.0 ("dead zone").
+        Default −120.
+    ceil_dbm : float
+        dBm value mapped to normalised score 1.0 ("strong signal").
+        Default −60.
+
+    Example::
+
+        >>> loss_fn = MaskedSoftMinLoss(shadow_quantile=0.05, temperature=0.1)
+        >>> rss = torch.tensor([1e-11, 1e-12, 1e-13, 1e-16])
+        >>> loss = loss_fn(rss)
+        >>> loss.backward()   # gradients flow cleanly
+    """
+
+    _LOGSUMEXP_SAFE: float = 80.0  # max_score / τ threshold for overflow warning
+
+    def __init__(
+        self,
+        shadow_quantile: float = 0.05,
+        temperature: float = 0.1,
+        floor_dbm: float = -120.0,
+        ceil_dbm: float = -60.0,
+    ) -> None:
+        super().__init__()
+        if not (0.0 < shadow_quantile < 1.0):
+            raise ValueError(
+                f"shadow_quantile must be in (0, 1), got {shadow_quantile}"
+            )
+        if temperature <= 0:
+            raise ValueError(f"temperature must be positive, got {temperature}")
+        self.shadow_quantile = shadow_quantile
+        self.temperature = temperature
+        self.floor_dbm = floor_dbm
+        self.ceil_dbm = ceil_dbm
+
+    def forward(self, rss_watts: torch.Tensor) -> torch.Tensor:
+        """Compute the masked soft-min loss.
+
+        Parameters
+        ----------
+        rss_watts : torch.Tensor
+            Radio-map RSS in **linear Watts**.  Any shape; flattened
+            internally.
+
+        Returns
+        -------
+        torch.Tensor
+            Scalar loss to **minimise**.  Lower ⇒ better worst-case
+            coverage among non-shadow cells.
+        """
+        flat = rss_watts.flatten()
+
+        # Exclude numerical-noise cells
+        valid_mask = flat > POWER_EPSILON
+        valid = flat[valid_mask]
+
+        if valid.numel() == 0:
+            return torch.tensor(
+                0.0, device=rss_watts.device, dtype=rss_watts.dtype,
+                requires_grad=True,
+            )
+
+        # -- Watts → dBm → [0, 1] normalised scores -----------------------
+        valid_dbm = 10.0 * torch.log10(valid + POWER_EPSILON) + 30.0
+        span = self.ceil_dbm - self.floor_dbm
+        scores = (valid_dbm - self.floor_dbm) / span
+        scores = torch.clamp(scores, min=0.0, max=1.0)
+
+        # -- Constraint 1: detached quantile mask --------------------------
+        # .detach() severs gradient through the threshold itself so the
+        # optimiser cannot shift the mask boundary to cheat.
+        threshold = torch.quantile(scores, self.shadow_quantile).detach()
+        mask = scores > threshold
+        valid_scores = scores[mask]
+
+        if valid_scores.numel() == 0:
+            return torch.tensor(
+                0.0, device=rss_watts.device, dtype=rss_watts.dtype,
+                requires_grad=True,
+            )
+
+        # -- Constraint 3: numerical-stability check -----------------------
+        tau = self.temperature
+        max_val = float(valid_scores.max().item())
+        if max_val / tau > self._LOGSUMEXP_SAFE:
+            import warnings
+            warnings.warn(
+                f"MaskedSoftMinLoss: max_score/τ = {max_val / tau:.1f} > "
+                f"{self._LOGSUMEXP_SAFE}.  Risk of numerical overflow in "
+                f"logsumexp.  Consider increasing temperature (currently {tau}) "
+                f"or widening the dBm normalisation window.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+        # -- Constraint 2: soft-min via logsumexp --------------------------
+        # soft_min ≈ min(valid_scores) as τ → 0
+        # Same formula as normalized_softmin_loss:
+        #   loss = τ · logsumexp(-s / τ)
+        soft_min = -tau * torch.logsumexp(-valid_scores / tau, dim=0)
+
+        # Minimise -soft_min  ≡  maximise soft_min  ≡  maximise worst-case
+        return -soft_min
+
+
+# ---------------------------------------------------------------------------
+# Differentiable Coverage Loss (Sigmoid approximation)
+# ---------------------------------------------------------------------------
+
+def differentiable_coverage_loss(
+    rssi_watts: torch.Tensor,
+    threshold_dbm: float = -120.0,
+    temperature: float = 2.0,
+) -> torch.Tensor:
+    """Smooth, differentiable loss for maximising coverage percentage.
+
+    Approximates the hard indicator ``1[RSSI > threshold]`` with a
+    **Sigmoid** function so that gradients are non-zero near the threshold.
+    This allows gradient-descent to *push* users whose signal strength is
+    just below the threshold over the line.
+
+    **Why not ``compute_coverage_metric``?**
+    That function uses a hard ``(rss > threshold).float()`` step whose
+    gradient is identically **zero** everywhere—useless for optimisation.
+
+    Pipeline::
+
+        Watts ──► dBm (ε-safe) ──► diff = dBm − threshold
+              ──► σ(diff / τ) ──► mean ──► 1 − mean  (loss)
+
+    Args:
+        rssi_watts: Tensor of received power **in linear Watts**.  Any shape;
+            will be flattened internally.  Values ≤ ``POWER_EPSILON`` are
+            kept (sigmoid maps them close to 0 automatically).
+        threshold_dbm: Target coverage threshold in dBm (default −120).
+        temperature: Sigmoid sharpness.  Low (0.1) ≈ hard step (vanishing
+            gradient); high (2–5) ≈ smooth slope (better for learning).
+            Default **2.0** is a good starting point.
+
+    Returns:
+        Scalar loss to **minimise** (``1.0 − soft_coverage_ratio``).
+        Range ≈ [0, 1].  Lower ⇒ more users above threshold.
+
+    Example::
+
+        >>> rssi = torch.tensor([1e-11, 1e-12, 1e-13, 1e-15])
+        >>> loss = differentiable_coverage_loss(rssi, threshold_dbm=-120.0)
+        >>> loss.backward()          # gradients flow cleanly
+    """
+    # Flatten to 1-D
+    rssi_flat = rssi_watts.flatten()
+
+    # Watts → dBm with epsilon safety
+    rssi_dbm = 10.0 * torch.log10(rssi_flat + POWER_EPSILON) + 30.0
+
+    # Distance from threshold (positive = covered)
+    diff = rssi_dbm - threshold_dbm
+
+    # Sigmoid soft-count: ≈1 if covered, ≈0 if not
+    soft_coverage_mask = torch.sigmoid(diff / temperature)
+
+    # Soft coverage ratio
+    soft_coverage_ratio = torch.mean(soft_coverage_mask)
+
+    # Return loss to minimise (1 − coverage)
+    return 1.0 - soft_coverage_ratio
+
+
+# ---------------------------------------------------------------------------
+# Percentile Coverage Objective (derivative-free)
+# ---------------------------------------------------------------------------
+
+class PercentileCoverageObjective(nn.Module):
+    """Derivative-free objective targeting a specific quantile of the coverage map.
+
+    Standard minimum-signal (0th-percentile) objectives fail when a passive
+    reflector is present because the reflector casts a perfect RF shadow
+    (dead zone) behind it.  The absolute minimum is always inside this
+    physical shadow and traps the optimiser.
+
+    This objective evaluates the *q*-th quantile of the power map instead,
+    effectively ignoring the small fraction of the grid swallowed by the
+    shadow.
+
+    Shadow-Area Constraint
+    ~~~~~~~~~~~~~~~~~~~~~~
+    The chosen ``target_quantile`` **must** be strictly larger than the
+    fraction of grid cells covered by the reflector's physical shadow.
+    For example, if a 2 m × 2 m reflector shadows ≈ 3 % of the room
+    area, setting ``target_quantile = 0.02`` would still evaluate cells
+    inside the dead zone, defeating the purpose.  A safe rule of thumb:
+
+    .. math::
+
+        q_{\\text{target}} > \\frac{A_{\\text{shadow}}}{A_{\\text{room}}}
+
+    The constructor enforces a *minimum* quantile (default 0.02) and
+    emits a warning when the value is suspiciously low.
+
+    Parameters
+    ----------
+    target_quantile : float
+        Percentile to evaluate, in [0, 1].  Default **0.05** (5th
+        percentile).  Must exceed the shadow-area fraction.
+    mode : str
+        ``"maximize"`` — higher score ⇒ better coverage (default for
+        GA / grid search fitness).
+        ``"minimize"`` — returns the negative score so that lower ⇒ better
+        (for loss-based minimisers).
+    shadow_fraction : float, optional
+        Estimated fraction of the grid area covered by the reflector's
+        shadow.  When provided, the constructor validates that
+        ``target_quantile > shadow_fraction`` and raises ``ValueError``
+        otherwise.  This is a soft safety net; callers should compute the
+        true shadow fraction from their geometry when possible.
+    """
+
+    def __init__(
+        self,
+        target_quantile: float = 0.05,
+        mode: str = "maximize",
+        shadow_fraction: float | None = None,
+    ) -> None:
+        super().__init__()
+        if not (0.0 <= target_quantile <= 1.0):
+            raise ValueError(
+                f"target_quantile must be in [0, 1], got {target_quantile}"
+            )
+        if mode not in ("maximize", "minimize"):
+            raise ValueError(f"mode must be 'maximize' or 'minimize', got {mode!r}")
+
+        # --- Shadow-area safety check ---
+        if shadow_fraction is not None:
+            if not (0.0 <= shadow_fraction < 1.0):
+                raise ValueError(
+                    f"shadow_fraction must be in [0, 1), got {shadow_fraction}"
+                )
+            if target_quantile <= shadow_fraction:
+                raise ValueError(
+                    f"target_quantile ({target_quantile}) must be strictly "
+                    f"larger than shadow_fraction ({shadow_fraction}).  "
+                    f"Otherwise the quantile still evaluates cells inside "
+                    f"the reflector's RF dead zone."
+                )
+
+        import warnings
+
+        _MIN_SENSIBLE_QUANTILE = 0.02
+        if target_quantile < _MIN_SENSIBLE_QUANTILE:
+            warnings.warn(
+                f"target_quantile={target_quantile} is very low.  With a "
+                f"typical reflector the physical shadow covers 2–5 % of the "
+                f"room.  A quantile below that threshold will still evaluate "
+                f"dead-zone cells.  Consider using ≥ 0.05.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        self.target_quantile = target_quantile
+        self.mode = mode
+
+    def forward(self, coverage_map: torch.Tensor) -> torch.Tensor:
+        """Evaluate the percentile objective on a coverage map.
+
+        Parameters
+        ----------
+        coverage_map : torch.Tensor
+            Signal-strength grid.  Accepted shapes:
+            - 2-D ``(H, W)`` — single grid evaluation.
+            - 3-D ``(B, H, W)`` — batched evaluation (one score per grid).
+            Values should be in **linear Watts** or **dBm**; the quantile
+            operation is order-preserving so the unit does not affect the
+            ranking, only the absolute score.
+
+        Returns
+        -------
+        torch.Tensor
+            Scalar (single grid) or ``(B,)`` tensor of fitness scores.
+            Higher ⇒ better when ``mode="maximize"``; lower ⇒ better when
+            ``mode="minimize"``.
+        """
+        if not coverage_map.is_floating_point():
+            coverage_map = coverage_map.float()
+
+        # Batched input: (B, H, W) → (B, H*W)
+        if coverage_map.dim() > 2:
+            flat_maps = coverage_map.view(coverage_map.size(0), -1)
+            score = torch.quantile(flat_maps, self.target_quantile, dim=1)
+        else:
+            flat_map = coverage_map.view(-1)
+            score = torch.quantile(flat_map, self.target_quantile)
+
+        if self.mode == "minimize":
+            return -score
+
+        return score
