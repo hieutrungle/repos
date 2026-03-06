@@ -1,28 +1,50 @@
 """
-Entry point: Run Genetic Algorithm with modular Ray evaluation.
+Entry point: Run Genetic Algorithm with modular evaluation.
 
-Wires together:
-    - ``RayActorPoolExecutor`` (execution engine — manages Ray ActorPool)
-    - ``GeneticAlgorithmRunner``  (algorithm logic — pure DEAP, no Ray imports)
+Supports two execution modes via ``--mode``:
 
-The executor's ``map`` method is injected into the GA runner via DEAP's
-``toolbox.register("map", executor.map)``.  This Inversion of Control (IoC)
-pattern strictly separates the execution engine from the algorithm logic,
-preventing freeze issues caused by ``map_unordered`` and resource contention.
+``local`` (default)
+    Single-process evaluation.  Loads the Scene once and evaluates all
+    individuals sequentially.  No Ray dependency — ideal for debugging,
+    profiling, and quick smoke tests.
+
+``ray``
+    Distributed evaluation via ``RayActorPoolExecutor``.  Spawns a pool
+    of persistent actors, each holding its own Scene, and distributes
+    fitness evaluations across workers automatically.
+
+In both modes the ``GeneticAlgorithmRunner`` (pure DEAP, no Ray imports)
+is identical — only the injected ``executor_map`` changes.
+
+When ``--reflector`` is passed the chromosome is extended with 4 extra
+genes ``[u, v, focal_x, focal_y]`` that control a passive mechanical
+reflector attached to a wall surface.  The fitness objective switches
+to a shadow-robust 5th-percentile metric via ``PercentileCoverageObjective``.
 
 Usage::
 
-    python examples/run_ga_modular.py
+    # Quick local test (small pop, few generations)
+    python examples/run_ga_modular.py --mode local
+
+    # Full distributed run
+    python examples/run_ga_modular.py --mode ray
+
+    # Custom parameters
+    python examples/run_ga_modular.py --mode local --pop-size 20 --n-gen 5
+
+    # Joint AP + reflector optimisation
+    python examples/run_ga_modular.py --mode ray --reflector
 """
 
+import argparse
 import json
 import os
+import time
 from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Tuple
 
-import ray
-
-from reflector_position.optimizers.ray_evaluator import RayActorPoolExecutor
 from reflector_position.optimizers.deap_logic import GeneticAlgorithmRunner
+
 
 # ===========================================================================
 # Configuration (matches ray_parallel_example.py Example 3)
@@ -32,18 +54,29 @@ SCENE_PATH = (
     Path.home() / "blender" / "models" / "building_floor" / "building_floor.xml"
 )
 
-SCENE_CONFIG = {
+SCENE_CONFIG_1AP = {
     "scene_path": str(SCENE_PATH),
     "frequency": 5.18e9,
     "tx_power_dbm": 5.0,
-    # tx_positions and rx_position use defaults from setup_building_floor_scene
 }
+
+FIXED_Z = 3.8
+INITIAL_AP_POSITIONS_2AP = [(7.0, 7.0), (23.0, 23.0)]
+
+SCENE_CONFIG_2AP = {
+    **SCENE_CONFIG_1AP,
+    "tx_positions": [
+        (pos[0], pos[1], FIXED_Z) for pos in INITIAL_AP_POSITIONS_2AP
+    ],
+}
+
+MIN_AP_SEPARATION = 5.0
 
 POSITION_BOUNDS = {
     "x_min": 5.0,
-    "x_max": 25.0,
+    "x_max": 35.0,
     "y_min": 5.0,
-    "y_max": 25.0,
+    "y_max": 35.0,
 }
 
 OUTPUT_DIR = "results/ray_parallel"
@@ -62,6 +95,8 @@ GA_PARAMS = {
     "cx_alpha": 0.5,
     "mut_mu": 0.0,
     "mut_sigma": 2.0,
+    "mut_sigma_pos": 2.0,
+    "mut_sigma_dir": 0.3,
     "mut_indpb": 0.2,
     "hof_size": 5,
 }
@@ -71,6 +106,218 @@ OPTIMIZATION_PARAMS = {
     "max_depth": 13,
     "verbose": False,
 }
+
+# ===========================================================================
+# Reflector configuration (defaults for --reflector mode)
+# ===========================================================================
+
+# Wall bounding box (top-left and bottom-right 3-D corners)
+# Example: a vertical wall segment spanning y=0, x ∈ [5, 25], z ∈ [0.5, 3.5]
+REFLECTOR_WALL_TOP_LEFT = [5.0, 0.0, 3.5]
+REFLECTOR_WALL_BOTTOM_RIGHT = [25.0, 0.0, 0.5]
+
+# Reflector panel dimensions (metres)
+REFLECTOR_SIZE = (2.0, 2.0)
+
+# Fixed z for the focal point (typically receiver height)
+FOCAL_Z = 1.5
+
+# Focal-point search bounds (horizontal plane)
+FOCAL_BOUNDS = {
+    "fx_min": 5.0,
+    "fx_max": 35.0,
+    "fy_min": 5.0,
+    "fy_max": 35.0,
+}
+
+# Shadow-robust quantile for the PercentileCoverageObjective
+PERCENTILE_TARGET_QUANTILE = 0.05
+
+
+# ===========================================================================
+# Local (single-process) executor
+# ===========================================================================
+
+
+class LocalExecutor:
+    """
+    Single-process executor that mimics the ``RayActorPoolExecutor`` interface.
+
+    Loads the Scene once, then evaluates individuals sequentially using
+    ``OptimizerFactory``.  Compatible with DEAP's ``toolbox.register("map", ...)``
+    pattern via the :meth:`map` method.
+
+    When ``reflector_enabled=True`` in the scene config, the returned
+    ``ReflectorController`` is attached to every optimizer created during
+    :meth:`map`, matching the behaviour of the Ray ``OptimizationWorker``.
+    """
+
+    def __init__(
+        self,
+        scene_config: Dict[str, Any],
+        verbose: bool = True,
+    ):
+        from reflector_position.scene_setup import setup_building_floor_scene
+
+        if verbose:
+            print("  Loading scene (single-process mode) ...")
+
+        loaded = setup_building_floor_scene(
+            scene_path=str(scene_config["scene_path"]),
+            frequency=scene_config.get("frequency", 5.18e9),
+            tx_positions=scene_config.get("tx_positions", None),
+            tx_power_dbm=scene_config.get("tx_power_dbm", 5.0),
+            rx_position=scene_config.get("rx_position", (16.0, 6.5, 1.5)),
+            reflector_enabled=scene_config.get("reflector_enabled", False),
+            reflector_size=tuple(
+                scene_config.get("reflector_size", (2.0, 2.0)),
+            ),
+            wall_top_left=scene_config.get("wall_top_left", None),
+            wall_bottom_right=scene_config.get("wall_bottom_right", None),
+            focal_point=scene_config.get("focal_point", None),
+            device=scene_config.get("device", "cuda"),
+        )
+
+        # Unpack scene and optional reflector controller
+        if isinstance(loaded, tuple) and len(loaded) == 2:
+            self.scene, self.reflector_controller = loaded
+        else:
+            self.scene = loaded
+            self.reflector_controller = None
+
+        if verbose:
+            refl_tag = (
+                " + ReflectorController"
+                if self.reflector_controller is not None
+                else ""
+            )
+            print(f"  Scene loaded{refl_tag}.")
+
+    def map(
+        self,
+        func: Callable,
+        iterable: Iterable,
+    ) -> List[Dict[str, Any]]:
+        """Evaluate items sequentially — drop-in replacement for Ray pool.map."""
+        from reflector_position.optimizers.optimizer_factory import OptimizerFactory
+
+        import numpy as np
+        import torch
+
+        items = list(iterable)
+        if not items:
+            return []
+
+        task_args = [func(item) for item in items]
+        results: List[Dict[str, Any]] = []
+
+        for task_id, method, kwargs, opt_params in task_args:
+            kwargs_local = dict(kwargs)
+
+            # Attach per-executor reflector controller (mirrors Ray worker)
+            if (
+                self.reflector_controller is not None
+                and "reflector_controller" not in kwargs_local
+            ):
+                kwargs_local["reflector_controller"] = (
+                    self.reflector_controller
+                )
+
+            # Construct PercentileCoverageObjective from scalar quantile
+            if (
+                "percentile_target_quantile" in kwargs_local
+                and "percentile_objective" not in kwargs_local
+            ):
+                from reflector_position.metrics import (
+                    PercentileCoverageObjective,
+                )
+
+                kwargs_local["percentile_objective"] = (
+                    PercentileCoverageObjective(
+                        target_quantile=float(
+                            kwargs_local.pop("percentile_target_quantile")
+                        ),
+                        mode="maximize",
+                    )
+                )
+
+            optimizer = OptimizerFactory.create(
+                method=method,
+                scene=self.scene,
+                **kwargs_local,
+            )
+            start = time.time()
+
+            # Wrap in no_grad for derivative-free (GA) evaluation
+            with torch.no_grad():
+                result_tuple = optimizer.optimize(**opt_params)
+
+            elapsed = time.time() - start
+
+            # Unpack — matches OptimizationWorker.optimize() output format.
+            result_orientation = None
+            if isinstance(result_tuple, tuple) and len(result_tuple) == 3:
+                final_position, result_orientation, final_metric = result_tuple
+            elif isinstance(result_tuple, tuple) and len(result_tuple) == 2:
+                final_position, final_metric = result_tuple
+            else:
+                final_position = None
+                final_metric = float("-inf")
+
+            best_position = (
+                np.asarray(final_position).tolist()
+                if final_position is not None
+                else [0.0, 0.0, 0.0]
+            )
+            best_direction = (
+                np.asarray(result_orientation).tolist()
+                if result_orientation is not None
+                else None
+            )
+            metric_linear = (
+                float(final_metric) if final_metric is not None else 0.0
+            )
+
+            result_dict: Dict[str, Any] = {
+                "task_id": task_id,
+                "worker_id": 0,
+                "best_position": best_position,
+                "best_metric": metric_linear,
+                "best_direction": best_direction,
+                "time_elapsed": elapsed,
+                "grid_results": (
+                    {
+                        k: v
+                        for k, v in optimizer.results.items()
+                        if k != "radio_maps"
+                    }
+                    if hasattr(optimizer, "results")
+                    else {}
+                ),
+            }
+
+            # Reflector metadata (mirrors Ray worker output)
+            if self.reflector_controller is not None:
+                result_dict["reflector_u"] = kwargs_local.get(
+                    "reflector_u",
+                )
+                result_dict["reflector_v"] = kwargs_local.get(
+                    "reflector_v",
+                )
+                result_dict["reflector_target"] = kwargs_local.get(
+                    "reflector_target",
+                )
+                result_dict["reflector_position"] = (
+                    self.reflector_controller.get_position().tolist()
+                )
+
+            results.append(result_dict)
+
+        return results
+
+    def shutdown(self) -> None:
+        """No-op for single-process mode."""
+        print("  Local executor shut down (no-op).")
 
 
 # ===========================================================================
@@ -84,16 +331,88 @@ def _save_ga_results(results: dict, path: str) -> None:
         "best_individual": results["best_individual"],
         "best_fitness": results["best_fitness"],
         "best_fitness_dbm": results["best_fitness_dbm"],
-        "best_position": results["best_position"],
+        "optimize_orientation": results.get("optimize_orientation"),
+        "num_aps": results.get("num_aps", 1),
         "hall_of_fame": results["hall_of_fame"],
         "total_time": results["total_time"],
         "total_evaluations": results["total_evaluations"],
         "ga_params": results["ga_params"],
         "generation_details": results["generation_details"],
     }
+    # 1-AP fields
+    if "best_position" in results:
+        serializable["best_position"] = results["best_position"]
+        serializable["best_direction"] = results.get("best_direction")
+    # Multi-AP fields
+    if "best_positions" in results:
+        serializable["best_positions"] = results["best_positions"]
+        serializable["best_directions"] = results.get("best_directions")
+        serializable["best_ap_separation"] = results.get("best_ap_separation")
+    # Reflector fields
+    if results.get("reflector_enabled"):
+        serializable["reflector_enabled"] = True
+        serializable["best_reflector"] = results.get("best_reflector")
+        serializable["percentile_target_quantile"] = results.get(
+            "percentile_target_quantile",
+        )
     with open(path, "w") as f:
         json.dump(serializable, f, indent=2, default=str)
     print(f"GA results saved to: {path}")
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run GA for AP position & orientation optimization.",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["local", "ray"],
+        default="local",
+        help="Execution mode: 'local' (single-process) or 'ray' (distributed). "
+             "Default: local.",
+    )
+    parser.add_argument("--pop-size", type=int, default=None, help="Population size.")
+    parser.add_argument("--n-gen", type=int, default=None, help="Number of generations.")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed.")
+    parser.add_argument(
+        "--no-orientation",
+        action="store_true",
+        help="Disable orientation optimization (legacy 2-gene mode).",
+    )
+    parser.add_argument(
+        "--num-aps",
+        type=int,
+        default=1,
+        choices=[1, 2],
+        help="Number of Access Points to optimise (1 or 2). Default: 1.",
+    )
+    parser.add_argument(
+        "--min-sep",
+        type=float,
+        default=None,
+        help="Minimum AP separation in metres (only for num_aps>=2). "
+             "Default: 2.0.",
+    )
+    parser.add_argument(
+        "--reflector",
+        action="store_true",
+        help="Enable passive reflector optimisation (+4 genes: u, v, fx, fy).",
+    )
+    parser.add_argument(
+        "--quantile",
+        type=float,
+        default=None,
+        help="Percentile target quantile for PercentileCoverageObjective. "
+             "Default: 0.05 (5th percentile).",
+    )
+    parser.add_argument(
+        "--focal-z",
+        type=float,
+        default=None,
+        help="Fixed z-coordinate for the reflector focal point. "
+             "Default: 1.5 (receiver height).",
+    )
+    return parser.parse_args()
 
 
 # ===========================================================================
@@ -102,58 +421,154 @@ def _save_ga_results(results: dict, path: str) -> None:
 
 
 if __name__ == "__main__":
-    # Initialize Ray once
-    ray.init(ignore_reinit_error=True)
+    args = _parse_args()
 
-    print("=" * 80)
-    print("MODULAR GA: RayActorPoolExecutor + GeneticAlgorithmRunner (IoC)")
-    print("=" * 80)
+    # Override GA params from CLI if provided
+    ga_params = dict(GA_PARAMS)
+    if args.pop_size is not None:
+        ga_params["pop_size"] = args.pop_size
+    if args.n_gen is not None:
+        ga_params["n_gen"] = args.n_gen
 
-    # 1. Create the execution engine (Ray ActorPool)
-    executor = RayActorPoolExecutor(
-        scene_config=SCENE_CONFIG,
-        num_workers=NUM_POOL_WORKERS,
-        gpu_fraction=GPU_FRACTION,
-        verbose=True,
+    optimize_orientation = not args.no_orientation
+    num_aps = args.num_aps
+    min_ap_separation = args.min_sep if args.min_sep is not None else MIN_AP_SEPARATION
+    reflector_enabled = args.reflector
+    focal_z = args.focal_z if args.focal_z is not None else FOCAL_Z
+    percentile_target_quantile = (
+        args.quantile if args.quantile is not None else PERCENTILE_TARGET_QUANTILE
     )
 
-    # 2. Create the algorithm runner, injecting executor.map
-    ga = GeneticAlgorithmRunner(
-        position_bounds=POSITION_BOUNDS,
-        fixed_z=3.8,
-        executor_map=executor.map,  # <--- Dependency Injection
+    # Select scene config based on num_aps
+    scene_config = dict(
+        SCENE_CONFIG_2AP if num_aps >= 2 else SCENE_CONFIG_1AP,
     )
 
-    try:
-        # 3. Run the GA
-        results = ga.run(
-            optimization_params=OPTIMIZATION_PARAMS,
-            ga_params=GA_PARAMS,
-            seed=42,
+    # Merge reflector params into scene config
+    if reflector_enabled:
+        scene_config.update({
+            "reflector_enabled": True,
+            "reflector_size": REFLECTOR_SIZE,
+            "wall_top_left": REFLECTOR_WALL_TOP_LEFT,
+            "wall_bottom_right": REFLECTOR_WALL_BOTTOM_RIGHT,
+            "focal_point": [15.0, 15.0, focal_z],  # initial focal point
+        })
+
+    print("=" * 80)
+    mode_label = "LOCAL (single-process)" if args.mode == "local" else "RAY (distributed)"
+    if num_aps == 1:
+        n_ap_genes = 4 if optimize_orientation else 2
+    else:
+        n_ap_genes = num_aps * 4 if optimize_orientation else num_aps * 2
+    n_refl_genes = 4 if reflector_enabled else 0
+    n_total_genes = n_ap_genes + n_refl_genes
+    gene_desc = f"{n_total_genes}D [AP"
+    if optimize_orientation:
+        gene_desc += "+orient"
+    if reflector_enabled:
+        gene_desc += "+reflector"
+    gene_desc += "]"
+    print(
+        f"MODULAR GA: {mode_label} | Chromosome: {gene_desc} | APs: {num_aps}"
+        + (f" | Reflector: ON (q={percentile_target_quantile})" if reflector_enabled else "")
+    )
+    print("=" * 80)
+
+    # -- Create executor ------------------------------------------------
+    executor: Any  # LocalExecutor or RayActorPoolExecutor
+    if args.mode == "local":
+        executor = LocalExecutor(
+            scene_config=scene_config,
+            verbose=True,
+        )
+    else:
+        import ray
+        from reflector_position.optimizers.ray_evaluator import RayActorPoolExecutor
+
+        ray.init(ignore_reinit_error=True)
+        executor = RayActorPoolExecutor(
+            scene_config=scene_config,
+            num_workers=NUM_POOL_WORKERS,
+            gpu_fraction=GPU_FRACTION,
             verbose=True,
         )
 
-        # 4. Save results
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
-        _save_ga_results(results, os.path.join(OUTPUT_DIR, "ga_modular_results.json"))
+    # -- Create GA runner -----------------------------------------------
+    ga_kwargs: Dict[str, Any] = dict(
+        position_bounds=POSITION_BOUNDS,
+        fixed_z=FIXED_Z,
+        executor_map=executor.map,
+        optimize_orientation=optimize_orientation,
+        num_aps=num_aps,
+        min_ap_separation=min_ap_separation,
+    )
+    if reflector_enabled:
+        ga_kwargs.update(
+            reflector_enabled=True,
+            focal_bounds=FOCAL_BOUNDS,
+            focal_z=focal_z,
+            percentile_target_quantile=percentile_target_quantile,
+        )
+    ga = GeneticAlgorithmRunner(**ga_kwargs)
 
-        # 5. Save evolution plot
+    try:
+        # -- Run GA -----------------------------------------------------
+        results = ga.run(
+            optimization_params=OPTIMIZATION_PARAMS,
+            ga_params=ga_params,
+            seed=args.seed,
+            verbose=True,
+        )
+
+        # -- Save results -----------------------------------------------
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        suffix = "local" if args.mode == "local" else "ray"
+        _save_ga_results(
+            results,
+            os.path.join(OUTPUT_DIR, f"ga_modular_{suffix}_results.json"),
+        )
+
+        # -- Save evolution plot ----------------------------------------
         ga.save_evolution_plot(
             results,
-            save_path=os.path.join(OUTPUT_DIR, "ga_modular_evolution.png"),
+            save_path=os.path.join(OUTPUT_DIR, f"ga_modular_{suffix}_evolution.png"),
             position_bounds=POSITION_BOUNDS,
             rss_range_dbm=RSS_RANGE_DBM,
         )
 
-        # 6. Summary
-        print(f"\nGenetic Algorithm ({GA_PARAMS['pop_size']} pop, "
-              f"{GA_PARAMS['n_gen']} gen):")
-        print(f"  Best position: {results['best_position']}")
-        print(f"  Best Min RSS:  {results['best_fitness_dbm']:.2f} dBm")
-        print(f"  Total evals:   {results['total_evaluations']}")
-        print(f"  Wall-clock:    {results['total_time']:.2f}s")
+        # -- Summary ----------------------------------------------------
+        refl_tag = f", reflector={'ON' if reflector_enabled else 'OFF'}" if reflector_enabled else ""
+        print(f"\nGenetic Algorithm ({ga_params['pop_size']} pop, "
+              f"{ga_params['n_gen']} gen, mode={args.mode}, "
+              f"APs={num_aps}{refl_tag}):")
+        if num_aps == 1:
+            print(f"  Best position:  {results['best_position']}")
+            bd = results.get("best_direction")
+            if bd:
+                print(f"  Best direction: ({bd[0]:+.4f}, {bd[1]:+.4f}, {bd[2]:+.4f})")
+        else:
+            for ap_idx in range(num_aps):
+                pos = results['best_positions'][ap_idx]
+                print(f"  AP{ap_idx} position:  ({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f})")
+                bd = results.get('best_directions')
+                if bd and bd[ap_idx]:
+                    d = bd[ap_idx]
+                    print(f"  AP{ap_idx} direction: ({d[0]:+.4f}, {d[1]:+.4f}, {d[2]:+.4f})")
+            print(f"  AP separation:  {results.get('best_ap_separation', 0):.2f}m")
+        # Reflector summary
+        best_refl = results.get("best_reflector")
+        if best_refl:
+            print(f"  Reflector u,v:  ({best_refl['u']:.4f}, {best_refl['v']:.4f})")
+            print(f"  Focal point:    ({best_refl['focal_x']:.2f}, "
+                  f"{best_refl['focal_y']:.2f}, {best_refl['focal_z']:.2f})")
+        print(f"  Best P5 RSS:   {results['best_fitness_dbm']:.2f} dBm")
+        if reflector_enabled:
+            pq = results.get('percentile_target_quantile', percentile_target_quantile)
+            print(f"  Quantile:       {pq} (5th-percentile shadow-robust)")
+        print(f"  Total evals:    {results['total_evaluations']}")
+        print(f"  Wall-clock:     {results['total_time']:.2f}s")
 
     finally:
-        # 7. Clean up
         executor.shutdown()
-        ray.shutdown()
+        if args.mode == "ray":
+            ray.shutdown()
