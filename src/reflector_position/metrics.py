@@ -24,6 +24,94 @@ numerical noise and excluded from optimisation metrics.  Also added inside
 ``log10`` / ``log`` calls to prevent ``-inf``."""
 
 
+def _flatten_rss_map(rss_map: torch.Tensor) -> torch.Tensor:
+    """Flatten a radio map into a 1-D tensor for reporting metrics."""
+    return rss_map.reshape(-1)
+
+
+def _threshold_watt_like(rss_map: torch.Tensor, threshold_dbm: float) -> torch.Tensor:
+    """Return the coverage threshold in Watts on the same dtype/device as ``rss_map``."""
+    return dbm_to_rss(
+        torch.tensor(threshold_dbm, dtype=rss_map.dtype, device=rss_map.device)
+    )
+
+
+def _valid_reporting_mask(rss_map: torch.Tensor, threshold_dbm: float) -> torch.Tensor:
+    """Return the mask for cells considered valid in thresholded reporting.
+
+    A cell is report-valid when it exceeds both the numerical power floor and
+    the configured coverage threshold.
+    """
+    flat_map = _flatten_rss_map(rss_map)
+    threshold_watt = _threshold_watt_like(flat_map, threshold_dbm)
+    epsilon_floor = torch.tensor(
+        POWER_EPSILON,
+        dtype=flat_map.dtype,
+        device=flat_map.device,
+    )
+    effective_threshold = torch.maximum(threshold_watt, epsilon_floor)
+    return flat_map > effective_threshold
+
+
+def compute_thresholded_reporting_metrics(
+    rss_map: torch.Tensor,
+    threshold_dbm: float = -120.0,
+    percentile: float = 0.05,
+) -> dict[str, float]:
+    """Compute report metrics using only threshold-valid cells.
+
+    Reporting semantics:
+
+    - ``coverage_pct`` is the percentage of all grid cells whose RSS exceeds
+      the configured threshold.
+    - ``min_rss_dbm``, ``p5_rss_dbm``, and ``mean_rss_dbm`` are computed only
+      over those covered cells.
+
+    When no cells exceed the threshold, the dBm statistics fall back to the
+    threshold value itself and coverage is ``0``.
+    """
+    flat_map = _flatten_rss_map(rss_map)
+    total_cells = int(flat_map.numel())
+    if total_cells == 0:
+        return {
+            "min_rss_dbm": float(threshold_dbm),
+            "p5_rss_dbm": float(threshold_dbm),
+            "mean_rss_dbm": float(threshold_dbm),
+            "coverage_pct": 0.0,
+            "valid_cell_count": 0.0,
+            "total_cell_count": 0.0,
+        }
+
+    valid_mask = _valid_reporting_mask(flat_map, threshold_dbm)
+    valid_rss = flat_map[valid_mask]
+    valid_count = int(valid_rss.numel())
+    coverage_pct = 100.0 * valid_count / total_cells
+
+    if valid_count == 0:
+        stats_dbm = {
+            "min_rss_dbm": float(threshold_dbm),
+            "p5_rss_dbm": float(threshold_dbm),
+            "mean_rss_dbm": float(threshold_dbm),
+        }
+    else:
+        valid_dbm = rss_to_dbm(valid_rss)
+        clamped_percentile = min(max(float(percentile), 0.0), 1.0)
+        stats_dbm = {
+            "min_rss_dbm": float(valid_dbm.min().item()),
+            "p5_rss_dbm": float(
+                torch.quantile(valid_dbm.float(), clamped_percentile).item()
+            ),
+            "mean_rss_dbm": float(valid_dbm.mean().item()),
+        }
+
+    return {
+        **stats_dbm,
+        "coverage_pct": float(coverage_pct),
+        "valid_cell_count": float(valid_count),
+        "total_cell_count": float(total_cells),
+    }
+
+
 def compute_min_rss_metric(rss_map: torch.Tensor) -> torch.Tensor:
     """
     Compute the minimum RSS value in the radio map (in linear scale).
@@ -129,12 +217,9 @@ def compute_coverage_metric(
     Returns:
         Coverage percentage (0-100)
     """
-    # Convert threshold to linear scale (Watts)
-    # P_watt = 10^((P_dbm - 30) / 10)
-    threshold_watt = dbm_to_rss(torch.tensor(threshold_dbm))
-
-    # Count cells above threshold
-    above_threshold = (rss_map > threshold_watt).float()
+    flat_map = _flatten_rss_map(rss_map)
+    valid_mask = _valid_reporting_mask(flat_map, threshold_dbm)
+    above_threshold = valid_mask.float()
     coverage = torch.mean(above_threshold) * 100.0  # Convert to percentage
 
     return coverage

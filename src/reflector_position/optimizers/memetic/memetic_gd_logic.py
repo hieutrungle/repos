@@ -1,7 +1,7 @@
 """Memetic targeted GD micro-exploitation orchestration.
 
 Phase 3 module for running gradient-descent fine-tuning on a curated set of
-GA-derived seeds using an already initialized ``RayParallelOptimizer``.
+GA-derived seeds using an already initialized raw Ray optimizer.
 
 The function in this module intentionally does not initialize Ray, create actor
 pools, or mutate external orchestrator state beyond invoking
@@ -14,18 +14,13 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
-from reflector_position.metrics import POWER_EPSILON
-
-
 _GD_OPTIMIZE_PARAM_KEYS = {
     "num_iterations",
     "learning_rate",
     "samples_per_tx",
     "max_depth",
-    "use_soft_min",
+    "softmin_temperature",
     "temperature",
-    "shadow_quantile",
-    "fairness_loss_type",
     "coverage_threshold_dbm",
     "alpha",
     "beta",
@@ -38,19 +33,20 @@ _GD_OPTIMIZE_PARAM_KEYS = {
 _GD_NON_INIT_TASK_KEYS = {
     "scene_config",
     "initial_orientations",  # bridge alias (3D), GD expects initial_directions_xy
-    "reflector_target",  # bridge alias, GD expects initial_focal_point
-    "reflector_u",  # not accepted by current GD optimizer constructor
-    "reflector_v",  # not accepted by current GD optimizer constructor
-    "initial_ga_rss_dbm",  # analysis metadata
-    "ga_seed_metric_dbm",  # analysis metadata
-    "seed_fitness_dbm",  # analysis metadata
-    "initial_metric_dbm",  # analysis metadata
+    "initial_primary_loss",  # analysis metadata
 }
 
 
-def _rss_watts_to_dbm(rss_watt: float) -> float:
-    """Convert linear Watts to dBm."""
-    return 10.0 * np.log10(max(float(rss_watt), POWER_EPSILON)) + 30.0
+def _extract_history(result: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Return the standardized GD history mapping when present."""
+    history = result.get("history", {})
+    return history if isinstance(history, Mapping) else {}
+
+
+def _extract_result_summary(result: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Return the standardized GD result summary when present."""
+    summary = result.get("results", {})
+    return summary if isinstance(summary, Mapping) else {}
 
 
 def _split_task_and_opt_params(task: Mapping[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
@@ -67,53 +63,63 @@ def _split_task_and_opt_params(task: Mapping[str, Any]) -> Tuple[Dict[str, Any],
     return init_kwargs, optimize_kwargs
 
 
-def _extract_initial_metric_dbm(
+def _extract_initial_primary_loss(
     task: Mapping[str, Any],
     result: Mapping[str, Any],
 ) -> Optional[float]:
-    """Extract initial metric (dBm) for one targeted GD run.
+    """Extract the starting primary loss for one targeted GD run."""
+    task_value = task.get("initial_primary_loss")
+    if task_value is not None:
+        return float(task_value)
 
-    Priority:
-    1. Explicit GA-seed metric on task payload.
-    2. First value from GD history ``min_rss_dbm_values``.
-    3. First value from GD history ``min_rss_values`` converted to dBm.
-    """
-    for key in (
-        "initial_ga_rss_dbm",
-        "ga_seed_metric_dbm",
-        "seed_fitness_dbm",
-        "initial_metric_dbm",
-    ):
-        if key in task and task[key] is not None:
-            return float(task[key])
-
-    history = result.get("history", {})
-    if isinstance(history, Mapping):
-        dbm_series = history.get("min_rss_dbm_values")
-        if isinstance(dbm_series, Sequence) and len(dbm_series) > 0:
-            return float(dbm_series[0])
-
-        lin_series = history.get("min_rss_values")
-        if isinstance(lin_series, Sequence) and len(lin_series) > 0:
-            return _rss_watts_to_dbm(float(lin_series[0]))
+    history = _extract_history(result)
+    primary_series = history.get("primary_loss")
+    if isinstance(primary_series, Sequence) and len(primary_series) > 0:
+        return float(primary_series[0])
 
     return None
 
 
-def _extract_final_metric_dbm(result: Mapping[str, Any]) -> Optional[float]:
-    """Extract final-iteration GD metric (dBm) when available."""
-    history = result.get("history", {})
-    if isinstance(history, Mapping):
-        dbm_series = history.get("min_rss_dbm_values")
-        if isinstance(dbm_series, Sequence) and len(dbm_series) > 0:
-            return float(dbm_series[-1])
+def _extract_final_primary_loss(result: Mapping[str, Any]) -> Optional[float]:
+    """Extract the final primary loss when available."""
+    history = _extract_history(result)
+    primary_series = history.get("primary_loss")
+    if isinstance(primary_series, Sequence) and len(primary_series) > 0:
+        return float(primary_series[-1])
 
-        lin_series = history.get("min_rss_values")
-        if isinstance(lin_series, Sequence) and len(lin_series) > 0:
-            return _rss_watts_to_dbm(float(lin_series[-1]))
+    summary = _extract_result_summary(result)
+    summary_value = summary.get("final_primary_loss", summary.get("primary_loss"))
+    return float(summary_value) if summary_value is not None else None
 
-    best_dbm = result.get("best_metric_dbm")
-    return float(best_dbm) if best_dbm is not None else None
+
+def _extract_best_primary_loss(result: Mapping[str, Any]) -> Optional[float]:
+    """Extract the best observed primary loss from raw or processed payloads."""
+    history = _extract_history(result)
+    primary_series = history.get("primary_loss")
+    if isinstance(primary_series, Sequence) and len(primary_series) > 0:
+        return float(min(float(value) for value in primary_series))
+
+    summary = _extract_result_summary(result)
+    summary_value = summary.get("primary_loss")
+    return float(summary_value) if summary_value is not None else None
+
+
+def _extract_best_loss_components(result: Mapping[str, Any]) -> Dict[str, float]:
+    """Extract the best standardized auxiliary loss dictionary."""
+    summary = _extract_result_summary(result)
+    components = summary.get("loss_components")
+    if isinstance(components, Mapping):
+        return {str(name): float(value) for name, value in components.items()}
+    return {}
+
+
+def _extract_best_physical_metrics(result: Mapping[str, Any]) -> Dict[str, float]:
+    """Extract the best standardized physical metrics dictionary."""
+    summary = _extract_result_summary(result)
+    metrics = summary.get("physical_metrics")
+    if isinstance(metrics, Mapping):
+        return {str(name): float(value) for name, value in metrics.items()}
+    return {}
 
 
 def _extract_scene_config(
@@ -155,14 +161,13 @@ def run_targeted_gd_exploitation(
 
         Optional per-item metadata keys used by this function:
         - ``scene_config``: scene config dict (if optimizer has no cached scene)
-        - ``initial_ga_rss_dbm`` / ``ga_seed_metric_dbm`` / ``seed_fitness_dbm``:
-          baseline GA metric for delta reporting.
+        - ``initial_primary_loss``: optional baseline loss for delta reporting.
 
         Optional optimize-parameter keys are recognized and removed from task
         kwargs before submission, then passed as shared ``optimization_params``
         to Ray when consistent across tasks.
 
-    ray_optimizer : RayParallelOptimizer
+    ray_optimizer : RawRayParallelOptimizer
         Already instantiated distributed optimizer. This function does not
         create Ray runtime or ActorPool.
 
@@ -179,20 +184,18 @@ def run_targeted_gd_exploitation(
           "metrics": {
               "num_tasks": int,
               "num_results": int,
-              "max_improvement_db": float | None,
-              "mean_improvement_db": float | None,
-              "min_improvement_db": float | None,
-              "best_final_metric_dbm": float | None,
+              "max_loss_reduction": float | None,
+              "mean_loss_reduction": float | None,
+              "min_loss_reduction": float | None,
+              "best_primary_loss": float | None,
           },
           "per_seed_analysis": list[dict],
         }
 
     Notes
     -----
-    - Supports both result contracts:
-      1) tuple ``(best_result_dict, all_results_list)``
-      2) dict with keys ``best_result`` and ``all_results``.
-    - If ``gd_tasks`` is empty, returns empty structures and skips Ray call.
+        - Consumes raw worker outputs from ``RawRayParallelOptimizer``.
+        - If ``gd_tasks`` is empty, returns empty structures and skips Ray call.
     """
     if not gd_tasks:
         if verbose:
@@ -203,10 +206,10 @@ def run_targeted_gd_exploitation(
             "metrics": {
                 "num_tasks": 0,
                 "num_results": 0,
-                "max_improvement_db": None,
-                "mean_improvement_db": None,
-                "min_improvement_db": None,
-                "best_final_metric_dbm": None,
+                "max_loss_reduction": None,
+                "mean_loss_reduction": None,
+                "min_loss_reduction": None,
+                "best_primary_loss": None,
             },
             "per_seed_analysis": [],
                 "parallel_run_metadata": {},
@@ -223,14 +226,14 @@ def run_targeted_gd_exploitation(
         optimize_param_candidates.append(optimize_kwargs)
 
     # Ensure optimize params are consistent across tasks because
-    # RayParallelOptimizer.run accepts one shared optimization_params dict.
+    # RawRayParallelOptimizer.run accepts one shared optimization_params dict.
     optimization_params: Dict[str, Any] = optimize_param_candidates[0] if optimize_param_candidates else {}
     for i, candidate in enumerate(optimize_param_candidates[1:], start=1):
         if candidate != optimization_params:
             raise ValueError(
                 "Inconsistent per-task GD optimize parameters detected. "
                 f"Task #0 params={optimization_params}, task #{i} params={candidate}. "
-                "Use shared gd_hyperparams in bridge stage for Ray batch execution."
+                "Use shared gd_optimization_params in bridge stage for Ray batch execution."
             )
 
     if "verbose" not in optimization_params:
@@ -238,25 +241,21 @@ def run_targeted_gd_exploitation(
 
     run_output = ray_optimizer.run(
         scene_config=scene_config,
-        optimizer_method="gradient_descent",
+        optimizer_method="memetic_gd",
         work_items=init_work_items,
         optimization_params=optimization_params,
         verbose=verbose,
     )
 
     parallel_run_metadata: Dict[str, Any] = {}
-    if isinstance(run_output, tuple) and len(run_output) == 2:
-        best_result = run_output[0]
-        all_results = run_output[1]
-    elif isinstance(run_output, Mapping):
-        best_result = run_output.get("best_result")
+    if isinstance(run_output, Mapping):
         all_results = run_output.get("all_results", [])
         for key in ("aggregate_stats", "pool_info", "total_time"):
             if key in run_output:
                 parallel_run_metadata[key] = run_output[key]
     else:
         raise RuntimeError(
-            "Unsupported return type from ray_optimizer.run(). Expected tuple or mapping."
+            "Unsupported return type from ray_optimizer.run(). Expected mapping."
         )
 
     if not isinstance(all_results, list):
@@ -278,89 +277,113 @@ def run_targeted_gd_exploitation(
         if result is None:
             analysis = {
                 "seed_index": idx,
-                "initial_ga_rss_dbm": None,
-                "final_gd_rss_dbm": None,
-                "delta_improvement_db": None,
+                "initial_primary_loss": None,
+                "best_primary_loss": None,
+                "final_primary_loss": None,
+                "delta_loss": None,
+                "delta_best_loss": None,
+                "loss_components": {},
+                "physical_metrics": {},
                 "status": "missing_result",
             }
             per_seed_analysis.append(analysis)
             continue
 
-        initial_dbm = _extract_initial_metric_dbm(original_task, result)
-        best_dbm = float(result.get("best_metric_dbm")) if result.get("best_metric_dbm") is not None else None
-        final_dbm = _extract_final_metric_dbm(result)
-        delta_best_db = (best_dbm - initial_dbm) if (best_dbm is not None and initial_dbm is not None) else None
-        delta_final_db = (final_dbm - initial_dbm) if (final_dbm is not None and initial_dbm is not None) else None
+        initial_primary_loss = _extract_initial_primary_loss(original_task, result)
+        best_primary_loss = _extract_best_primary_loss(result)
+        final_primary_loss = _extract_final_primary_loss(result)
+        delta_best_loss = (
+            initial_primary_loss - best_primary_loss
+            if (best_primary_loss is not None and initial_primary_loss is not None)
+            else None
+        )
+        delta_loss = (
+            initial_primary_loss - final_primary_loss
+            if (final_primary_loss is not None and initial_primary_loss is not None)
+            else None
+        )
 
-        if delta_best_db is not None:
-            deltas.append(float(delta_best_db))
+        if delta_loss is not None:
+            deltas.append(float(delta_loss))
 
         analysis = {
             "seed_index": idx,
             "task_id": int(result.get("task_id", idx)),
             "worker_id": result.get("worker_id"),
-            "initial_ga_rss_dbm": initial_dbm,
-            "best_gd_rss_dbm": best_dbm,
-            "final_gd_rss_dbm": final_dbm,
-            "delta_improvement_db": delta_best_db,
-            "delta_best_improvement_db": delta_best_db,
-            "delta_final_improvement_db": delta_final_db,
+            "initial_primary_loss": initial_primary_loss,
+            "best_primary_loss": best_primary_loss,
+            "final_primary_loss": final_primary_loss,
+            "delta_loss": delta_loss,
+            "delta_best_loss": delta_best_loss,
+            "loss_components": _extract_best_loss_components(result),
+            "physical_metrics": _extract_best_physical_metrics(result),
             "status": "ok",
         }
         per_seed_analysis.append(analysis)
 
-    # Identify absolute global optimum by final GD metric.
+    # Identify absolute global optimum by the minimum observed primary loss.
     global_best_result: Optional[Dict[str, Any]] = None
-    best_final_metric_dbm: Optional[float] = None
+    best_primary_loss: Optional[float] = None
     for res in all_results:
-        res_dbm = res.get("best_metric_dbm")
-        if res_dbm is None:
+        res_loss = _extract_best_primary_loss(res)
+        if res_loss is None:
             continue
-        res_dbm = float(res_dbm)
-        if best_final_metric_dbm is None or res_dbm > best_final_metric_dbm:
-            best_final_metric_dbm = res_dbm
+        res_loss = float(res_loss)
+        if best_primary_loss is None or res_loss < best_primary_loss:
+            best_primary_loss = res_loss
             global_best_result = res
 
     metrics = {
         "num_tasks": len(gd_tasks),
         "num_results": len(all_results),
-        "max_improvement_db": float(max(deltas)) if deltas else None,
-        "mean_improvement_db": float(np.mean(deltas)) if deltas else None,
-        "min_improvement_db": float(min(deltas)) if deltas else None,
-        "best_final_metric_dbm": best_final_metric_dbm,
+        "max_loss_reduction": float(max(deltas)) if deltas else None,
+        "mean_loss_reduction": float(np.mean(deltas)) if deltas else None,
+        "min_loss_reduction": float(min(deltas)) if deltas else None,
+        "best_primary_loss": best_primary_loss,
     }
 
     if verbose:
         print("\n" + "=" * 80)
         print("TARGETED GD MICRO-EXPLOITATION SUMMARY")
         print("=" * 80)
-        print("Seed | Initial GA (dBm) | Best GD (dBm) | Delta_best (dB)")
+        print("Seed | Initial Loss | Best Loss | Final Loss | Delta")
         print("-" * 80)
         for row in per_seed_analysis:
             seed_idx = row["seed_index"]
-            init_dbm = row["initial_ga_rss_dbm"]
-            fin_dbm = row["best_gd_rss_dbm"]
-            delta_db = row["delta_best_improvement_db"]
+            initial_value = row["initial_primary_loss"]
+            best_value = row["best_primary_loss"]
+            final_value = row["final_primary_loss"]
+            delta_value = row["delta_loss"]
 
-            init_txt = f"{init_dbm:>16.2f}" if init_dbm is not None else "       N/A       "
-            fin_txt = f"{fin_dbm:>14.2f}" if fin_dbm is not None else "      N/A      "
-            delta_txt = f"{delta_db:>10.2f}" if delta_db is not None else "   N/A    "
-            print(f"{seed_idx:>4d} | {init_txt} | {fin_txt} | {delta_txt}")
+            initial_txt = f"{initial_value:>12.6f}" if initial_value is not None else "    N/A     "
+            best_txt = f"{best_value:>9.6f}" if best_value is not None else "   N/A   "
+            final_txt = f"{final_value:>10.6f}" if final_value is not None else "    N/A   "
+            delta_txt = f"{delta_value:>10.6f}" if delta_value is not None else "   N/A    "
+            print(f"{seed_idx:>4d} | {initial_txt} | {best_txt} | {final_txt} | {delta_txt}")
+
+            loss_components = row.get("loss_components", {})
+            if isinstance(loss_components, Mapping) and loss_components:
+                for name, value in loss_components.items():
+                    print(f"     component {name}: {float(value):.6f}")
 
         print("-" * 80)
         print(
-            "Max/Mean/Min Delta (dB): "
-            f"{metrics['max_improvement_db'] if metrics['max_improvement_db'] is not None else 'N/A'} / "
-            f"{metrics['mean_improvement_db'] if metrics['mean_improvement_db'] is not None else 'N/A'} / "
-            f"{metrics['min_improvement_db'] if metrics['min_improvement_db'] is not None else 'N/A'}"
+            "Max/Mean/Min Loss Reduction: "
+            f"{metrics['max_loss_reduction'] if metrics['max_loss_reduction'] is not None else 'N/A'} / "
+            f"{metrics['mean_loss_reduction'] if metrics['mean_loss_reduction'] is not None else 'N/A'} / "
+            f"{metrics['min_loss_reduction'] if metrics['min_loss_reduction'] is not None else 'N/A'}"
         )
         if global_best_result is not None:
             print(
                 "Global best GD: "
                 f"task #{global_best_result.get('task_id')} | "
                 f"worker #{global_best_result.get('worker_id')} | "
-                f"best_metric_dbm={float(global_best_result.get('best_metric_dbm')):.2f}"
+                f"primary_loss={float(best_primary_loss):.6f}"
             )
+            best_components = _extract_best_loss_components(global_best_result)
+            if best_components:
+                for name, value in best_components.items():
+                    print(f"  {name}: {value:.6f}")
         else:
             print("Global best GD: N/A")
         print("=" * 80)

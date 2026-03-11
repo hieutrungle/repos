@@ -12,13 +12,11 @@ Key additions over baseline GA runner:
 Design notes
 ------------
 - No Ray imports here. Parallelism is injected through ``executor_map`` via
-  ``toolbox.register("map", executor_map)``.
-- Fitness maximization uses the *inverted composite loss* from the worker
-  (``softmin_fitness = -total_loss``), aligning the GA landscape with the
-  GD smoothed objective.  ``best_metric`` (linear Watts) is kept for
-  human-readable logging only.
+    ``toolbox.register("map", executor_map)``.
+- Fitness maximization uses the worker's generic ``primary_fitness`` value,
+    aligning the GA landscape with the GD objective contract.
 - Distance filtering compares AP coordinates only (macro topology), ignoring
-  AP orientation and reflector genes by design.
+    AP orientation and reflector genes by design.
 """
 
 from __future__ import annotations
@@ -26,12 +24,10 @@ from __future__ import annotations
 import random
 import time
 from dataclasses import asdict, dataclass
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 from deap import base, creator, tools
-
-from reflector_position.metrics import POWER_EPSILON
 
 # ---------------------------------------------------------------------------
 # DEAP creator types (module-safe)
@@ -44,10 +40,7 @@ if not hasattr(creator, "MemeticIndividual"):
 
 FIXED_DIR_Z_DEFAULT = -0.5
 PENALTY_FITNESS_LINEAR = 1e-100
-# Penalty used when softmin_fitness is the GA objective.  Must be far below
-# any achievable inverted-loss value so penalized individuals are never
-# selected by tournament selection.
-PENALTY_SOFTMIN_FITNESS: float = -1e15
+PENALTY_PRIMARY_FITNESS: float = -1e15
 MIN_AP_SEPARATION_DEFAULT = 2.0
 DEFAULT_HOF_SIZE = 50
 DEFAULT_K_SEEDS = 5
@@ -62,10 +55,8 @@ class MemeticSeed:
     ----------
     rank : int
         Rank in the selected seed list (1-indexed).
-    fitness : float
-        GA fitness in linear Watts.
-    fitness_dbm : float
-        GA fitness converted to dBm.
+    primary_fitness : float
+        GA fitness equal to the negative primary loss.
     ap_positions : list[tuple[float, float, float]]
         Decoded AP coordinates.
     ap_directions : list[tuple[float, float, float]] | None
@@ -74,26 +65,90 @@ class MemeticSeed:
         Reflector genes (u, v, focal_x, focal_y, focal_z) when enabled.
     chromosome : list[float]
         Full raw chromosome values for reproducibility.
-    coverage : float
-        Coverage metric copied from worker output when available.
+    loss_components : dict[str, float]
+        Detached auxiliary loss components reported by the worker.
+    physical_metrics : dict[str, float]
+        Detached observation metrics reported by the worker.
     min_distance_to_previous : float | None
         Minimum topological distance to previously accepted seeds.
     """
 
     rank: int
-    fitness: float
-    fitness_dbm: float
+    primary_fitness: float
     ap_positions: List[Tuple[float, float, float]]
     ap_directions: Optional[List[Tuple[float, float, float]]]
     reflector: Optional[Dict[str, float]]
     chromosome: List[float]
-    coverage: float
+    loss_components: Dict[str, float]
+    physical_metrics: Dict[str, float]
     min_distance_to_previous: Optional[float]
 
 
-def _rss_watts_to_dbm(rss_watt: float) -> float:
-    """Convert RSS from linear Watts to dBm."""
-    return 10.0 * np.log10(max(float(rss_watt), POWER_EPSILON)) + 30.0
+def _extract_result_primary_fitness(result: Mapping[str, Any]) -> float:
+    """Extract GA fitness from the standardized evaluator payload."""
+    fitness = result.get("primary_fitness")
+    if fitness is not None:
+        return float(fitness)
+    return PENALTY_PRIMARY_FITNESS
+
+
+def _extract_result_loss_components(result: Mapping[str, Any]) -> Dict[str, float]:
+    """Extract detached auxiliary loss components from the evaluator payload."""
+    loss_components = result.get("loss_components")
+    if isinstance(loss_components, Mapping):
+        return {
+            str(name): float(value)
+            for name, value in loss_components.items()
+            if value is not None
+        }
+    return {}
+
+
+def _extract_result_physical_metrics(result: Mapping[str, Any]) -> Dict[str, float]:
+    """Extract detached observation metrics from the evaluator payload."""
+    physical_metrics = result.get("physical_metrics")
+    if isinstance(physical_metrics, Mapping):
+        return {
+            str(name): float(value)
+            for name, value in physical_metrics.items()
+            if value is not None
+        }
+    return {}
+
+
+def _compile_generation_stats(population: Sequence[Any]) -> Dict[str, float | int]:
+    """Compile GA generation stats while excluding infeasible penalties from means.
+
+    Infeasible individuals keep the large negative penalty fitness so selection
+    pressure remains intact, but reporting means over those values is not
+    informative. This helper reports the best score over the full population
+    while computing mean/std/min over feasible individuals only.
+    """
+    all_values = [
+        float(ind.fitness.values[0])
+        for ind in population
+        if getattr(ind.fitness, "valid", False)
+    ]
+    feasible_values = [
+        float(ind.fitness.values[0])
+        for ind in population
+        if getattr(ind.fitness, "valid", False) and not getattr(ind, "penalized", False)
+    ]
+
+    if not all_values:
+        raise RuntimeError("Population contains no valid fitness values.")
+
+    stat_values = feasible_values if feasible_values else all_values
+    penalized_count = max(0, len(all_values) - len(feasible_values))
+    return {
+        "max": float(np.max(all_values)),
+        "mean": float(np.mean(stat_values)),
+        "std": float(np.std(stat_values)),
+        "min": float(np.min(stat_values)),
+        "feasible_count": int(len(feasible_values)),
+        "penalized_count": int(penalized_count),
+        "mean_population": float(np.mean(all_values)),
+    }
 
 
 def _normalize_direction(
@@ -332,15 +387,13 @@ class MemeticGeneticAlgorithmRunner:
 
             seed = MemeticSeed(
                 rank=len(selected) + 1,
-                fitness=float(candidate.fitness.values[0]),
-                fitness_dbm=float(
-                    getattr(candidate, "best_metric_dbm", -999.0)
-                ),
+                primary_fitness=float(candidate.fitness.values[0]),
                 ap_positions=self._extract_positions(candidate),
                 ap_directions=self._extract_directions(candidate),
                 reflector=self._extract_reflector(candidate),
                 chromosome=[float(g) for g in candidate],
-                coverage=float(getattr(candidate, "best_coverage", 0.0)),
+                loss_components=dict(getattr(candidate, "loss_components", {})),
+                physical_metrics=dict(getattr(candidate, "physical_metrics", {})),
                 min_distance_to_previous=min_dist,
             )
             selected.append(seed)
@@ -360,50 +413,57 @@ class MemeticGeneticAlgorithmRunner:
         task_id = self._task_counter
         self._task_counter += 1
 
-        if self.num_aps == 1:
-            optimizer_kwargs: Dict[str, Any] = {
-                "evaluation_position": (float(individual[0]), float(individual[1])),
-                "fixed_z": self.fixed_z,
-            }
-            if self.optimize_orientation:
-                dx, dy = float(individual[2]), float(individual[3])
-                optimizer_kwargs["evaluation_orientation"] = _normalize_direction(
-                    dx,
-                    dy,
-                    self.fixed_dir_z,
+        task_kwargs: Dict[str, Any] = {
+            "initial_positions": [
+                (
+                    float(individual[2 * ap_idx]),
+                    float(individual[2 * ap_idx + 1]),
                 )
-        else:
-            positions = [
-                (float(individual[2 * ap_idx]), float(individual[2 * ap_idx + 1]))
+                for ap_idx in range(self.num_aps)
+            ],
+            "fixed_z": self.fixed_z,
+            "samples_per_tx": int(self._opt_params.get("samples_per_tx", 1_000_000)),
+            "max_depth": int(self._opt_params.get("max_depth", 13)),
+            "loss_kwargs": {
+                "alpha": float(self._opt_params.get("alpha", 0.6)),
+                "beta": float(self._opt_params.get("beta", 0.4)),
+                "softmin_temperature": float(
+                    self._opt_params.get(
+                        "softmin_temperature",
+                        self._opt_params.get("temperature", 0.1),
+                    )
+                ),
+                "coverage_threshold_dbm": float(
+                    self._opt_params.get("coverage_threshold_dbm", -100.0)
+                ),
+                "coverage_temperature": float(
+                    self._opt_params.get("coverage_temperature", 2.0)
+                ),
+            },
+        }
+
+        if self.optimize_orientation:
+            dir_base = self._n_pos_genes
+            task_kwargs["initial_directions_xy"] = [
+                _normalize_direction(
+                    float(individual[dir_base + 2 * ap_idx]),
+                    float(individual[dir_base + 2 * ap_idx + 1]),
+                    self.fixed_dir_z,
+                )[:2]
                 for ap_idx in range(self.num_aps)
             ]
-            optimizer_kwargs = {
-                "evaluation_positions": positions,
-                "fixed_z": self.fixed_z,
-            }
-            if self.optimize_orientation:
-                dir_base = self._n_pos_genes
-                optimizer_kwargs["evaluation_orientations"] = [
-                    _normalize_direction(
-                        float(individual[dir_base + 2 * ap_idx]),
-                        float(individual[dir_base + 2 * ap_idx + 1]),
-                        self.fixed_dir_z,
-                    )
-                    for ap_idx in range(self.num_aps)
-                ]
 
         if self.reflector_enabled:
             rg = self._reflector_gene_start
-            optimizer_kwargs["reflector_u"] = float(individual[rg])
-            optimizer_kwargs["reflector_v"] = float(individual[rg + 1])
-            optimizer_kwargs["reflector_target"] = (
+            task_kwargs["reflector_u"] = float(individual[rg])
+            task_kwargs["reflector_v"] = float(individual[rg + 1])
+            task_kwargs["reflector_target"] = (
                 float(individual[rg + 2]),
                 float(individual[rg + 3]),
                 self.focal_z,
             )
-            optimizer_kwargs["percentile_target_quantile"] = self.percentile_target_quantile
 
-        return (task_id, "grid_search_point", optimizer_kwargs, self._opt_params)
+        return (task_id, "memetic_eval", task_kwargs, {})
 
     def _clamp_individual(self, individual: Sequence[float]) -> None:
         """Clamp chromosome values in-place to valid bounds."""
@@ -451,33 +511,24 @@ class MemeticGeneticAlgorithmRunner:
                     penalized_inds.append(ind)
 
             for ind in penalized_inds:
-                ind.fitness.values = (PENALTY_SOFTMIN_FITNESS,)
+                ind.fitness.values = (PENALTY_PRIMARY_FITNESS,)
                 ind.penalized = True
-                ind.best_coverage = 0.0
-                ind.best_metric_dbm = -999.0
+                ind.loss_components = {}
+                ind.physical_metrics = {}
         else:
             valid_inds = invalid_ind
 
         if valid_inds:
             results = toolbox.map(toolbox.evaluate, valid_inds)
             for ind, res in zip(valid_inds, results):
-                # Use the inverted composite loss as GA fitness so that
-                # the GA landscape is aligned with the GD smoothed
-                # objective. Fall back to a heavily penalised value when
-                # the worker does not return softmin_fitness.
+                # Use the standardized primary fitness so the GA follows the
+                # same objective contract as the downstream local search.
                 ind.fitness.values = (
-                    float(res.get("softmin_fitness", PENALTY_SOFTMIN_FITNESS)),
+                    _extract_result_primary_fitness(res),
                 )
                 ind.penalized = False
-
-                # Keep physical P5 RSS metric for human-readable logging.
-                ind.best_metric_dbm = float(
-                    res.get("best_metric_dbm", -999.0)
-                )
-
-                grid_results = res.get("grid_results", {})
-                cov_values = grid_results.get("coverage_values", [])
-                ind.best_coverage = float(cov_values[-1]) if cov_values else 0.0
+                ind.loss_components = _extract_result_loss_components(res)
+                ind.physical_metrics = _extract_result_physical_metrics(res)
 
         return len(invalid_ind)
 
@@ -619,14 +670,17 @@ class MemeticGeneticAlgorithmRunner:
         toolbox.register("map", self._executor_map)
         toolbox.register("evaluate", self._format_individual)
 
-        stats = tools.Statistics(lambda ind: ind.fitness.values[0])
-        stats.register("max", np.max)
-        stats.register("mean", np.mean)
-        stats.register("std", np.std)
-        stats.register("min", np.min)
-
         logbook = tools.Logbook()
-        logbook.header = ["gen", "nevals", "max", "mean", "std", "min", "max_dbm", "mean_dbm"]
+        logbook.header = [
+            "gen",
+            "nevals",
+            "max",
+            "mean",
+            "std",
+            "min",
+            "feasible_count",
+            "penalized_count",
+        ]
 
         hof = tools.HallOfFame(maxsize=hof_size)
 
@@ -634,35 +688,31 @@ class MemeticGeneticAlgorithmRunner:
         total_evaluations = 0
         generation_details: List[Dict[str, Any]] = []
 
+        # Initial evaluation of the randomly generated population
+        
         nevals = self._evaluate_invalid(population, toolbox)
         total_evaluations += nevals
         hof.update(population)
 
-        record = stats.compile(population)
-        # dBm stats from stored physical metric (not from fitness, which is
-        # now the inverted composite loss).
-        _dbm_vals = [
-            getattr(ind, "best_metric_dbm", -999.0)
-            for ind in population
-            if ind.fitness.valid
-        ]
-        record["max_dbm"] = float(np.max(_dbm_vals)) if _dbm_vals else -999.0
-        record["mean_dbm"] = float(np.mean(_dbm_vals)) if _dbm_vals else -999.0
+        record = _compile_generation_stats(population)
         logbook.record(gen=0, nevals=nevals, **record)
         generation_details.append(
             {
                 "gen": 0,
                 "nevals": nevals,
-                "max_dbm": record["max_dbm"],
-                "mean_dbm": record["mean_dbm"],
-                "std": record["std"],
+                "best_primary_fitness": float(record["max"]),
+                "mean_primary_fitness": float(record["mean"]),
+                "std": float(record["std"]),
+                "feasible_count": int(record["feasible_count"]),
+                "penalized_count": int(record["penalized_count"]),
+                "mean_population_fitness": float(record["mean_population"]),
             }
         )
 
         if verbose:
             print(
-                f"  Gen  0 | evals={nevals:>3d} | best={record['max_dbm']:.2f} dBm | "
-                f"mean={record['mean_dbm']:.2f} dBm"
+                f"  Gen  0 | evals={nevals:>3d} | best={record['max']:.6f} | "
+                f"mean={record['mean']:.6f} | penalized={record['penalized_count']}"
             )
 
         for gen in range(1, n_gen + 1):
@@ -690,14 +740,7 @@ class MemeticGeneticAlgorithmRunner:
             population[:] = offspring
             hof.update(population)
 
-            record = stats.compile(population)
-            _dbm_vals = [
-                getattr(ind, "best_metric_dbm", -999.0)
-                for ind in population
-                if ind.fitness.valid
-            ]
-            record["max_dbm"] = float(np.max(_dbm_vals)) if _dbm_vals else -999.0
-            record["mean_dbm"] = float(np.mean(_dbm_vals)) if _dbm_vals else -999.0
+            record = _compile_generation_stats(population)
             logbook.record(gen=gen, nevals=nevals, **record)
 
             gen_time = time.time() - gen_start
@@ -705,17 +748,21 @@ class MemeticGeneticAlgorithmRunner:
                 {
                     "gen": gen,
                     "nevals": nevals,
-                    "max_dbm": record["max_dbm"],
-                    "mean_dbm": record["mean_dbm"],
-                    "std": record["std"],
+                    "best_primary_fitness": float(record["max"]),
+                    "mean_primary_fitness": float(record["mean"]),
+                    "std": float(record["std"]),
+                    "feasible_count": int(record["feasible_count"]),
+                    "penalized_count": int(record["penalized_count"]),
+                    "mean_population_fitness": float(record["mean_population"]),
                     "time": gen_time,
                 }
             )
 
             if verbose:
                 print(
-                    f"  Gen {gen:>2d} | evals={nevals:>3d} | best={record['max_dbm']:.2f} dBm | "
-                    f"mean={record['mean_dbm']:.2f} dBm | time={gen_time:.1f}s"
+                    f"  Gen {gen:>2d} | evals={nevals:>3d} | best={record['max']:.6f} | "
+                    f"mean={record['mean']:.6f} | penalized={record['penalized_count']} | "
+                    f"time={gen_time:.1f}s"
                 )
 
         total_time = time.time() - start_time
@@ -735,11 +782,9 @@ class MemeticGeneticAlgorithmRunner:
             hall_of_fame.append(
                 {
                     "rank": i,
-                    "fitness": float(ind.fitness.values[0]),
-                    "fitness_dbm": float(
-                        getattr(ind, "best_metric_dbm", -999.0)
-                    ),
-                    "coverage": float(getattr(ind, "best_coverage", 0.0)),
+                    "primary_fitness": float(ind.fitness.values[0]),
+                    "loss_components": dict(getattr(ind, "loss_components", {})),
+                    "physical_metrics": dict(getattr(ind, "physical_metrics", {})),
                     "ap_positions": self._extract_positions(ind),
                     "ap_directions": self._extract_directions(ind),
                     "reflector": self._extract_reflector(ind),
@@ -751,12 +796,10 @@ class MemeticGeneticAlgorithmRunner:
             "num_aps": self.num_aps,
             "optimize_orientation": self.optimize_orientation,
             "reflector_enabled": self.reflector_enabled,
-            "best_fitness": float(best.fitness.values[0]),
-            "best_fitness_dbm": float(
-                getattr(best, "best_metric_dbm", -999.0)
-            ),
+            "best_primary_fitness": float(best.fitness.values[0]),
             "best_individual": [float(g) for g in best],
-            "best_coverage": float(getattr(best, "best_coverage", 0.0)),
+            "best_loss_components": dict(getattr(best, "loss_components", {})),
+            "best_physical_metrics": dict(getattr(best, "physical_metrics", {})),
             "seeds": [asdict(seed) for seed in selected_seeds],
             "num_selected_seeds": len(selected_seeds),
             "seed_extraction": {
@@ -792,7 +835,15 @@ class MemeticGeneticAlgorithmRunner:
         if verbose:
             print("-" * 80)
             print("MEMETIC GA COMPLETE")
-            print(f"  Best fitness: {results['best_fitness_dbm']:.2f} dBm")
+            print(f"  Best primary fitness: {results['best_primary_fitness']:.6f}")
+            if results["best_loss_components"]:
+                print("  Best loss components:")
+                for name, value in results["best_loss_components"].items():
+                    print(f"    {name}: {value:.6f}")
+            if results["best_physical_metrics"]:
+                print("  Best physical metrics:")
+                for name, value in results["best_physical_metrics"].items():
+                    print(f"    {name}: {value:.6f}")
             print(f"  Selected seeds: {results['num_selected_seeds']} / {eff_k_seeds}")
             print(f"  Total evals: {total_evaluations}")
             print(f"  Wall-clock: {total_time:.2f}s")

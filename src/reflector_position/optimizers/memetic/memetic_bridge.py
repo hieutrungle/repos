@@ -2,7 +2,7 @@
 
 This module converts the Phase-1 memetic GA outputs (topological seed dicts)
 into self-contained task dictionaries for distributed gradient-descent runs via
-``RayParallelOptimizer.run(..., optimizer_method="gradient_descent")``.
+``RawRayParallelOptimizer.run(..., optimizer_method="gradient_descent")``.
 
 The bridge is intentionally pure and side-effect free:
 - It does not mutate input seed dictionaries.
@@ -115,6 +115,7 @@ def generate_gd_tasks_from_seeds(
     num_aps: int,
     optimize_orientation: bool,
     reflector_enabled: bool,
+    gd_optimization_params: Optional[Dict[str, Any]] = None,
     gd_hyperparams: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Translate GA seeds into Ray-compatible GD work items.
@@ -143,15 +144,18 @@ def generate_gd_tasks_from_seeds(
         orientation initialization keys when available.
     reflector_enabled : bool
         Whether reflector initialization is required.
-    gd_hyperparams : dict, optional
+    gd_optimization_params : dict, optional
         Additional key-value pairs injected into every returned task dict
         (e.g. ``num_iterations``, ``learning_rate_pos``, ``learning_rate_dir``).
+
+    gd_hyperparams : dict, optional
+        Backward-compatible alias for ``gd_optimization_params``.
 
     Returns
     -------
     list[dict[str, Any]]
         One task dict per seed. Each task is self-contained and intended for
-        ``RayParallelOptimizer.run(..., optimizer_method="gradient_descent")``
+        ``RawRayParallelOptimizer.run(..., optimizer_method="gradient_descent")``
         ``work_items`` usage.
 
         Per task, emitted keys include:
@@ -163,7 +167,7 @@ def generate_gd_tasks_from_seeds(
         - ``initial_directions_xy``: list[(dx, dy)] | None (GD-compatible)
         - ``reflector_u`` / ``reflector_v`` / ``reflector_target`` (bridge keys)
         - ``initial_focal_point`` (GD-compatible reflector focal-point init)
-        - + any ``gd_hyperparams`` keys
+        - + any ``gd_optimization_params`` keys
 
     Raises
     ------
@@ -174,7 +178,18 @@ def generate_gd_tasks_from_seeds(
     if num_aps < 1:
         raise ValueError(f"num_aps must be >= 1, got {num_aps}")
 
-    hyperparams: Dict[str, Any] = dict(gd_hyperparams or {})
+    if gd_optimization_params is not None and gd_hyperparams is not None:
+        raise ValueError(
+            "Provide either 'gd_optimization_params' or the legacy "
+            "'gd_hyperparams', not both."
+        )
+
+    selected_gd_params = (
+        gd_optimization_params
+        if gd_optimization_params is not None
+        else gd_hyperparams
+    )
+    hyperparams: Dict[str, Any] = dict(selected_gd_params or {})
     tasks: List[Dict[str, Any]] = []
 
     for idx, seed in enumerate(seeds):

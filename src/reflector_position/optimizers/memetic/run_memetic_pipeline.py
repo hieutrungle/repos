@@ -16,17 +16,12 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import math
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, MutableMapping, Optional
 
-import matplotlib
 import ray
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 
 from reflector_position.optimizers.memetic.memetic_bridge import (
     generate_gd_tasks_from_seeds,
@@ -37,8 +32,115 @@ from reflector_position.optimizers.memetic.memetic_ga_logic import (
 from reflector_position.optimizers.memetic.memetic_gd_logic import (
     run_targeted_gd_exploitation,
 )
-from reflector_position.optimizers.ray_evaluator import RayActorPoolExecutor
-from reflector_position.optimizers.ray_parallel_optimizer import RayParallelOptimizer
+from reflector_position.optimizers.memetic.memetic_plotting import (
+    save_memetic_plots,
+)
+from reflector_position.optimizers.memetic.raw_ray_parallel_optimizer import (
+    RawRayActorPoolExecutor,
+    RawRayParallelOptimizer,
+)
+from reflector_position.optimizers.memetic.memetic_summary import (
+    save_memetic_summary_report,
+)
+
+
+_OBJECTIVE_PARAM_DEFAULTS: Dict[str, Any] = {
+    "alpha": 0.95,
+    "beta": 0.05,
+    "softmin_temperature": 0.15,
+    "coverage_threshold_dbm": -120.0,
+    "coverage_temperature": 2.0,
+}
+
+_GA_EVALUATION_PARAM_DEFAULTS: Dict[str, Any] = {
+    "samples_per_tx": 1_000_000,
+    "max_depth": 13,
+    "verbose": False,
+}
+
+_GD_OPTIMIZATION_PARAM_DEFAULTS: Dict[str, Any] = {
+    "num_iterations": 50,
+    "learning_rate": 0.1,
+    "samples_per_tx": 1_000_000,
+    "max_depth": 13,
+    "verbose": False,
+}
+
+_LEGACY_OBJECTIVE_KEY_MAP = {
+    "temperature": "softmin_temperature",
+}
+
+
+def _coerce_mapping(
+    config_args: Mapping[str, Any],
+    primary_key: str,
+    legacy_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return a copied config subsection, with optional legacy-key fallback."""
+    section = config_args.get(primary_key)
+    if section is None and legacy_key is not None:
+        section = config_args.get(legacy_key)
+    if section is None:
+        return {}
+    if not isinstance(section, Mapping):
+        raise ValueError(f"'{primary_key}' must be a mapping when provided")
+    return dict(section)
+
+
+def _resolve_objective_params(config_args: Mapping[str, Any]) -> Dict[str, Any]:
+    """Resolve shared memetic objective parameters from new or legacy schema."""
+    objective_params = dict(_OBJECTIVE_PARAM_DEFAULTS)
+    explicit_objective_params = _coerce_mapping(config_args, "objective_params")
+    objective_params.update(explicit_objective_params)
+
+    legacy_sources = (
+        _coerce_mapping(config_args, "ga_evaluation_params", "ga_optimization_params"),
+        _coerce_mapping(config_args, "gd_optimization_params", "gd_hyperparams"),
+    )
+    explicit_objective_keys = set(explicit_objective_params.keys())
+    for source in legacy_sources:
+        for legacy_key, normalized_key in _LEGACY_OBJECTIVE_KEY_MAP.items():
+            if normalized_key not in explicit_objective_keys and legacy_key in source:
+                objective_params[normalized_key] = source[legacy_key]
+        for key in _OBJECTIVE_PARAM_DEFAULTS:
+            if key not in explicit_objective_keys and key in source:
+                objective_params[key] = source[key]
+
+    return objective_params
+
+
+def _resolve_ga_evaluation_params(
+    config_args: Mapping[str, Any],
+    objective_params: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Build GA evaluator worker params from separated config sections."""
+    ga_evaluation_params = dict(_GA_EVALUATION_PARAM_DEFAULTS)
+    ga_evaluation_params.update(
+        _coerce_mapping(config_args, "ga_evaluation_params", "ga_optimization_params")
+    )
+    ga_evaluation_params.update(objective_params)
+    return ga_evaluation_params
+
+
+def _resolve_gd_optimization_params(
+    config_args: Mapping[str, Any],
+    objective_params: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Build GD optimize params from separated config sections."""
+    gd_optimization_params = dict(_GD_OPTIMIZATION_PARAM_DEFAULTS)
+    gd_source = _coerce_mapping(config_args, "gd_optimization_params", "gd_hyperparams")
+
+    if "softmin_temperature" not in gd_source and "temperature" in gd_source:
+        gd_source["softmin_temperature"] = gd_source["temperature"]
+
+    gd_source.pop("temperature", None)
+    gd_source.pop("use_soft_min", None)
+    gd_source.pop("shadow_quantile", None)
+    gd_source.pop("fairness_loss_type", None)
+
+    gd_optimization_params.update(gd_source)
+    gd_optimization_params.update(objective_params)
+    return gd_optimization_params
 
 
 def _deep_update(base: Dict[str, Any], updates: Mapping[str, Any]) -> Dict[str, Any]:
@@ -95,6 +197,11 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     return parser
 
 
+##################################################
+# Save Summary of All Runs, including GA/GD results, timings, and tabular artifacts.
+##################################################
+
+
 def _to_jsonable(value: Any) -> Any:
     """Recursively coerce arbitrary objects into JSON-serializable structures."""
     if isinstance(value, (str, int, float, bool)) or value is None:
@@ -136,120 +243,28 @@ def _write_csv(path: Path, rows: List[Mapping[str, Any]], fieldnames: List[str])
             writer.writerow({key: row.get(key) for key in fieldnames})
 
 
-def _plot_ga_training_curve(ga_results: Mapping[str, Any], save_path: Path) -> None:
-    """Plot GA max/mean training curves in dBm over generations."""
-    details = ga_results.get("generation_details", [])
-    if not isinstance(details, list) or len(details) == 0:
-        return
-
-    generations = [int(d.get("gen", i)) for i, d in enumerate(details)]
-    max_dbm = [float(d.get("max_dbm")) for d in details if d.get("max_dbm") is not None]
-    mean_dbm = [float(d.get("mean_dbm")) for d in details if d.get("mean_dbm") is not None]
-
-    if len(max_dbm) != len(generations) or len(mean_dbm) != len(generations):
-        return
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(generations, max_dbm, marker="o", linewidth=2.0, label="GA Best (dBm)")
-    ax.plot(generations, mean_dbm, marker="s", linewidth=1.6, label="GA Mean (dBm)")
-    ax.set_xlabel("Generation")
-    ax.set_ylabel("P5 RSS (dBm)")
-    ax.set_title("Memetic Phase-1 Training Curve (GA)")
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=300, bbox_inches="tight")
-    plt.close(fig)
+def _flatten_row(row: Mapping[str, Any], prefix: str = "") -> Dict[str, Any]:
+    """Flatten nested mappings into one CSV-friendly row."""
+    flattened: Dict[str, Any] = {}
+    for key, value in row.items():
+        flat_key = f"{prefix}{key}"
+        if isinstance(value, Mapping):
+            flattened.update(_flatten_row(value, prefix=f"{flat_key}__"))
+        else:
+            flattened[flat_key] = value
+    return flattened
 
 
-def _plot_gd_seed_improvements(gd_results: Mapping[str, Any], save_path: Path) -> None:
-    """Plot per-seed initial/final metrics and delta improvements for GD."""
-    analysis = gd_results.get("per_seed_analysis", [])
-    if not isinstance(analysis, list) or len(analysis) == 0:
-        return
-
-    seed_ids: List[int] = []
-    init_vals: List[float] = []
-    final_vals: List[float] = []
-    deltas: List[float] = []
-
-    for row in analysis:
-        init_dbm = row.get("initial_ga_rss_dbm")
-        final_dbm = row.get("best_gd_rss_dbm", row.get("final_gd_rss_dbm"))
-        delta_db = row.get("delta_best_improvement_db", row.get("delta_improvement_db"))
-        if init_dbm is None or final_dbm is None or delta_db is None:
-            continue
-        seed_ids.append(int(row.get("seed_index", len(seed_ids))))
-        init_vals.append(float(init_dbm))
-        final_vals.append(float(final_dbm))
-        deltas.append(float(delta_db))
-
-    if not seed_ids:
-        return
-
-    x = list(range(len(seed_ids)))
-    width = 0.36
-
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(11, 9), sharex=True)
-
-    ax1.bar([i - width / 2 for i in x], init_vals, width=width, label="Initial GA")
-    ax1.bar([i + width / 2 for i in x], final_vals, width=width, label="Final GD")
-    ax1.set_ylabel("P5 RSS (dBm)")
-    ax1.set_title("Memetic Phase-3 Refinement by Seed")
-    ax1.grid(True, axis="y", alpha=0.25)
-    ax1.legend()
-
-    bars = ax2.bar(x, deltas, width=0.55, color="tab:green")
-    ax2.axhline(0.0, color="black", linewidth=1.0)
-    ax2.set_xlabel("Seed Index")
-    ax2.set_ylabel("Delta Improvement (dB)")
-    ax2.set_xticks(x)
-    ax2.set_xticklabels([str(seed_id) for seed_id in seed_ids])
-    ax2.grid(True, axis="y", alpha=0.25)
-
-    for bar, delta in zip(bars, deltas):
-        ax2.text(
-            bar.get_x() + bar.get_width() / 2,
-            bar.get_height(),
-            f"{delta:.2f}",
-            ha="center",
-            va="bottom",
-            fontsize=8,
-        )
-
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=300, bbox_inches="tight")
-    plt.close(fig)
-
-
-def _plot_phase_timing(timings: Mapping[str, Any], save_path: Path) -> None:
-    """Plot GA/GD/total timing summary for publication-ready reporting."""
-    labels = ["GA", "GD", "Total"]
-    values = [
-        float(timings.get("ga_duration_sec", 0.0)),
-        float(timings.get("gd_duration_sec", 0.0)),
-        float(timings.get("total_duration_sec", 0.0)),
-    ]
-
-    fig, ax = plt.subplots(figsize=(8, 5))
-    bars = ax.bar(labels, values, color=["tab:blue", "tab:orange", "tab:purple"])
-    ax.set_ylabel("Seconds")
-    ax.set_title("Memetic Pipeline Runtime Breakdown")
-    ax.grid(True, axis="y", alpha=0.25)
-
-    for bar, value in zip(bars, values):
-        ax.text(
-            bar.get_x() + bar.get_width() / 2,
-            bar.get_height(),
-            f"{value:.2f}s",
-            ha="center",
-            va="bottom",
-            fontsize=9,
-        )
-
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=300, bbox_inches="tight")
-    plt.close(fig)
+def _collect_fieldnames(rows: List[Mapping[str, Any]]) -> List[str]:
+    """Collect stable CSV fieldnames from a sequence of flattened rows."""
+    fieldnames: List[str] = []
+    seen = set()
+    for row in rows:
+        for key in row.keys():
+            if key not in seen:
+                seen.add(key)
+                fieldnames.append(str(key))
+    return fieldnames
 
 
 def _save_memetic_artifacts(
@@ -257,7 +272,7 @@ def _save_memetic_artifacts(
     config_args: Mapping[str, Any],
     output_dir: Path,
 ) -> Dict[str, str]:
-    """Save complete memetic run artifacts (JSON/CSV/plots) into output_dir."""
+    """Save complete memetic run artifacts (JSON/CSV/plots/report) into output_dir."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
     artifacts_dir = output_dir / "artifacts"
@@ -273,6 +288,7 @@ def _save_memetic_artifacts(
     gd_json = artifacts_dir / "gd_results.json"
     config_json = artifacts_dir / "run_config.json"
     best_json = artifacts_dir / "global_best_result.json"
+    report_md = artifacts_dir / "memetic_report.md"
 
     _write_json(summary_json, summary)
     _write_json(ga_json, ga_results)
@@ -285,8 +301,8 @@ def _save_memetic_artifacts(
         fieldnames = [
             "gen",
             "nevals",
-            "max_dbm",
-            "mean_dbm",
+            "best_primary_fitness",
+            "mean_primary_fitness",
             "std",
             "time",
         ]
@@ -294,29 +310,18 @@ def _save_memetic_artifacts(
 
     seed_rows = gd_results.get("per_seed_analysis", [])
     if isinstance(seed_rows, list) and seed_rows:
-        fieldnames = [
-            "seed_index",
-            "task_id",
-            "worker_id",
-            "initial_ga_rss_dbm",
-            "best_gd_rss_dbm",
-            "final_gd_rss_dbm",
-            "delta_improvement_db",
-            "delta_best_improvement_db",
-            "delta_final_improvement_db",
-            "status",
-        ]
-        _write_csv(artifacts_dir / "gd_per_seed_analysis.csv", seed_rows, fieldnames)
+        flattened_seed_rows = [_flatten_row(row) for row in seed_rows]
+        fieldnames = _collect_fieldnames(flattened_seed_rows)
+        _write_csv(artifacts_dir / "gd_per_seed_analysis.csv", flattened_seed_rows, fieldnames)
 
-    ga_plot = plots_dir / "ga_training_curve.png"
-    gd_plot = plots_dir / "gd_seed_improvements.png"
-    timing_plot = plots_dir / "pipeline_timing_breakdown.png"
+    plot_artifacts = save_memetic_plots(
+        summary=summary,
+        output_dir=output_dir,
+        position_bounds=config_args.get("position_bounds"),
+    )
+    report_path = save_memetic_summary_report(summary, report_md)
 
-    _plot_ga_training_curve(ga_results, ga_plot)
-    _plot_gd_seed_improvements(gd_results, gd_plot)
-    _plot_phase_timing(dict(summary.get("timings", {})), timing_plot)
-
-    return {
+    artifacts = {
         "output_dir": str(output_dir),
         "artifacts_dir": str(artifacts_dir),
         "plots_dir": str(plots_dir),
@@ -325,118 +330,22 @@ def _save_memetic_artifacts(
         "gd_results_json": str(gd_json),
         "run_config_json": str(config_json),
         "global_best_json": str(best_json),
+        "report_markdown": report_path,
         "ga_generation_csv": str(artifacts_dir / "ga_generation_details.csv"),
         "gd_per_seed_csv": str(artifacts_dir / "gd_per_seed_analysis.csv"),
-        "ga_training_plot": str(ga_plot),
-        "gd_seed_plot": str(gd_plot),
-        "timing_plot": str(timing_plot),
     }
-
-
-def _build_ray_style_gd_plot_payload(
-    gd_results: Mapping[str, Any],
-    num_workers: int,
-) -> Optional[Dict[str, Any]]:
-    """Build a RayParallelOptimizer-compatible plotting payload from memetic GD results."""
-    all_results = gd_results.get("all_fine_tuned_results", [])
-    best_result = gd_results.get("global_best_result")
-    metadata = gd_results.get("parallel_run_metadata", {})
-
-    if not isinstance(all_results, list) or len(all_results) == 0 or not isinstance(best_result, Mapping):
-        return None
-
-    metrics_dbm = [
-        float(r["best_metric_dbm"])
-        for r in all_results
-        if isinstance(r, Mapping) and r.get("best_metric_dbm") is not None
-    ]
-    if not metrics_dbm:
-        return None
-
-    mean_dbm = sum(metrics_dbm) / len(metrics_dbm)
-    std_dbm = math.sqrt(sum((x - mean_dbm) ** 2 for x in metrics_dbm) / len(metrics_dbm))
-
-    aggregate_stats = {
-        "mean_metric_dbm": mean_dbm,
-        "std_metric_dbm": std_dbm,
-        "min_metric_dbm": min(metrics_dbm),
-        "max_metric_dbm": max(metrics_dbm),
-        "mean_percentile_dbm": mean_dbm,
-        "std_percentile_dbm": std_dbm,
-        "min_percentile_dbm": min(metrics_dbm),
-        "max_percentile_dbm": max(metrics_dbm),
-    }
-
-    total_time = metadata.get("total_time")
-    if total_time is None:
-        total_time = sum(
-            float(r.get("time_elapsed", 0.0))
-            for r in all_results
-            if isinstance(r, Mapping)
-        )
-
-    pool_info = dict(metadata.get("pool_info", {})) if isinstance(metadata, Mapping) else {}
-    pool_info.setdefault("num_workers", num_workers)
-    pool_info.setdefault("num_tasks", len(all_results))
-
-    return {
-        "all_results": all_results,
-        "best_result": dict(best_result),
-        "aggregate_stats": aggregate_stats,
-        "pool_info": pool_info,
-        "total_time": float(total_time),
-    }
-
-
-def _save_ray_style_gd_plots(
-    ray_parallel_optimizer: RayParallelOptimizer,
-    gd_results: Mapping[str, Any],
-    output_dir: Path,
-    position_bounds: Mapping[str, Any],
-    num_workers: int,
-) -> Dict[str, str]:
-    """Save Ray-style GD summary plot and one trajectory plot per task."""
-    payload = _build_ray_style_gd_plot_payload(gd_results, num_workers=num_workers)
-    if payload is None:
-        return {}
-
-    plots_dir = output_dir / "plots"
-    traj_dir = plots_dir / "gd_trajectories"
-    plots_dir.mkdir(parents=True, exist_ok=True)
-    traj_dir.mkdir(parents=True, exist_ok=True)
-
-    summary_plot_path = plots_dir / "gd_parallel_summary.png"
-    ray_parallel_optimizer.save_results_plot(
-        payload,
-        save_path=str(summary_plot_path),
-        metric_name="P5 RSS",
-        position_bounds=dict(position_bounds),
-        rss_range_dbm=(-130.0, -80.0),
-    )
-
-    trajectory_paths = ray_parallel_optimizer.save_task_trajectory_plots(
-        payload,
-        save_dir=str(traj_dir),
-        filename_prefix="gd_task",
-        position_bounds=dict(position_bounds),
-        rss_range_dbm=(-130.0, -80.0),
-    )
-
-    return {
-        "gd_ray_style_summary_plot": str(summary_plot_path),
-        "gd_trajectory_dir": str(traj_dir),
-        "gd_trajectory_count": str(len(trajectory_paths)),
-    }
+    artifacts.update(plot_artifacts)
+    return artifacts
 
 
 def _bind_shared_actor_pool(
-    ray_parallel_optimizer: RayParallelOptimizer,
-    executor: RayActorPoolExecutor,
+    ray_parallel_optimizer: RawRayParallelOptimizer,
+    executor: RawRayActorPoolExecutor,
 ) -> None:
-    """Bind an existing RayActorPoolExecutor pool into RayParallelOptimizer.
+    """Bind an existing raw ActorPool executor into RawRayParallelOptimizer.
 
     This intentionally reuses private pool state so both GA (executor.map) and
-    GD (`RayParallelOptimizer.run`) operate on the same hot actors.
+    GD (``RawRayParallelOptimizer.run``) operate on the same hot actors.
     """
     ray_parallel_optimizer._workers = executor._workers  # type: ignore[attr-defined]
     ray_parallel_optimizer._pool = executor._pool  # type: ignore[attr-defined]
@@ -461,14 +370,18 @@ def run_memetic_optimization(config_args: Mapping[str, Any]) -> Dict[str, Any]:
         - ``optimize_orientation``: bool
         - ``reflector_enabled``: bool
         - ``focal_z``: float reflector focal z
+        - ``objective_params``: shared memetic loss settings for GA and GD
         - ``ga_params``: dict DEAP hyperparameters
-        - ``ga_optimization_params``: dict worker eval params for GA
+        - ``ga_evaluation_params``: dict worker eval params for GA
         - ``k_seeds``: int number of spatial seeds to extract
         - ``d_corr``: float topological distance threshold
-        - ``gd_hyperparams``: dict GD optimization params
+        - ``gd_optimization_params``: dict GD optimizer settings
         - ``output_dir``: str|Path base folder for run artifacts
         - ``run_name``: optional run label subfolder name
         - ``verbose``: bool
+
+        Legacy config keys ``ga_optimization_params`` and ``gd_hyperparams``
+        are still accepted for backward compatibility.
 
     Returns
     -------
@@ -487,42 +400,22 @@ def run_memetic_optimization(config_args: Mapping[str, Any]) -> Dict[str, Any]:
     position_bounds = dict(config_args["position_bounds"])
     fixed_z = float(config_args.get("fixed_z", 3.8))
 
-    num_pool_workers = int(config_args.get("num_pool_workers", 4))
-    gpu_fraction = float(config_args.get("gpu_fraction", 0.25))
+    num_pool_workers = int(config_args.get("num_pool_workers", 3))
+    gpu_fraction = float(config_args.get("gpu_fraction", 0.33))
 
     num_aps = int(config_args.get("num_aps", 2))
-    min_ap_separation = float(config_args.get("min_ap_separation", 2.0))
+    min_ap_separation = float(config_args.get("min_ap_separation", 5.0))
     optimize_orientation = bool(config_args.get("optimize_orientation", True))
-    reflector_enabled = bool(config_args.get("reflector_enabled", False))
+    reflector_enabled = bool(config_args.get("reflector_enabled", True))
     focal_z = float(config_args.get("focal_z", 1.5))
 
     ga_params = dict(config_args.get("ga_params", {}))
-    ga_optimization_params = dict(config_args.get("ga_optimization_params", {}))
     k_seeds = int(config_args.get("k_seeds", 5))
-    d_corr = float(config_args.get("d_corr", 5.0))
+    d_corr = float(config_args.get("d_corr", 3.0))
 
-    gd_hyperparams = dict(config_args.get("gd_hyperparams", {}))
-
-    # ------------------------------------------------------------------
-    # GA/GD objective alignment: inject composite-loss hyperparameters
-    # from gd_hyperparams into ga_optimization_params so that Ray workers
-    # compute the *same* smoothed landscape during the GA evaluation pass.
-    # Existing ga_optimization_params values take precedence (explicit
-    # override).
-    # ------------------------------------------------------------------
-    _ALIGNMENT_KEYS = (
-        "use_soft_min",
-        "temperature",
-        "shadow_quantile",
-        "fairness_loss_type",
-        "alpha",
-        "beta",
-        "coverage_threshold_dbm",
-        "coverage_temperature",
-    )
-    for _key in _ALIGNMENT_KEYS:
-        if _key not in ga_optimization_params and _key in gd_hyperparams:
-            ga_optimization_params[_key] = gd_hyperparams[_key]
+    objective_params = _resolve_objective_params(config_args)
+    ga_evaluation_params = _resolve_ga_evaluation_params(config_args, objective_params)
+    gd_optimization_params = _resolve_gd_optimization_params(config_args, objective_params)
 
     output_base_dir = Path(str(config_args.get("output_dir", "results/experiments/")))
     run_name = config_args.get("run_name")
@@ -538,8 +431,8 @@ def run_memetic_optimization(config_args: Mapping[str, Any]) -> Dict[str, Any]:
 
     pipeline_start = time.perf_counter()
 
-    executor: Optional[RayActorPoolExecutor] = None
-    ray_parallel_optimizer: Optional[RayParallelOptimizer] = None
+    executor: Optional[RawRayActorPoolExecutor] = None
+    ray_parallel_optimizer: Optional[RawRayParallelOptimizer] = None
 
     try:
         # -----------------------------------------------------------------
@@ -549,7 +442,7 @@ def run_memetic_optimization(config_args: Mapping[str, Any]) -> Dict[str, Any]:
             ray.init(ignore_reinit_error=True)
 
         # Intentionally keep this executor alive for both GA and GD phases.
-        executor = RayActorPoolExecutor(
+        executor = RawRayActorPoolExecutor(
             scene_config=scene_config,
             num_workers=num_pool_workers,
             gpu_fraction=gpu_fraction,
@@ -575,7 +468,7 @@ def run_memetic_optimization(config_args: Mapping[str, Any]) -> Dict[str, Any]:
         )
 
         ga_results = ga_runner.run(
-            optimization_params=ga_optimization_params,
+            optimization_params=ga_evaluation_params,
             ga_params=ga_params,
             seed=config_args.get("random_seed"),
             verbose=verbose,
@@ -595,22 +488,22 @@ def run_memetic_optimization(config_args: Mapping[str, Any]) -> Dict[str, Any]:
             num_aps=num_aps,
             optimize_orientation=optimize_orientation,
             reflector_enabled=reflector_enabled,
-            gd_hyperparams=gd_hyperparams,
+            gd_optimization_params=gd_optimization_params,
         )
 
         # Attach scene + baseline metric metadata for Phase-3 analysis.
         for seed, task in zip(seeds, gd_tasks):
             task["scene_config"] = scene_config
-            seed_metric_dbm = seed.get("fitness_dbm")
-            if seed_metric_dbm is not None:
-                task["seed_fitness_dbm"] = float(seed_metric_dbm)
+            seed_primary_fitness = seed.get("primary_fitness")
+            if seed_primary_fitness is not None:
+                task["initial_primary_loss"] = -float(seed_primary_fitness)
 
         # -----------------------------------------------------------------
         # Step 4: Phase 3 - Targeted GD micro-exploitation
         # -----------------------------------------------------------------
         gd_start = time.perf_counter()
 
-        ray_parallel_optimizer = RayParallelOptimizer(
+        ray_parallel_optimizer = RawRayParallelOptimizer(
             num_workers=num_pool_workers,
             gpu_fraction=gpu_fraction,
         )
@@ -648,21 +541,6 @@ def run_memetic_optimization(config_args: Mapping[str, Any]) -> Dict[str, Any]:
             config_args=config_args,
             output_dir=run_dir,
         )
-
-        # Additional Ray-style GD visualizations (same look as experiment runner).
-        try:
-            if ray_parallel_optimizer is not None:
-                ray_plot_artifacts = _save_ray_style_gd_plots(
-                    ray_parallel_optimizer=ray_parallel_optimizer,
-                    gd_results=gd_results,
-                    output_dir=run_dir,
-                    position_bounds=position_bounds,
-                    num_workers=num_pool_workers,
-                )
-                saved_artifacts.update(ray_plot_artifacts)
-        except Exception as exc:
-            if verbose:
-                print(f"[memetic-pipeline] Warning: failed to save Ray-style GD plots: {exc}")
 
         summary["saved_artifacts"] = saved_artifacts
 
@@ -734,6 +612,13 @@ def _default_memetic_config() -> Dict[str, Any]:
         "optimize_orientation": True,
         "reflector_enabled": True,
         "focal_z": 1.5,
+        "objective_params": {
+            "alpha": 0.95,
+            "beta": 0.05,
+            "softmin_temperature": 0.15,
+            "coverage_threshold_dbm": -120.0,
+            "coverage_temperature": 2.0,
+        },
         "ga_params": {
             "pop_size": 150,
             "n_gen": 50,
@@ -742,26 +627,18 @@ def _default_memetic_config() -> Dict[str, Any]:
             "tournsize": 3,
             "hof_size": 20,
         },
-        "ga_optimization_params": {
+        "ga_evaluation_params": {
             "samples_per_tx": 1_000_000,
             "max_depth": 13,
             "verbose": False,
         },
         "k_seeds": 3,
         "d_corr": 5.0,
-        "gd_hyperparams": {
+        "gd_optimization_params": {
             "num_iterations": 50,
             "learning_rate": 0.1,
             "samples_per_tx": 1_000_000,
             "max_depth": 13,
-            "use_soft_min": True,
-            "temperature": 0.15,
-            "shadow_quantile": 0.05,
-            "fairness_loss_type": "auto",
-            "alpha": 0.95,
-            "beta": 0.05,
-            "coverage_threshold_dbm": -120.0,
-            "coverage_temperature": 2.0,
             "verbose": False,
         },
         "verbose": True,
@@ -789,9 +666,14 @@ if __name__ == "__main__":
 
     output = run_memetic_optimization(run_config)
     global_best = output.get("global_best_result")
+    best_primary_loss = (
+        output.get("gd_results", {})
+        .get("metrics", {})
+        .get("best_primary_loss")
+    )
     if global_best is not None:
         print(
             "\nGlobal best result: "
             f"task #{global_best.get('task_id')} | "
-            f"best_metric_dbm={float(global_best.get('best_metric_dbm')):.2f}"
+            f"primary_loss={float(best_primary_loss):.6f}"
         )
