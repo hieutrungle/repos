@@ -1,0 +1,38 @@
+{
+  "output_dir": "results/experiments/memetic_hparam_sweep",
+  "shared": {
+    "verbose": true
+  },
+  "trials": [
+    {
+      "name": "baseline_current_config",
+      "overrides": {}
+    }
+  ],
+  "sweep_groups": [
+    {
+      "name_prefix": "gd_lr_temp_alpha",
+      "base_overrides": {
+        "gd_optimization_params": {
+          "num_iterations": 50,
+          "samples_per_tx": 1000000,
+          "max_depth": 13,
+          "verbose": false
+        }
+      },
+      "grid": {
+        "gd_optimization_params.learning_rate": [0.01],
+        "objective_params.softmin_temperature": [0.1],
+        "objective_params.alpha": [0.99]
+      }
+    },
+    {
+      "name_prefix": "ga_pop_mut",
+      "grid": {
+        "ga_params.pop_size": [100],
+        "ga_params.n_gen": [20],
+        "ga_params.mutpb": [0.7]
+      }
+    }
+  ]
+}

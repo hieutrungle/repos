@@ -4,7 +4,8 @@
     "frequency": 6000000000.0,
     "tx_power_dbm": 5.0,
     "tx_positions": [
-      [20.0, 20.0, 3.8]
+      [10.0, 10.0, 3.8],
+      [25.0, 25.0, 3.8]
     ],
     "reflector_enabled": true,
     "reflector_size": [2.0, 2.0],
@@ -23,16 +24,16 @@
   "fixed_z": 3.8,
   "num_pool_workers": 2,
   "gpu_fraction": 0.5,
-  "random_seed": 4,
+  "random_seed": 40,
   "num_aps": 1,
-  "min_ap_separation": 0.0,
+  "min_ap_separation": 2.0,
   "optimize_orientation": true,
   "reflector_enabled": true,
   "focal_z": 1.5,
   "objective_params": {
-    "alpha": 0.99,
-    "beta": 0.01,
-    "softmin_temperature": 0.15,
+    "alpha": 2.0,
+    "beta": 0.001,
+    "softmin_temperature": 0.2,
     "coverage_threshold_dbm": -120.0,
     "coverage_temperature": 2.0
   },
@@ -50,7 +51,7 @@
     "verbose": false
   },
   "k_seeds": 5,
-  "d_corr": 0.0,
+  "d_corr": 0.05,
   "gd_optimization_params": {
     "num_iterations": 50,
     "learning_rate": 0.02,
