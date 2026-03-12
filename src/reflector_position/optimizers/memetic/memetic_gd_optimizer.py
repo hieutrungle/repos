@@ -24,6 +24,7 @@ import drjit as dr
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.optim.lr_scheduler import CosineAnnealingLR
 import sionna.rt
 from sionna.rt import RadioMapSolver, Transmitter
 
@@ -151,8 +152,8 @@ class MemeticGradientDescentOptimizer(BaseAPOptimizer):
         self.radio_solver = RadioMapSolver()
         self.radio_solver.loop_mode = "evaluated"
         self.loss_module = MemeticCompositeLoss(
-            alpha=0.95,
-            beta=0.05,
+            alpha=0.99,
+            beta=0.01,
             softmin_temperature=0.15,
             coverage_threshold_dbm=-120.0,
             coverage_temperature=2.0,
@@ -183,8 +184,8 @@ class MemeticGradientDescentOptimizer(BaseAPOptimizer):
         max_depth: int = 13,
         temperature: float = 0.1,
         softmin_temperature: Optional[float] = None,
-        alpha: float = 0.6,
-        beta: float = 0.4,
+        alpha: float = 0.99,
+        beta: float = 0.01,
         coverage_threshold_dbm: float = -120.0,
         coverage_temperature: float = 2.0,
         verbose: bool = True,
@@ -218,7 +219,7 @@ class MemeticGradientDescentOptimizer(BaseAPOptimizer):
         ]
         if self.optimize_orientation:
             param_groups.append(
-                {"params": [self.tx_dir_xy], "lr": float(learning_rate) * 5.0}
+                {"params": [self.tx_dir_xy], "lr": float(learning_rate) * 2.0}
             )
         reflector_params = self._reflector_parameter_list()
         if reflector_params:
@@ -230,7 +231,8 @@ class MemeticGradientDescentOptimizer(BaseAPOptimizer):
         # AdamW's default weight decay adds an implicit regularizer that is not
         # part of the memetic loss and can make the logged loss rise even when
         # the optimizer is following its internal objective.
-        optimizer = torch.optim.AdamW(param_groups, weight_decay=0.0)
+        optimizer = torch.optim.AdamW(param_groups, weight_decay=0.0, betas=(0.0, 0.999))
+        scheduler = CosineAnnealingLR(optimizer, T_max=int(num_iterations), eta_min=1e-5)
 
         start_time = time.time()
         with torch.no_grad():
@@ -283,8 +285,9 @@ class MemeticGradientDescentOptimizer(BaseAPOptimizer):
 
             if verbose:
                 self._log_iteration(iteration + 1, int(num_iterations), snapshot)
-                
-        
+                scheduler.step()
+                scheduler.zero_grad()
+
         with torch.no_grad():
             snapshot = self._evaluate_metrics(
                 samples_per_tx=int(samples_per_tx),
