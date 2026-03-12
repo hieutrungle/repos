@@ -124,14 +124,16 @@ def _print_hints(config_path: Path) -> None:
     print("1) Primary config file:")
     print(f"   {config_path}")
     print("\n2) Most-used tuning keys:")
+    print("   - objective_params.softmin_temperature / alpha / beta")
     print("   - ga_params.pop_size / ga_params.n_gen")
+    print("   - ga_evaluation_params.samples_per_tx / max_depth")
     print("   - k_seeds / d_corr")
-    print("   - gd_hyperparams.num_iterations / learning_rate")
+    print("   - gd_optimization_params.num_iterations / learning_rate")
     print("   - num_pool_workers / gpu_fraction")
     print("\n3) Fast smoke-test profile (recommended before long runs):")
     print("   - ga_params.pop_size: 12-30")
     print("   - ga_params.n_gen: 1-5")
-    print("   - gd_hyperparams.num_iterations: 3-20")
+    print("   - gd_optimization_params.num_iterations: 3-20")
     print("\n4) Journal-quality profile:")
     print("   - Increase pop_size, n_gen, num_iterations")
     print("   - Keep d_corr meaningful to avoid redundant seed exploitation")
@@ -180,11 +182,16 @@ def main() -> int:
         print(f"\nSaved artifacts: {saved['output_dir']}")
 
     global_best = output.get("global_best_result")
-    if isinstance(global_best, dict) and global_best.get("best_metric_dbm") is not None:
+    best_primary_loss = (
+        output.get("gd_results", {})
+        .get("metrics", {})
+        .get("best_primary_loss")
+    )
+    if isinstance(global_best, dict) and best_primary_loss is not None:
         print(
             "Global best: "
             f"task #{global_best.get('task_id')} | "
-            f"best_metric_dbm={float(global_best.get('best_metric_dbm')):.2f}"
+            f"primary_loss={float(best_primary_loss):.6f}"
         )
 
     return 0
