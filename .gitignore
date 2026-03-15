@@ -24,3 +24,8 @@ context/
 
 # previous work
 diff_rt_calibration_prev/
+
+# temp files and folders
+temp/
+temp_*
+tmp_*

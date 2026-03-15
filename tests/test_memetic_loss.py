@@ -10,6 +10,8 @@ def test_memetic_composite_loss_decreases_when_signal_strength_increases() -> No
         alpha=2.0,
         beta=0.001,
         softmin_temperature=0.2,
+        softmin_floor_dbm=-120.0,
+        softmin_ceil_dbm=-60.0,
         coverage_threshold_dbm=-120.0,
         coverage_temperature=2.0,
     )
@@ -29,6 +31,8 @@ def test_memetic_coverage_component_rewards_more_cells_above_threshold() -> None
         alpha=0.0,
         beta=1.0,
         softmin_temperature=0.2,
+        softmin_floor_dbm=-120.0,
+        softmin_ceil_dbm=-60.0,
         coverage_threshold_dbm=-120.0,
         coverage_temperature=2.0,
     )
