@@ -155,6 +155,8 @@ class MemeticGradientDescentOptimizer(BaseAPOptimizer):
             alpha=0.99,
             beta=0.01,
             softmin_temperature=0.15,
+            softmin_floor_dbm=-120.0,
+            softmin_ceil_dbm=-70.0,
             coverage_threshold_dbm=-120.0,
             coverage_temperature=2.0,
         )
@@ -184,6 +186,8 @@ class MemeticGradientDescentOptimizer(BaseAPOptimizer):
         max_depth: int = 13,
         temperature: float = 0.1,
         softmin_temperature: Optional[float] = None,
+        softmin_floor_dbm: float = -120.0,
+        softmin_ceil_dbm: float = -70.0,
         alpha: float = 0.99,
         beta: float = 0.01,
         coverage_threshold_dbm: float = -120.0,
@@ -210,6 +214,8 @@ class MemeticGradientDescentOptimizer(BaseAPOptimizer):
             alpha=float(alpha),
             beta=float(beta),
             softmin_temperature=float(effective_softmin_temperature),
+            softmin_floor_dbm=float(softmin_floor_dbm),
+            softmin_ceil_dbm=float(softmin_ceil_dbm),
             coverage_threshold_dbm=float(coverage_threshold_dbm),
             coverage_temperature=float(coverage_temperature),
         )

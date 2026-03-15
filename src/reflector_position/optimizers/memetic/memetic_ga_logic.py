@@ -433,6 +433,12 @@ class MemeticGeneticAlgorithmRunner:
                         self._opt_params.get("temperature", 0.1),
                     )
                 ),
+                "softmin_floor_dbm": float(
+                    self._opt_params.get("softmin_floor_dbm", -120.0)
+                ),
+                "softmin_ceil_dbm": float(
+                    self._opt_params.get("softmin_ceil_dbm", -70.0)
+                ),
                 "coverage_threshold_dbm": float(
                     self._opt_params.get("coverage_threshold_dbm", -100.0)
                 ),

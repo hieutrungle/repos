@@ -48,6 +48,8 @@ _OBJECTIVE_PARAM_DEFAULTS: Dict[str, Any] = {
     "alpha": 0.95,
     "beta": 0.05,
     "softmin_temperature": 0.15,
+    "softmin_floor_dbm": -120.0,
+    "softmin_ceil_dbm": -60.0,
     "coverage_threshold_dbm": -120.0,
     "coverage_temperature": 2.0,
 }
@@ -616,6 +618,8 @@ def _default_memetic_config() -> Dict[str, Any]:
             "alpha": 0.95,
             "beta": 0.05,
             "softmin_temperature": 0.15,
+            "softmin_floor_dbm": -120.0,
+            "softmin_ceil_dbm": -70.0,
             "coverage_threshold_dbm": -120.0,
             "coverage_temperature": 2.0,
         },

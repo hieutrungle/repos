@@ -6,8 +6,9 @@ memetic Genetic Algorithm (GA) and Gradient Descent (GD) stages.
 The design goal is to expose a single source of truth for the optimization
 manifold:
 
-1. ``SoftMinLoss`` rewards improvements in weak-signal regions through a
-   smooth minimum surrogate.
+1. ``WeightedNormalizedSoftMinLoss`` rewards improvements in weak-signal
+    regions through a demand-weighted smooth minimum surrogate in a normalized
+    penalty domain.
 2. ``SoftCoverageLoss`` rewards broader area coverage above a target
    threshold through a sigmoid relaxation.
 3. ``MemeticCompositeLoss`` combines both terms into one scalar objective.
@@ -188,6 +189,111 @@ class SoftCoverageLoss(nn.Module):
         return -soft_coverage.mean()
 
 
+class WeightedNormalizedSoftMinLoss(nn.Module):
+    r"""Demand-weighted soft-min loss in a normalized penalty domain.
+
+    This objective avoids hard minimum clamping so gradients remain informative
+    even in severe dead zones. dBm inputs are first normalized to a score range
+    anchored by ``floor_dbm`` and ``ceil_dbm``:
+
+    .. math::
+
+        s_i = \frac{x_i - \mathrm{floor}}{\mathrm{ceil} - \mathrm{floor}}
+
+    Scores above 1 are softly capped (no extra reward above ``ceil_dbm``),
+    while low scores remain unbounded below so dead zones continue to produce
+    gradient signal. Scores are then inverted into penalties:
+
+    .. math::
+
+        p_i = 1 - s_i
+
+    and aggregated with a weighted log-sum-exp formulation:
+
+    .. math::
+
+        \mathcal{L} = T\left[\log\sum_i w_i e^{p_i/T} - \log\sum_i w_i\right]
+
+    where ``w_i`` are spatial demand weights and ``T`` is the temperature.
+    The returned value is a positive penalty that is minimized directly.
+    """
+
+    def __init__(
+        self,
+        temperature: float,
+        floor_dbm: float = -120.0,
+        ceil_dbm: float = -70.0,
+    ) -> None:
+        """Initialize the weighted normalized soft-min loss.
+
+        Parameters
+        ----------
+        temperature : float
+            Positive soft-min temperature in penalty space.
+        floor_dbm : float, default=-120.0
+            Baseline dBm corresponding to normalized score 0.
+        ceil_dbm : float, default=-70.0
+            Target dBm corresponding to normalized score 1.
+        """
+        super().__init__()
+        if temperature <= 0.0:
+            raise ValueError("temperature must be positive")
+        if ceil_dbm <= floor_dbm:
+            raise ValueError("ceil_dbm must be greater than floor_dbm")
+
+        self.temperature = float(temperature)
+        self.floor_dbm = float(floor_dbm)
+        self.ceil_dbm = float(ceil_dbm)
+
+    def forward(self, coverage_map_dbm: Tensor, spatial_weights: Tensor) -> Tensor:
+        """Compute weighted normalized soft-min penalty.
+
+        Parameters
+        ----------
+        coverage_map_dbm : torch.Tensor
+            Coverage map in dBm with shape ``(H, W)``, ``(B, H, W)``, or any
+            batch-plus-spatial equivalent.
+        spatial_weights : torch.Tensor
+            Demand weights aligned to the coverage map. Must be non-negative.
+
+        Returns
+        -------
+        torch.Tensor
+            Scalar penalty loss. Lower is better.
+        """
+        flat_map_dbm = _flatten_spatial_dims(coverage_map_dbm)
+        flat_weights = _flatten_spatial_dims(spatial_weights)
+
+        if flat_weights.shape != flat_map_dbm.shape:
+            if (
+                flat_weights.shape[0] == 1
+                and flat_weights.shape[1] == flat_map_dbm.shape[1]
+            ):
+                flat_weights = flat_weights.expand(flat_map_dbm.shape[0], -1)
+            else:
+                raise ValueError(
+                    "spatial_weights must match coverage_map_dbm shape "
+                    "(or have a single broadcastable batch axis)"
+                )
+
+        if torch.any(flat_weights < 0):
+            raise ValueError("spatial_weights must be non-negative")
+
+        scores = (flat_map_dbm - self.floor_dbm) / (self.ceil_dbm - self.floor_dbm)
+        scores = torch.where(scores > 1.0, torch.ones_like(scores), scores)
+        penalties = 1.0 - scores
+        scaled_penalties = penalties / self.temperature
+
+        log_weights = torch.log(flat_weights + 1e-9)
+        shifted_inputs = scaled_penalties + log_weights
+        weighted_lse = torch.logsumexp(shifted_inputs, dim=-1)
+
+        normalization = torch.log(flat_weights.sum(dim=-1) + 1e-9)
+        normalized_lse = weighted_lse - normalization
+
+        return (self.temperature * normalized_lse).mean()
+
+
 class MemeticCompositeLoss(nn.Module):
     r"""Composite memetic objective shared by GA and GD.
 
@@ -202,10 +308,11 @@ class MemeticCompositeLoss(nn.Module):
     where both component losses are already expressed in minimization form.
     The composite module converts the incoming radio map from linear Watts to
     dBm exactly once, then evaluates both terms on the same dBm manifold.
-    ``SoftMinLoss`` returns the negative dBm soft minimum, and
-    ``SoftCoverageLoss`` returns the negative soft coverage percentage. This
-    keeps the optimization landscape fully continuous and avoids any masking
-    or hard selection operations that would break gradient flow.
+    ``WeightedNormalizedSoftMinLoss`` returns a positive demand-weighted
+    penalty, and ``SoftCoverageLoss`` returns the negative soft coverage
+    percentage. This keeps the optimization landscape fully continuous and
+    avoids any masking or hard selection operations that would break gradient
+    flow.
     """
 
     def __init__(
@@ -213,6 +320,8 @@ class MemeticCompositeLoss(nn.Module):
         alpha: float,
         beta: float,
         softmin_temperature: float,
+        softmin_floor_dbm: float,
+        softmin_ceil_dbm: float,
         coverage_threshold_dbm: float,
         coverage_temperature: float,
     ) -> None:
@@ -225,7 +334,11 @@ class MemeticCompositeLoss(nn.Module):
         beta : float
             Weight applied to the soft-coverage term.
         softmin_temperature : float
-            Temperature parameter for :class:`SoftMinLoss`.
+            Temperature parameter for :class:`WeightedNormalizedSoftMinLoss`.
+        softmin_floor_dbm : float
+            Floor reference for soft-min normalization.
+        softmin_ceil_dbm : float
+            Ceiling reference for soft-min normalization.
         coverage_threshold_dbm : float
             Threshold in dBm used by :class:`SoftCoverageLoss`.
         coverage_temperature : float
@@ -235,13 +348,21 @@ class MemeticCompositeLoss(nn.Module):
         self.alpha = float(alpha)
         self.beta = float(beta)
 
-        self.softmin_loss = SoftMinLoss(temperature=softmin_temperature, coverage_threshold_dbm=coverage_threshold_dbm)
+        self.softmin_loss = WeightedNormalizedSoftMinLoss(
+            temperature=softmin_temperature,
+            floor_dbm=softmin_floor_dbm,
+            ceil_dbm=softmin_ceil_dbm,
+        )
         self.coverage_loss = SoftCoverageLoss(
             threshold_dbm=coverage_threshold_dbm,
             temperature=coverage_temperature,
         )
 
-    def forward(self, coverage_map: Tensor) -> Tuple[Tensor, Dict[str, float]]:
+    def forward(
+        self,
+        coverage_map: Tensor,
+        spatial_weights: Tensor | None = None,
+    ) -> Tuple[Tensor, Dict[str, float]]:
         """Compute the total loss and detached auxiliary loss components.
 
         Parameters
@@ -249,6 +370,9 @@ class MemeticCompositeLoss(nn.Module):
         coverage_map : torch.Tensor
             Radio map tensor in linear Watts with shape ``(H, W)``,
             ``(B, H, W)``, or any batch-plus-spatial equivalent.
+        spatial_weights : torch.Tensor | None
+            Optional demand-weight tensor aligned to the radio map. When
+            omitted, uniform weights are used.
 
         Returns
         -------
@@ -258,12 +382,15 @@ class MemeticCompositeLoss(nn.Module):
             detached scalar components for logging.
         """
         coverage_map_dbm = _coverage_map_to_dbm(coverage_map)
-        softmin_loss = self.softmin_loss(coverage_map_dbm)
+        if spatial_weights is None:
+            spatial_weights = torch.ones_like(coverage_map_dbm)
+
+        softmin_loss = self.softmin_loss(coverage_map_dbm, spatial_weights)
         coverage_loss = self.coverage_loss(coverage_map_dbm)
         total_loss = self.alpha * softmin_loss + self.beta * coverage_loss
 
         components = {
-            "softmin_loss": float(softmin_loss.detach().item()),
+            "weighted_normalized_softmin_loss": float(softmin_loss.detach().item()),
             "coverage_loss": float(coverage_loss.detach().item()),
         }
         return total_loss, components
@@ -271,6 +398,7 @@ class MemeticCompositeLoss(nn.Module):
 
 __all__ = [
     "SoftMinLoss",
+    "WeightedNormalizedSoftMinLoss",
     "SoftCoverageLoss",
     "MemeticCompositeLoss",
 ]

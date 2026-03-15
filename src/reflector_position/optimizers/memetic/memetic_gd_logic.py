@@ -20,6 +20,8 @@ _GD_OPTIMIZE_PARAM_KEYS = {
     "samples_per_tx",
     "max_depth",
     "softmin_temperature",
+    "softmin_floor_dbm",
+    "softmin_ceil_dbm",
     "temperature",
     "coverage_threshold_dbm",
     "alpha",

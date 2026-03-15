@@ -32,7 +32,9 @@
   "objective_params": {
     "alpha": 0.99,
     "beta": 0.01,
-    "softmin_temperature": 0.15,
+    "softmin_temperature": 0.05,
+    "softmin_floor_dbm": -120.0,
+    "softmin_ceil_dbm": -70.0,
     "coverage_threshold_dbm": -120.0,
     "coverage_temperature": 2.0
   },
