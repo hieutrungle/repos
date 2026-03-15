@@ -70,13 +70,10 @@ _GD_OPTIMIZATION_PARAM_DEFAULTS: Dict[str, Any] = {
 }
 
 _DEMAND_CONFIG_DEFAULTS: Dict[str, Any] = {
-    "enabled": True,
-    "bounding_boxes": [
-        [[20, 20], [25, 25]],
-        [[10, 10], [15, 15]],
-    ],
-    "box_weights": [5.0, 2.0],
-    "apply_blur": True,
+    "enabled": False,
+    "bounding_boxes": [],
+    "box_weights": [],
+    "apply_blur": False,
 }
 
 _LEGACY_OBJECTIVE_KEY_MAP = {
@@ -158,8 +155,21 @@ def _resolve_gd_optimization_params(
 
 def _resolve_demand_config(config_args: Mapping[str, Any]) -> Dict[str, Any]:
     """Resolve spatial demand-map configuration from the top-level config."""
+    raw_demand = config_args.get("demand_config")
+    explicit_weighted_stats = False
+    if isinstance(raw_demand, Mapping):
+        raw_boxes = raw_demand.get("bounding_boxes")
+        raw_weights = raw_demand.get("box_weights")
+        explicit_weighted_stats = (
+            isinstance(raw_boxes, list)
+            and isinstance(raw_weights, list)
+            and len(raw_boxes) > 0
+            and len(raw_weights) > 0
+        )
+
     demand_config = dict(_DEMAND_CONFIG_DEFAULTS)
     demand_config.update(_coerce_mapping(config_args, "demand_config"))
+    demand_config["_report_weighted_stats"] = bool(explicit_weighted_stats)
     return demand_config
 
 

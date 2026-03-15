@@ -272,6 +272,21 @@ class RawOptimizationWorker:
             valid_mask=valid_mask,
         )
 
+    def _has_explicit_weighted_reporting_config(self) -> bool:
+        """Return True when weighted reporting was explicitly requested."""
+        if "_report_weighted_stats" in self.demand_config:
+            return bool(self.demand_config.get("_report_weighted_stats", False))
+
+        # Backward-compatible fallback for older configs that set these keys.
+        bounding_boxes = self.demand_config.get("bounding_boxes")
+        box_weights = self.demand_config.get("box_weights")
+        return (
+            isinstance(bounding_boxes, Sequence)
+            and isinstance(box_weights, Sequence)
+            and len(bounding_boxes) > 0
+            and len(box_weights) > 0
+        )
+
     def optimize(
         self,
         task_id: int,
@@ -325,6 +340,7 @@ class RawOptimizationWorker:
             loss_kwargs=loss_kwargs,
             spatial_weights=self.spatial_weights,
             radio_map_geometry=self.radio_map_geometry,
+            include_weighted_reporting=self._has_explicit_weighted_reporting_config(),
         )
 
         start_time = time.time()
@@ -366,6 +382,7 @@ class RawOptimizationWorker:
             scene=self.scene,
             spatial_weights=self.spatial_weights,
             radio_map_geometry=self.radio_map_geometry,
+            include_weighted_reporting=self._has_explicit_weighted_reporting_config(),
             **optimizer_kwargs_local,
         )
 

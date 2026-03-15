@@ -15,6 +15,42 @@ Constants:
 import torch
 import torch.nn as nn
 
+
+def _weighted_quantile(values: torch.Tensor, weights: torch.Tensor, q: float) -> torch.Tensor:
+    """Compute a weighted quantile for 1-D tensors.
+
+    Parameters
+    ----------
+    values : torch.Tensor
+        1-D tensor of sortable values.
+    weights : torch.Tensor
+        1-D non-negative weights aligned with ``values``.
+    q : float
+        Target quantile in [0, 1].
+
+    Returns
+    -------
+    torch.Tensor
+        Weighted quantile value on the same device as inputs.
+    """
+    if values.numel() == 0:
+        return torch.tensor(float("nan"), dtype=values.dtype, device=values.device)
+
+    q_clamped = min(max(float(q), 0.0), 1.0)
+    sort_idx = torch.argsort(values)
+    sorted_values = values[sort_idx]
+    sorted_weights = weights[sort_idx]
+    cumulative = torch.cumsum(sorted_weights, dim=0)
+    total = cumulative[-1]
+
+    if total <= 0:
+        return torch.tensor(float("nan"), dtype=values.dtype, device=values.device)
+
+    threshold = q_clamped * total
+    idx = int(torch.searchsorted(cumulative, threshold, right=False).item())
+    idx = min(max(idx, 0), int(sorted_values.numel()) - 1)
+    return sorted_values[idx]
+
 # ---------------------------------------------------------------------------
 # Global epsilon — single source of truth for all power-floor comparisons
 # ---------------------------------------------------------------------------
@@ -57,6 +93,8 @@ def compute_thresholded_reporting_metrics(
     rss_map: torch.Tensor,
     threshold_dbm: float = -120.0,
     percentile: float = 0.05,
+    spatial_weights: torch.Tensor | None = None,
+    include_weighted: bool = False,
 ) -> dict[str, float]:
     """Compute report metrics using only threshold-valid cells.
 
@@ -71,6 +109,16 @@ def compute_thresholded_reporting_metrics(
     threshold value itself and coverage is ``0``.
     """
     flat_map = _flatten_rss_map(rss_map)
+
+    weighted_defaults = {
+        "weighted_min_rss_dbm": float("nan"),
+        "weighted_p5_rss_dbm": float("nan"),
+        "weighted_mean_rss_dbm": float("nan"),
+        "weighted_coverage_pct": float("nan"),
+        "weighted_valid_cell_count": float("nan"),
+        "weighted_total_cell_count": float("nan"),
+    }
+
     total_cells = int(flat_map.numel())
     if total_cells == 0:
         return {
@@ -80,6 +128,7 @@ def compute_thresholded_reporting_metrics(
             "coverage_pct": 0.0,
             "valid_cell_count": 0.0,
             "total_cell_count": 0.0,
+            **weighted_defaults,
         }
 
     valid_mask = _valid_reporting_mask(flat_map, threshold_dbm)
@@ -104,12 +153,62 @@ def compute_thresholded_reporting_metrics(
             "mean_rss_dbm": float(valid_dbm.mean().item()),
         }
 
-    return {
+    metrics = {
         **stats_dbm,
         "coverage_pct": float(coverage_pct),
         "valid_cell_count": float(valid_count),
         "total_cell_count": float(total_cells),
     }
+
+    if not include_weighted:
+        metrics.update(weighted_defaults)
+        return metrics
+
+    if spatial_weights is None:
+        metrics.update(weighted_defaults)
+        return metrics
+
+    flat_weights = _flatten_rss_map(spatial_weights).to(dtype=flat_map.dtype, device=flat_map.device)
+    if int(flat_weights.numel()) != total_cells:
+        metrics.update(weighted_defaults)
+        return metrics
+
+    non_negative_weights = torch.clamp(flat_weights, min=0.0)
+    total_weight = float(non_negative_weights.sum().item())
+    if total_weight <= 0.0:
+        metrics.update(weighted_defaults)
+        return metrics
+
+    valid_weights = non_negative_weights[valid_mask]
+    valid_weight_sum = float(valid_weights.sum().item())
+
+    if valid_count == 0 or valid_weight_sum <= 0.0:
+        weighted_stats = {
+            "weighted_min_rss_dbm": float(threshold_dbm),
+            "weighted_p5_rss_dbm": float(threshold_dbm),
+            "weighted_mean_rss_dbm": float(threshold_dbm),
+            "weighted_coverage_pct": 0.0,
+            "weighted_valid_cell_count": 0.0,
+            "weighted_total_cell_count": float(total_weight),
+        }
+    else:
+        valid_dbm = rss_to_dbm(valid_rss)
+        normalized_valid_weights = valid_weights / valid_weights.sum()
+        weighted_mean = torch.sum(valid_dbm * normalized_valid_weights)
+        weighted_p5 = _weighted_quantile(valid_dbm.float(), valid_weights.float(), float(percentile))
+        weighted_min = _weighted_quantile(valid_dbm.float(), valid_weights.float(), 0.0)
+
+        weighted_stats = {
+            "weighted_min_rss_dbm": float(weighted_min.item()),
+            "weighted_p5_rss_dbm": float(weighted_p5.item()),
+            "weighted_mean_rss_dbm": float(weighted_mean.item()),
+            "weighted_coverage_pct": float(100.0 * valid_weight_sum / total_weight),
+            "weighted_valid_cell_count": float(valid_weight_sum),
+            "weighted_total_cell_count": float(total_weight),
+        }
+
+    metrics.update(weighted_stats)
+    return metrics
 
 
 def compute_min_rss_metric(rss_map: torch.Tensor) -> torch.Tensor:

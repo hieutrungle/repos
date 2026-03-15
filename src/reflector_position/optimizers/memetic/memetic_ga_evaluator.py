@@ -47,6 +47,7 @@ class StaticConfigurationEvaluator:
         loss_kwargs: Mapping[str, Any],
         spatial_weights: Optional[torch.Tensor] = None,
         radio_map_geometry: Optional[Mapping[str, Any]] = None,
+        include_weighted_reporting: bool = False,
     ) -> None:
         self.scene = scene
         self.reflector_controller = reflector_controller
@@ -63,6 +64,7 @@ class StaticConfigurationEvaluator:
             else None
         )
         self.radio_map_geometry = dict(radio_map_geometry or {})
+        self.include_weighted_reporting = bool(include_weighted_reporting)
 
     def evaluate(self, task: Mapping[str, Any]) -> Dict[str, Any]:
         """Evaluate a single static configuration and return standardized output.
@@ -119,6 +121,8 @@ class StaticConfigurationEvaluator:
         metrics = compute_thresholded_reporting_metrics(
             coverage_map,
             threshold_dbm=self.loss_module.coverage_loss.threshold_dbm,
+            spatial_weights=self.spatial_weights,
+            include_weighted=self.include_weighted_reporting,
         )
         return dict(metrics)
 

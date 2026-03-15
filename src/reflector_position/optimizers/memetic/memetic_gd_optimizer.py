@@ -92,6 +92,7 @@ class MemeticGradientDescentOptimizer(BaseAPOptimizer):
         reflector_controller: Optional[ReflectorController] = None,
         spatial_weights: Optional[torch.Tensor] = None,
         radio_map_geometry: Optional[Dict[str, Any]] = None,
+        include_weighted_reporting: bool = False,
         reflector_u: Optional[float] = None,
         reflector_v: Optional[float] = None,
         reflector_target: Optional[Tuple[float, float, float]] = None,
@@ -147,6 +148,7 @@ class MemeticGradientDescentOptimizer(BaseAPOptimizer):
             else None
         )
         self.radio_map_geometry = dict(radio_map_geometry or {})
+        self.include_weighted_reporting = bool(include_weighted_reporting)
         self.reflector_u_raw: Optional[torch.Tensor] = None
         self.reflector_v_raw: Optional[torch.Tensor] = None
         self.reflector_target: Optional[torch.Tensor] = None
@@ -681,6 +683,8 @@ class MemeticGradientDescentOptimizer(BaseAPOptimizer):
         physical_metrics = compute_thresholded_reporting_metrics(
             coverage_map,
             threshold_dbm=self.loss_module.coverage_loss.threshold_dbm,
+            spatial_weights=self.spatial_weights,
+            include_weighted=self.include_weighted_reporting,
         )
         repulsion_loss = float(self._compute_repulsion_loss().item())
 

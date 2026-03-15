@@ -21,8 +21,8 @@
     "y_max": 34.5
   },
   "fixed_z": 3.8,
-  "num_pool_workers": 3,
-  "gpu_fraction": 0.333,
+  "num_pool_workers": 4,
+  "gpu_fraction": 0.25,
   "random_seed": 4,
   "num_aps": 1,
   "min_ap_separation": 0.0,
@@ -35,7 +35,7 @@
       [[5.0, 35.0], [11.0, 5.0]],
       [[30.0, 26.0], [35.0, 5.0]]
     ],
-    "box_weights": [5.0, 2.0],
+    "box_weights": [4.0, 4.0],
     "apply_blur": true
   },
   "objective_params": {
@@ -60,11 +60,11 @@
     "max_depth": 13,
     "verbose": false
   },
-  "k_seeds": 5,
+  "k_seeds": 8,
   "d_corr": 0.0,
   "gd_optimization_params": {
-    "num_iterations": 50,
-    "learning_rate": 0.02,
+    "num_iterations": 100,
+    "learning_rate": 0.01,
     "samples_per_tx": 1000000,
     "max_depth": 13,
     "verbose": false
