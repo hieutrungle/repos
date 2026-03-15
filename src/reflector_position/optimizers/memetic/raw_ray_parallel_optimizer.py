@@ -9,12 +9,18 @@ plotting, and summaries.
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import ray
+import torch
 from ray.util.actor_pool import ActorPool
+from sionna.rt import RadioMapSolver
 
+from reflector_position.metrics import POWER_EPSILON
+from reflector_position.optimizers.memetic.demand_weights import (
+    generate_spatial_weight_map,
+)
 from reflector_position.optimizers.memetic.memetic_ga_evaluator import (
     StaticConfigurationEvaluator,
 )
@@ -59,10 +65,16 @@ class RawOptimizationWorker:
         self,
         worker_id: int,
         scene_config: Dict[str, Any],
+        demand_config: Optional[Mapping[str, Any]] = None,
     ):
         self.worker_id = worker_id
         self._run_count = 0
-        self.scene, self.reflector_controller = self._load_scene(scene_config)
+        self.scene_config = dict(scene_config)
+        self.demand_config = dict(demand_config or {})
+        self.scene, self.reflector_controller = self._load_scene(self.scene_config)
+        self.device = self._resolve_device()
+        self.radio_map_geometry: Dict[str, Any] = {}
+        self.spatial_weights = self._build_spatial_weights()
 
     def _load_scene(self, scene_config: Dict[str, Any]) -> Tuple[Any, Optional[Any]]:
         """Load scene and optional reflector controller."""
@@ -70,10 +82,10 @@ class RawOptimizationWorker:
 
         loaded = setup_building_floor_scene(
             scene_path=str(scene_config["scene_path"]),
-            frequency=scene_config.get("frequency", 5.18e9),
+            frequency=scene_config.get("frequency", 6e9),
             tx_positions=scene_config.get("tx_positions", None),
             tx_power_dbm=scene_config.get("tx_power_dbm", 5.0),
-            rx_position=scene_config.get("rx_position", (16.0, 6.5, 1.5)),
+            rx_position=scene_config.get("rx_position", (16.0, 16.5, 1.5)),
             reflector_enabled=scene_config.get("reflector_enabled", False),
             reflector_size=tuple(scene_config.get("reflector_size", (2.0, 2.0))),
             wall_top_left=scene_config.get("wall_top_left", None),
@@ -85,6 +97,180 @@ class RawOptimizationWorker:
             scene, reflector_controller = loaded
             return scene, reflector_controller
         return loaded, None
+
+    def _resolve_device(self) -> torch.device:
+        """Resolve the torch device used for worker-local tensors."""
+        if self.reflector_controller is not None:
+            return torch.device(self.reflector_controller.device)
+
+        configured_device = str(self.scene_config.get("device", "cuda"))
+        if configured_device.startswith("cuda") and not torch.cuda.is_available():
+            return torch.device("cpu")
+        return torch.device(configured_device)
+
+    def _build_default_task(self) -> Dict[str, Any]:
+        """Build a default task payload used for worker-level map initialization.
+
+        This mirrors the configuration flow used by ``StaticConfigurationEvaluator``
+        so the precomputed demand map is generated on the same scene state
+        convention as GA/GD evaluations.
+        """
+        transmitters = list(self.scene.transmitters.values())
+        if not transmitters:
+            raise ValueError("Scene must contain at least one transmitter")
+
+        first_tx_position = np.array(transmitters[0].position, dtype=np.float32)
+        fixed_z = float(first_tx_position[2])
+        task: Dict[str, Any] = {
+            "initial_positions": [
+                (float(np.array(tx.position)[0]), float(np.array(tx.position)[1]))
+                for tx in transmitters
+            ],
+            "fixed_z": fixed_z,
+            "initial_directions_xy": None,
+        }
+
+        focal_point = self.scene_config.get("focal_point")
+        if self.reflector_controller is not None and focal_point is not None:
+            if isinstance(focal_point, Sequence) and len(focal_point) == 3:
+                task["reflector_u"] = float(0.5)
+                task["reflector_v"] = float(0.5)
+                task["reflector_target"] = (
+                    float(focal_point[0]),
+                    float(focal_point[1]),
+                    float(focal_point[2]),
+                )
+
+        return task
+
+    def _build_tx_positions(self, task: Mapping[str, Any]) -> List[List[float]]:
+        """Convert task AP coordinates into 3-D transmitter positions."""
+        raw_positions = task.get("initial_positions")
+        if not isinstance(raw_positions, Sequence) or len(raw_positions) == 0:
+            raise ValueError("task must include non-empty 'initial_positions'")
+
+        fixed_z = float(task.get("fixed_z", 0.0))
+        tx_positions: List[List[float]] = []
+        for position in raw_positions:
+            if not isinstance(position, Sequence) or len(position) < 2:
+                raise ValueError("each entry in 'initial_positions' must contain at least (x, y)")
+            tx_positions.append([
+                float(position[0]),
+                float(position[1]),
+                fixed_z,
+            ])
+        return tx_positions
+
+    def _configure_transmitters(
+        self,
+        tx_positions: Sequence[Sequence[float]],
+        directions_xy: Any,
+    ) -> None:
+        """Update scene transmitter positions and optional look directions."""
+        transmitters = list(self.scene.transmitters.values())
+        if len(tx_positions) > len(transmitters):
+            raise ValueError(
+                f"task defines {len(tx_positions)} APs but scene only has {len(transmitters)} transmitters"
+            )
+
+        directions_list: Optional[Sequence[Any]]
+        if directions_xy is None:
+            directions_list = None
+        elif isinstance(directions_xy, Sequence):
+            directions_list = directions_xy
+            if len(directions_list) != len(tx_positions):
+                raise ValueError(
+                    "'initial_directions_xy' must have the same length as 'initial_positions'"
+                )
+        else:
+            raise ValueError("'initial_directions_xy' must be a sequence or None")
+
+        for index, transmitter in enumerate(transmitters[: len(tx_positions)]):
+            position = [float(coord) for coord in tx_positions[index]]
+            transmitter.position = position
+
+            if directions_list is None or directions_list[index] is None:
+                continue
+
+            direction_xy = directions_list[index]
+            if not isinstance(direction_xy, Sequence) or len(direction_xy) < 2:
+                raise ValueError(
+                    "each entry in 'initial_directions_xy' must contain at least (dx, dy)"
+                )
+
+            dx = float(direction_xy[0])
+            dy = float(direction_xy[1])
+            target = [position[0] + dx, position[1] + dy, position[2]]
+            transmitter.look_at(target)
+
+    def _configure_reflector(
+        self,
+        tx_positions: Sequence[Sequence[float]],
+        task: Mapping[str, Any],
+    ) -> None:
+        """Apply reflector state when a controller and task parameters exist."""
+        controller = self.reflector_controller
+        if controller is None:
+            return
+
+        required_keys = ("reflector_u", "reflector_v", "reflector_target")
+        if not all(key in task and task[key] is not None for key in required_keys):
+            return
+
+        reflector_target = task["reflector_target"]
+        if not isinstance(reflector_target, Sequence) or len(reflector_target) != 3:
+            raise ValueError("'reflector_target' must be a 3-D point")
+
+        controller.u = torch.tensor(float(task["reflector_u"]), dtype=torch.float32, device=self.device)
+        controller.v = torch.tensor(float(task["reflector_v"]), dtype=torch.float32, device=self.device)
+        controller.set_tx_position(np.asarray(tx_positions[0], dtype=np.float32))
+        controller.set_focal_point(
+            torch.tensor(reflector_target, dtype=torch.float32, device=self.device),
+            requires_grad=False,
+        )
+        controller.orient_to_target()
+        controller.apply_to_scene()
+
+    def _build_spatial_weights(self) -> torch.Tensor:
+        """Build one static normalized demand map for this worker's scene."""
+        task = self._build_default_task()
+        tx_positions = self._build_tx_positions(task)
+        self._configure_transmitters(tx_positions, task.get("initial_directions_xy"))
+        self._configure_reflector(tx_positions, task)
+
+        solver = RadioMapSolver()
+        radio_map = solver(
+            self.scene,
+            cell_size=(1.0, 1.0),
+            samples_per_tx=100_000,
+            max_depth=3,
+            refraction=True,
+            diffraction=True,
+        )
+
+        # Lock a single map geometry for all subsequent evaluations in this
+        # worker so demand weights and coverage maps always share HxW shape.
+        self.radio_map_geometry = {
+            "center": np.array(radio_map.center).tolist(),
+            "size": np.array(radio_map.size).tolist(),
+            "orientation": np.array(radio_map.orientation).tolist(),
+        }
+
+        coverage_map = torch.from_numpy(np.array(radio_map.rss)).to(self.device)
+        flat_batches = coverage_map.reshape(-1, coverage_map.shape[-2], coverage_map.shape[-1])
+        valid_mask = (flat_batches > POWER_EPSILON).any(dim=0)
+        
+        if not torch.any(valid_mask):
+            valid_mask = torch.ones_like(valid_mask, dtype=torch.bool, device=self.device)
+
+        num_rows, num_cols = int(valid_mask.shape[0]), int(valid_mask.shape[1])
+
+        return generate_spatial_weight_map(
+            num_rows=num_rows,
+            num_cols=num_cols,
+            demand_config=self.demand_config,
+            valid_mask=valid_mask,
+        )
 
     def optimize(
         self,
@@ -137,6 +323,8 @@ class RawOptimizationWorker:
             scene=self.scene,
             reflector_controller=self.reflector_controller,
             loss_kwargs=loss_kwargs,
+            spatial_weights=self.spatial_weights,
+            radio_map_geometry=self.radio_map_geometry,
         )
 
         start_time = time.time()
@@ -176,6 +364,8 @@ class RawOptimizationWorker:
 
         optimizer = MemeticGradientDescentOptimizer(
             scene=self.scene,
+            spatial_weights=self.spatial_weights,
+            radio_map_geometry=self.radio_map_geometry,
             **optimizer_kwargs_local,
         )
 
@@ -275,13 +465,16 @@ class RawRayParallelOptimizer:
         self,
         num_workers: int = 4,
         gpu_fraction: float = 0.25,
+        demand_config: Optional[Mapping[str, Any]] = None,
     ):
         self.num_workers = int(num_workers)
         self.gpu_fraction = float(gpu_fraction)
+        self.demand_config = dict(demand_config or {})
 
         self._workers: List[Any] = []
         self._pool: Optional[ActorPool] = None
         self._scene_config: Optional[Dict[str, Any]] = None
+        self._demand_config: Dict[str, Any] = dict(self.demand_config)
 
         if not ray.is_initialized():
             ray.init(ignore_reinit_error=True)
@@ -302,7 +495,11 @@ class RawRayParallelOptimizer:
 
     def _ensure_pool(self, scene_config: Dict[str, Any], verbose: bool = False) -> None:
         """Create or reuse actor pool for the given scene config."""
-        if self._pool is not None and self._scene_config == scene_config:
+        if (
+            self._pool is not None
+            and self._scene_config == scene_config
+            and self._demand_config == self.demand_config
+        ):
             return
 
         if self._workers:
@@ -319,11 +516,13 @@ class RawRayParallelOptimizer:
             RawOptimizationWorker.options(**actor_options).remote(
                 worker_id=i,
                 scene_config=scene_config,
+                demand_config=self.demand_config,
             )
             for i in range(self.num_workers)
         ]
         self._pool = ActorPool(self._workers)
         self._scene_config = dict(scene_config)
+        self._demand_config = dict(self.demand_config)
 
     def _build_task_configs(
         self,
@@ -445,6 +644,7 @@ class RawRayActorPoolExecutor:
     def __init__(
         self,
         scene_config: Dict[str, Any],
+        demand_config: Optional[Mapping[str, Any]] = None,
         num_workers: int = 4,
         gpu_fraction: float = 0.25,
         verbose: bool = True,
@@ -452,6 +652,7 @@ class RawRayActorPoolExecutor:
         self.num_workers = int(num_workers)
         self.gpu_fraction = float(gpu_fraction)
         self.scene_config = dict(scene_config)
+        self.demand_config = dict(demand_config or {})
 
         if not ray.is_initialized():
             ray.init(ignore_reinit_error=True)
@@ -470,6 +671,7 @@ class RawRayActorPoolExecutor:
             RawOptimizationWorker.options(**actor_options).remote(
                 worker_id=i,
                 scene_config=self.scene_config,
+                demand_config=self.demand_config,
             )
             for i in range(self.num_workers)
         ]

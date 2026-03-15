@@ -4,16 +4,16 @@
     "frequency": 6000000000.0,
     "tx_power_dbm": 5.0,
     "tx_positions": [
-      [20.0, 20.0, 3.8]
+      [25.0, 25.0, 3.8]
     ],
     "reflector_enabled": true,
     "reflector_size": [2.0, 2.0],
     "wall_top_left": [15.0, 34.0, 3.0],
     "wall_bottom_right": [34.0, 34.0, 1.0],
-    "focal_point": [20.0, 20.0, 1.5],
+    "focal_point": [25.0, 25.0, 1.5],
     "device": "cuda"
   },
-  "output_dir": "results/experiments/",
+  "output_dir": "tmp_results/experiments/",
   "position_bounds": {
     "x_min": 5.5,
     "x_max": 34.5,
@@ -21,17 +21,26 @@
     "y_max": 34.5
   },
   "fixed_z": 3.8,
-  "num_pool_workers": 2,
-  "gpu_fraction": 0.5,
+  "num_pool_workers": 3,
+  "gpu_fraction": 0.333,
   "random_seed": 4,
   "num_aps": 1,
   "min_ap_separation": 0.0,
   "optimize_orientation": true,
   "reflector_enabled": true,
   "focal_z": 1.5,
+  "demand_config": {
+    "enabled": true,
+    "bounding_boxes": [
+      [[5.0, 35.0], [11.0, 5.0]],
+      [[30.0, 26.0], [35.0, 5.0]]
+    ],
+    "box_weights": [5.0, 2.0],
+    "apply_blur": true
+  },
   "objective_params": {
-    "alpha": 0.99,
-    "beta": 0.01,
+    "alpha": 0.999,
+    "beta": 0.001,
     "softmin_temperature": 0.05,
     "softmin_floor_dbm": -120.0,
     "softmin_ceil_dbm": -70.0,
@@ -59,6 +68,11 @@
     "samples_per_tx": 1000000,
     "max_depth": 13,
     "verbose": false
+  },
+  "coverage_plot_settings": {
+    "samples_per_tx": 1000000,
+    "max_depth": 13,
+    "resolution": [1200, 900]
   },
   "verbose": true
 }

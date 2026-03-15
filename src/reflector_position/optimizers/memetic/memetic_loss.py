@@ -273,7 +273,9 @@ class WeightedNormalizedSoftMinLoss(nn.Module):
             else:
                 raise ValueError(
                     "spatial_weights must match coverage_map_dbm shape "
-                    "(or have a single broadcastable batch axis)"
+                    "(or have a single broadcastable batch axis). "
+                    f"Got coverage_map_dbm shape={tuple(coverage_map_dbm.shape)} "
+                    f"and spatial_weights shape={tuple(spatial_weights.shape)}"
                 )
 
         if torch.any(flat_weights < 0):

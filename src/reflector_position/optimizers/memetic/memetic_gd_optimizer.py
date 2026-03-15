@@ -90,6 +90,8 @@ class MemeticGradientDescentOptimizer(BaseAPOptimizer):
         optimize_orientation: bool = True,
         repulsion_weight: float = 1.0,
         reflector_controller: Optional[ReflectorController] = None,
+        spatial_weights: Optional[torch.Tensor] = None,
+        radio_map_geometry: Optional[Dict[str, Any]] = None,
         reflector_u: Optional[float] = None,
         reflector_v: Optional[float] = None,
         reflector_target: Optional[Tuple[float, float, float]] = None,
@@ -139,6 +141,12 @@ class MemeticGradientDescentOptimizer(BaseAPOptimizer):
         )
 
         self.reflector_controller = reflector_controller
+        self.spatial_weights = (
+            spatial_weights.to(device=self.device, dtype=torch.float32)
+            if spatial_weights is not None
+            else None
+        )
+        self.radio_map_geometry = dict(radio_map_geometry or {})
         self.reflector_u_raw: Optional[torch.Tensor] = None
         self.reflector_v_raw: Optional[torch.Tensor] = None
         self.reflector_target: Optional[torch.Tensor] = None
@@ -391,11 +399,16 @@ class MemeticGradientDescentOptimizer(BaseAPOptimizer):
                 max_depth=max_depth,
                 refraction=True,
                 diffraction=True,
+                **self.radio_map_geometry,
             )
             return radio_map.rss
 
         coverage_map = compute_rss(*wrap_args)
-        total_loss, loss_components = self.loss_module(coverage_map)
+        coverage_map = coverage_map.squeeze()
+        total_loss, loss_components = self.loss_module(
+            coverage_map=coverage_map,
+            spatial_weights=self.spatial_weights,
+        )
 
         repulsion_loss = self._compute_repulsion_loss()
         total_loss = total_loss + self.repulsion_weight * repulsion_loss
@@ -656,10 +669,15 @@ class MemeticGradientDescentOptimizer(BaseAPOptimizer):
             max_depth=max_depth,
             refraction=True,
             diffraction=True,
+            **self.radio_map_geometry,
         )
         coverage_map = torch.from_numpy(np.array(radio_map.rss)).to(self.device)
+        coverage_map = coverage_map.squeeze()
 
-        computed_total_loss, computed_loss_components = self.loss_module(coverage_map)
+        computed_total_loss, computed_loss_components = self.loss_module(
+            coverage_map=coverage_map,
+            spatial_weights=self.spatial_weights,
+        )
         physical_metrics = compute_thresholded_reporting_metrics(
             coverage_map,
             threshold_dbm=self.loss_module.coverage_loss.threshold_dbm,

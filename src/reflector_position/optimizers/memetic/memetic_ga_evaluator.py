@@ -45,6 +45,8 @@ class StaticConfigurationEvaluator:
         scene: sionna.rt.Scene,
         reflector_controller: Optional[ReflectorController],
         loss_kwargs: Mapping[str, Any],
+        spatial_weights: Optional[torch.Tensor] = None,
+        radio_map_geometry: Optional[Mapping[str, Any]] = None,
     ) -> None:
         self.scene = scene
         self.reflector_controller = reflector_controller
@@ -55,6 +57,12 @@ class StaticConfigurationEvaluator:
             self.device = self.reflector_controller.device
         else:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.spatial_weights = (
+            spatial_weights.to(device=self.device, dtype=torch.float32)
+            if spatial_weights is not None
+            else None
+        )
+        self.radio_map_geometry = dict(radio_map_geometry or {})
 
     def evaluate(self, task: Mapping[str, Any]) -> Dict[str, Any]:
         """Evaluate a single static configuration and return standardized output.
@@ -88,10 +96,17 @@ class StaticConfigurationEvaluator:
                 max_depth=int(task.get("max_depth", 13)),
                 refraction=True,
                 diffraction=True,
+                **self.radio_map_geometry,
             )
             coverage_map = torch.from_numpy(np.array(radio_map.rss)).to(self.device)
+            # Sionna may expose extra singleton axes (e.g. [1,H,W] or [H,W,1]).
+            # Remove them so the demand map aligns with the spatial grid.
+            coverage_map = coverage_map.squeeze()
 
-            total_loss, loss_components = self.loss_module(coverage_map)
+            total_loss, loss_components = self.loss_module(
+                coverage_map=coverage_map,
+                spatial_weights=self.spatial_weights,
+            )
             physical_metrics = self._compute_physical_metrics(coverage_map)
             return {
                 "primary_fitness": -float(total_loss.item()),

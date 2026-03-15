@@ -166,6 +166,57 @@ def _ensure_list(value: Any) -> List[Any]:
     return [value]
 
 
+def _is_number(value: Any) -> bool:
+    """Return True for int/float values but not booleans."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _is_grid_box(value: Any) -> bool:
+    """Return True when value matches one bounding-box shape ``[[r1,c1],[r2,c2]]``."""
+    if not isinstance(value, list) or len(value) != 2:
+        return False
+    corners_valid = all(
+        isinstance(corner, list)
+        and len(corner) == 2
+        and _is_number(corner[0])
+        and _is_number(corner[1])
+        for corner in value
+    )
+    return corners_valid
+
+
+def _is_grid_bounding_boxes(value: Any) -> bool:
+    """Return True when value matches one full ``bounding_boxes`` payload."""
+    return isinstance(value, list) and len(value) > 0 and all(_is_grid_box(box) for box in value)
+
+
+def _grid_values_for_key(key: str, raw_value: Any) -> List[Any]:
+    """Expand one grid value while preserving structured demand payloads.
+
+    For ``demand_config.bounding_boxes`` and ``demand_config.box_weights``, a
+    single list payload should be treated as one candidate, not as an axis to
+    iterate element-wise.
+    """
+    if not isinstance(raw_value, list):
+        return [raw_value]
+
+    if key.endswith("bounding_boxes"):
+        if _is_grid_bounding_boxes(raw_value):
+            return [raw_value]
+        if all(_is_grid_bounding_boxes(item) for item in raw_value):
+            return raw_value
+        return raw_value
+
+    if key.endswith("box_weights"):
+        if all(_is_number(item) for item in raw_value):
+            return [raw_value]
+        if all(isinstance(item, list) and all(_is_number(v) for v in item) for item in raw_value):
+            return raw_value
+        return raw_value
+
+    return raw_value
+
+
 def _extract_trial_overrides(trial: Mapping[str, Any]) -> Dict[str, Any]:
     """Extract the effective override payload for one explicit trial."""
     if "overrides" in trial:
@@ -226,7 +277,7 @@ def _build_sweep_group_trials(spec: Mapping[str, Any], shared: Mapping[str, Any]
             _deep_update(base_overrides, dict(base_payload))
 
         grid_keys = [str(key) for key in grid.keys()]
-        grid_values = [_ensure_list(grid[key]) for key in grid_keys]
+        grid_values = [_grid_values_for_key(key, grid[key]) for key in grid_keys]
         name_prefix = _sanitize_name(str(group.get("name_prefix", f"group_{group_index:02d}")))
 
         for combo_index, combo in enumerate(product(*grid_values), start=1):

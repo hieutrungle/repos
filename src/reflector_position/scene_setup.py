@@ -34,7 +34,7 @@ def setup_building_floor_scene(
     frequency: float = 5.18e9,
     tx_positions: Optional[List[Tuple[float, float, float]]] = None,
     tx_power_dbm: float = 5.0,
-    rx_position: Tuple[float, float, float] = (16.0, 6.5, 1.5),
+    rx_position: Tuple[float, float, float] = (16.0, 16.5, 1.5),
     # --- reflector parameters (all optional) ---
     reflector_enabled: bool = False,
     reflector_size: Tuple[float, float] = (2.0, 2.0),
@@ -107,7 +107,7 @@ def setup_building_floor_scene(
     )
 
     if tx_positions is None:
-        tx_positions = [(10.0, 20.0, 3.8)]
+        tx_positions = [(25.0, 25.0, 3.8)]
 
     n_txs = 1  # power-split kept at 1 AP for legacy compat
     power_per_tx = tx_power_dbm / n_txs
@@ -167,10 +167,10 @@ def setup_building_floor_scene(
 
     controller = ReflectorController(
         reflector=reflector_obj,
-        wall_top_left=np.asarray(wall_top_left, dtype=np.float32) if wall_top_left is not None else None,
-        wall_bottom_right=np.asarray(wall_bottom_right, dtype=np.float32) if wall_bottom_right is not None else None,
+        wall_top_left=np.asarray(wall_top_left, dtype=np.float32),
+        wall_bottom_right=np.asarray(wall_bottom_right, dtype=np.float32),
         tx_position=tx_pos_arr,
-        focal_point=np.asarray(focal_point, dtype=np.float32) if focal_point is not None else None,
+        focal_point=np.asarray(focal_point, dtype=np.float32),
         device=device,
     )
 

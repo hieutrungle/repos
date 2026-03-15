@@ -790,3 +790,371 @@ def save_memetic_plots(
     artifacts["gd_trajectory_dir"] = str(plots_dir / "gd_trajectories")
     artifacts["gd_trajectory_count"] = str(len(gd_trajectory_paths))
     return artifacts
+
+
+def _as_positions_3d(raw: Any) -> Optional[List[List[float]]]:
+    """Normalize raw position payloads to a list of 3D positions."""
+    if raw is None or not isinstance(raw, Sequence) or len(raw) == 0:
+        return None
+
+    first = raw[0]
+    if isinstance(first, (list, tuple, np.ndarray)):
+        return [[float(p[0]), float(p[1]), float(p[2])] for p in raw]
+
+    if len(raw) >= 3:
+        return [[float(raw[0]), float(raw[1]), float(raw[2])]]
+    return None
+
+
+def _as_directions_3d(raw: Any) -> Optional[List[List[float]]]:
+    """Normalize raw direction payloads to a list of 3D vectors."""
+    if raw is None or not isinstance(raw, Sequence) or len(raw) == 0:
+        return None
+
+    first = raw[0]
+    if isinstance(first, (list, tuple, np.ndarray)):
+        output: List[List[float]] = []
+        for direction in raw:
+            if len(direction) >= 3:
+                output.append([float(direction[0]), float(direction[1]), float(direction[2])])
+            elif len(direction) >= 2:
+                output.append([float(direction[0]), float(direction[1]), 0.0])
+        return output or None
+
+    if len(raw) >= 3:
+        return [[float(raw[0]), float(raw[1]), float(raw[2])]]
+    if len(raw) >= 2:
+        return [[float(raw[0]), float(raw[1]), 0.0]]
+    return None
+
+
+def _extract_reflector_state(payload: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    """Extract reflector state in a uniform form: ``u``, ``v``, ``target``."""
+    reflector = payload.get("reflector")
+    if isinstance(reflector, Mapping):
+        if {
+            "u",
+            "v",
+            "focal_x",
+            "focal_y",
+            "focal_z",
+        }.issubset(reflector.keys()):
+            return {
+                "u": float(reflector["u"]),
+                "v": float(reflector["v"]),
+                "target": [
+                    float(reflector["focal_x"]),
+                    float(reflector["focal_y"]),
+                    float(reflector["focal_z"]),
+                ],
+            }
+        if {"u", "v", "target"}.issubset(reflector.keys()):
+            target = reflector["target"]
+            if isinstance(target, Sequence) and len(target) >= 3:
+                return {
+                    "u": float(reflector["u"]),
+                    "v": float(reflector["v"]),
+                    "target": [float(target[0]), float(target[1]), float(target[2])],
+                }
+
+    if {"reflector_u", "reflector_v", "reflector_target"}.issubset(payload.keys()):
+        target = payload["reflector_target"]
+        if isinstance(target, Sequence) and len(target) >= 3:
+            return {
+                "u": float(payload["reflector_u"]),
+                "v": float(payload["reflector_v"]),
+                "target": [float(target[0]), float(target[1]), float(target[2])],
+            }
+
+    return None
+
+
+def _build_ga_snapshots(summary: Mapping[str, Any], scene_config: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Build GA initial/best/final snapshots for coverage-map rendering."""
+    ga_results = summary.get("ga_results", {})
+    if not isinstance(ga_results, Mapping):
+        return {}
+
+    initial_positions = _as_positions_3d(scene_config.get("tx_positions"))
+    initial_reflector = None
+    focal_point = scene_config.get("focal_point")
+    if isinstance(focal_point, Sequence) and len(focal_point) >= 3:
+        initial_reflector = {
+            "u": 0.5,
+            "v": 0.5,
+            "target": [float(focal_point[0]), float(focal_point[1]), float(focal_point[2])],
+        }
+
+    snapshots: Dict[str, Dict[str, Any]] = {}
+    if initial_positions is not None:
+        snapshots["initial"] = {
+            "positions": initial_positions,
+            "directions": None,
+            "reflector": initial_reflector,
+        }
+
+    best_entry: Optional[Mapping[str, Any]] = None
+    hall = ga_results.get("hall_of_fame")
+    if isinstance(hall, Sequence) and len(hall) > 0 and isinstance(hall[0], Mapping):
+        best_entry = hall[0]
+    if best_entry is None:
+        seeds = ga_results.get("seeds")
+        if isinstance(seeds, Sequence) and len(seeds) > 0 and isinstance(seeds[0], Mapping):
+            best_entry = seeds[0]
+
+    if best_entry is not None:
+        best_positions = _as_positions_3d(best_entry.get("ap_positions", best_entry.get("positions")))
+        best_directions = _as_directions_3d(best_entry.get("ap_directions", best_entry.get("directions")))
+        best_reflector = _extract_reflector_state(best_entry)
+        if best_positions is not None:
+            snapshots["best"] = {
+                "positions": best_positions,
+                "directions": best_directions,
+                "reflector": best_reflector,
+            }
+
+            # GA exposes one final chosen configuration in this pipeline.
+            snapshots["final"] = {
+                "positions": best_positions,
+                "directions": best_directions,
+                "reflector": best_reflector,
+            }
+
+    return snapshots
+
+
+def _build_gd_snapshots(summary: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Build GD initial/best/final snapshots from global best task history."""
+    gd_results = summary.get("gd_results", {})
+    if not isinstance(gd_results, Mapping):
+        return {}
+    best_task = gd_results.get("global_best_result")
+    if not isinstance(best_task, Mapping):
+        return {}
+
+    history = best_task.get("history")
+    if not isinstance(history, Mapping):
+        return {}
+
+    positions_seq = history.get("positions")
+    primary_seq = history.get("primary_loss")
+    if not isinstance(positions_seq, Sequence) or len(positions_seq) == 0:
+        return {}
+
+    best_index = len(positions_seq) - 1
+    if isinstance(primary_seq, Sequence) and len(primary_seq) == len(positions_seq):
+        best_index = int(np.argmin([float(value) for value in primary_seq]))
+
+    direction_seq = history.get("directions") if isinstance(history.get("directions"), Sequence) else None
+    reflector_u = history.get("reflector_u") if isinstance(history.get("reflector_u"), Sequence) else None
+    reflector_v = history.get("reflector_v") if isinstance(history.get("reflector_v"), Sequence) else None
+    reflector_target = history.get("reflector_target") if isinstance(history.get("reflector_target"), Sequence) else None
+
+    def _snapshot_at(index: int) -> Optional[Dict[str, Any]]:
+        positions = _as_positions_3d(positions_seq[index])
+        if positions is None:
+            return None
+        directions = None
+        if direction_seq is not None and len(direction_seq) > index:
+            directions = _as_directions_3d(direction_seq[index])
+
+        reflector = None
+        if (
+            reflector_u is not None
+            and reflector_v is not None
+            and reflector_target is not None
+            and len(reflector_u) > index
+            and len(reflector_v) > index
+            and len(reflector_target) > index
+        ):
+            target = reflector_target[index]
+            if isinstance(target, Sequence) and len(target) >= 3:
+                reflector = {
+                    "u": float(reflector_u[index]),
+                    "v": float(reflector_v[index]),
+                    "target": [float(target[0]), float(target[1]), float(target[2])],
+                }
+
+        return {
+            "positions": positions,
+            "directions": directions,
+            "reflector": reflector,
+        }
+
+    initial_snapshot = _snapshot_at(0)
+    best_snapshot = _snapshot_at(best_index)
+    final_snapshot = _snapshot_at(len(positions_seq) - 1)
+
+    snapshots: Dict[str, Dict[str, Any]] = {}
+    if initial_snapshot is not None:
+        snapshots["initial"] = initial_snapshot
+    if best_snapshot is not None:
+        snapshots["best"] = best_snapshot
+    if final_snapshot is not None:
+        snapshots["final"] = final_snapshot
+    return snapshots
+
+
+def _apply_snapshot_to_scene(
+    scene: Any,
+    reflector_controller: Any,
+    snapshot: Mapping[str, Any],
+) -> None:
+    """Apply AP and reflector snapshot values to the mutable scene."""
+    import torch
+
+    positions = snapshot.get("positions")
+    directions = snapshot.get("directions")
+    reflector = snapshot.get("reflector")
+
+    transmitters = list(scene.transmitters.values())
+    if not isinstance(positions, Sequence) or len(positions) == 0:
+        return
+
+    for index, position in enumerate(positions[: len(transmitters)]):
+        pos = [float(position[0]), float(position[1]), float(position[2])]
+        transmitters[index].position = pos
+        if isinstance(directions, Sequence) and len(directions) > index and directions[index] is not None:
+            direction = directions[index]
+            dx = float(direction[0])
+            dy = float(direction[1])
+            dz = float(direction[2]) if len(direction) >= 3 else 0.0
+            target = [pos[0] + dx, pos[1] + dy, pos[2] + dz]
+            transmitters[index].look_at(target)
+
+    if reflector_controller is None or not isinstance(reflector, Mapping):
+        return
+
+    target = reflector.get("target")
+    if not isinstance(target, Sequence) or len(target) < 3:
+        return
+
+    device = getattr(reflector_controller, "device", "cpu")
+    reflector_controller.u = torch.tensor(float(reflector.get("u", 0.5)), dtype=torch.float32, device=device)
+    reflector_controller.v = torch.tensor(float(reflector.get("v", 0.5)), dtype=torch.float32, device=device)
+    reflector_controller.set_tx_position(np.asarray(positions[0], dtype=np.float32))
+    reflector_controller.set_focal_point(
+        torch.tensor([float(target[0]), float(target[1]), float(target[2])], dtype=torch.float32, device=device),
+        requires_grad=False,
+    )
+    reflector_controller.orient_to_target()
+    reflector_controller.apply_to_scene()
+
+
+def _render_coverage_snapshot(
+    scene_config: Mapping[str, Any],
+    snapshot: Mapping[str, Any],
+    save_path: Path,
+    samples_per_tx: int,
+    max_depth: int,
+    resolution: Tuple[int, int],
+) -> Optional[str]:
+    """Render one coverage-map image using Sionna Scene.render_to_file."""
+    from sionna import rt as sionna_rt
+    from sionna.rt import RadioMapSolver
+
+    from reflector_position.scene_setup import setup_building_floor_scene
+
+    loaded = setup_building_floor_scene(
+        scene_path=str(scene_config["scene_path"]),
+        frequency=scene_config.get("frequency", 6e9),
+        tx_positions=scene_config.get("tx_positions", None),
+        tx_power_dbm=scene_config.get("tx_power_dbm", 5.0),
+        rx_position=scene_config.get("rx_position", (16.0, 16.5, 1.5)),
+        reflector_enabled=scene_config.get("reflector_enabled", False),
+        reflector_size=tuple(scene_config.get("reflector_size", (2.0, 2.0))),
+        wall_top_left=scene_config.get("wall_top_left", None),
+        wall_bottom_right=scene_config.get("wall_bottom_right", None),
+        focal_point=scene_config.get("focal_point", None),
+        device=scene_config.get("device", "cuda"),
+    )
+    if isinstance(loaded, tuple) and len(loaded) == 2:
+        scene, reflector_controller = loaded
+    else:
+        scene, reflector_controller = loaded, None
+
+    _apply_snapshot_to_scene(scene, reflector_controller, snapshot)
+
+    solver = RadioMapSolver()
+    radio_map = solver(
+        scene,
+        cell_size=(1.0, 1.0),
+        samples_per_tx=int(samples_per_tx),
+        max_depth=int(max_depth),
+        refraction=True,
+        diffraction=True,
+    )
+
+    camera = sionna_rt.Camera(
+        position=[20, 20, 55],
+        look_at=[20, 20.1, 1.5],
+    )
+
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    scene.render_to_file(
+        camera=camera,
+        filename=str(save_path),
+        radio_map=radio_map,
+        rm_metric="rss",
+        rm_db_scale=True,
+        resolution=resolution,
+        show_devices=True,
+        show_orientations=True,
+    )
+    return str(save_path)
+
+
+def save_memetic_coverage_maps(
+    summary: Mapping[str, Any],
+    config_args: Mapping[str, Any],
+    output_dir: Path,
+) -> Dict[str, str]:
+    """Save GA/GD coverage map images for initial, best, and final states."""
+    scene_config = config_args.get("scene_config")
+    if not isinstance(scene_config, Mapping):
+        return {}
+
+    render_settings = config_args.get("coverage_plot_settings")
+    if not isinstance(render_settings, Mapping):
+        render_settings = {}
+
+    samples_per_tx = int(render_settings.get("samples_per_tx", 1_000_000))
+    max_depth = int(render_settings.get("max_depth", 13))
+    resolution_raw = render_settings.get("resolution", (1200, 900))
+    if isinstance(resolution_raw, Sequence) and len(resolution_raw) >= 2:
+        resolution = (int(resolution_raw[0]), int(resolution_raw[1]))
+    else:
+        resolution = (1200, 900)
+
+    plots_dir = output_dir / "plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+
+    artifacts: Dict[str, str] = {}
+    states_by_method = {
+        "ga": _build_ga_snapshots(summary, scene_config),
+        "gd": _build_gd_snapshots(summary),
+    }
+
+    for method, snapshots in states_by_method.items():
+        for stage in ("initial", "best", "final"):
+            snapshot = snapshots.get(stage)
+            if not isinstance(snapshot, Mapping):
+                continue
+
+            image_path = plots_dir / f"coverage_map_{method}_{stage}.png"
+            key = f"coverage_map_{method}_{stage}"
+            try:
+                rendered = _render_coverage_snapshot(
+                    scene_config=scene_config,
+                    snapshot=snapshot,
+                    save_path=image_path,
+                    samples_per_tx=samples_per_tx,
+                    max_depth=max_depth,
+                    resolution=resolution,
+                )
+                if rendered is not None:
+                    artifacts[key] = rendered
+            except Exception as exc:
+                artifacts[f"coverage_map_{method}_{stage}_error"] = str(exc)
+
+    return artifacts

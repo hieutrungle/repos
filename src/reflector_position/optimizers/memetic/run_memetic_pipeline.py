@@ -33,6 +33,7 @@ from reflector_position.optimizers.memetic.memetic_gd_logic import (
     run_targeted_gd_exploitation,
 )
 from reflector_position.optimizers.memetic.memetic_plotting import (
+    save_memetic_coverage_maps,
     save_memetic_plots,
 )
 from reflector_position.optimizers.memetic.raw_ray_parallel_optimizer import (
@@ -66,6 +67,16 @@ _GD_OPTIMIZATION_PARAM_DEFAULTS: Dict[str, Any] = {
     "samples_per_tx": 1_000_000,
     "max_depth": 13,
     "verbose": False,
+}
+
+_DEMAND_CONFIG_DEFAULTS: Dict[str, Any] = {
+    "enabled": True,
+    "bounding_boxes": [
+        [[20, 20], [25, 25]],
+        [[10, 10], [15, 15]],
+    ],
+    "box_weights": [5.0, 2.0],
+    "apply_blur": True,
 }
 
 _LEGACY_OBJECTIVE_KEY_MAP = {
@@ -143,6 +154,13 @@ def _resolve_gd_optimization_params(
     gd_optimization_params.update(gd_source)
     gd_optimization_params.update(objective_params)
     return gd_optimization_params
+
+
+def _resolve_demand_config(config_args: Mapping[str, Any]) -> Dict[str, Any]:
+    """Resolve spatial demand-map configuration from the top-level config."""
+    demand_config = dict(_DEMAND_CONFIG_DEFAULTS)
+    demand_config.update(_coerce_mapping(config_args, "demand_config"))
+    return demand_config
 
 
 def _deep_update(base: Dict[str, Any], updates: Mapping[str, Any]) -> Dict[str, Any]:
@@ -321,6 +339,11 @@ def _save_memetic_artifacts(
         output_dir=output_dir,
         position_bounds=config_args.get("position_bounds"),
     )
+    coverage_artifacts = save_memetic_coverage_maps(
+        summary=summary,
+        config_args=config_args,
+        output_dir=output_dir,
+    )
     report_path = save_memetic_summary_report(summary, report_md)
 
     artifacts = {
@@ -337,6 +360,7 @@ def _save_memetic_artifacts(
         "gd_per_seed_csv": str(artifacts_dir / "gd_per_seed_analysis.csv"),
     }
     artifacts.update(plot_artifacts)
+    artifacts.update(coverage_artifacts)
     return artifacts
 
 
@@ -352,6 +376,7 @@ def _bind_shared_actor_pool(
     ray_parallel_optimizer._workers = executor._workers  # type: ignore[attr-defined]
     ray_parallel_optimizer._pool = executor._pool  # type: ignore[attr-defined]
     ray_parallel_optimizer._scene_config = dict(executor.scene_config)  # type: ignore[attr-defined]
+    ray_parallel_optimizer._demand_config = dict(executor.demand_config)  # type: ignore[attr-defined]
 
 
 def run_memetic_optimization(config_args: Mapping[str, Any]) -> Dict[str, Any]:
@@ -372,6 +397,7 @@ def run_memetic_optimization(config_args: Mapping[str, Any]) -> Dict[str, Any]:
         - ``optimize_orientation``: bool
         - ``reflector_enabled``: bool
         - ``focal_z``: float reflector focal z
+        - ``demand_config``: dict controlling spatial demand weighting
         - ``objective_params``: shared memetic loss settings for GA and GD
         - ``ga_params``: dict DEAP hyperparameters
         - ``ga_evaluation_params``: dict worker eval params for GA
@@ -416,6 +442,7 @@ def run_memetic_optimization(config_args: Mapping[str, Any]) -> Dict[str, Any]:
     d_corr = float(config_args.get("d_corr", 3.0))
 
     objective_params = _resolve_objective_params(config_args)
+    demand_config = _resolve_demand_config(config_args)
     ga_evaluation_params = _resolve_ga_evaluation_params(config_args, objective_params)
     gd_optimization_params = _resolve_gd_optimization_params(config_args, objective_params)
 
@@ -446,6 +473,7 @@ def run_memetic_optimization(config_args: Mapping[str, Any]) -> Dict[str, Any]:
         # Intentionally keep this executor alive for both GA and GD phases.
         executor = RawRayActorPoolExecutor(
             scene_config=scene_config,
+            demand_config=demand_config,
             num_workers=num_pool_workers,
             gpu_fraction=gpu_fraction,
             verbose=verbose,
@@ -508,6 +536,7 @@ def run_memetic_optimization(config_args: Mapping[str, Any]) -> Dict[str, Any]:
         ray_parallel_optimizer = RawRayParallelOptimizer(
             num_workers=num_pool_workers,
             gpu_fraction=gpu_fraction,
+            demand_config=demand_config,
         )
 
         # Reuse existing ActorPool from GA executor (hot worker contexts).
@@ -614,6 +643,7 @@ def _default_memetic_config() -> Dict[str, Any]:
         "optimize_orientation": True,
         "reflector_enabled": True,
         "focal_z": 1.5,
+        "demand_config": dict(_DEMAND_CONFIG_DEFAULTS),
         "objective_params": {
             "alpha": 0.95,
             "beta": 0.05,
