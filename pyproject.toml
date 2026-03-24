@@ -23,6 +23,7 @@ dependencies = [
     "sionna-rt>=1.2.1",
     "numpy==1.26.4",
     "matplotlib>=3.10.0",
+    "plotly>=6.0.0",
     "torch>=2.9.1",
     "torchvision>=0.24.1",
     "drjit>=1.2.0",
