@@ -83,7 +83,7 @@ def soft_coverage_loss(
 	"""Compute pointwise soft coverage loss: ``-sigmoid(T * (x - theta))``."""
 	if temperature <= 0.0:
 		raise ValueError("temperature must be positive")
-	z = temperature * (x_dbm - threshold_dbm)
+	z = (x_dbm - threshold_dbm) / temperature
 	return -1.0 / (1.0 + np.exp(-z))
 
 
