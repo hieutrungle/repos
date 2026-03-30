@@ -19,8 +19,8 @@ classifiers = [
 
 dependencies = [
     "tensorflow>=2.20.0",
-    "sionna>=1.2.1",
-    "sionna-rt>=1.2.1",
+    "sionna>=2.0.0",
+    "sionna-rt>=2.0.0",
     "numpy==1.26.4",
     "matplotlib>=3.10.0",
     "plotly>=6.0.0",
