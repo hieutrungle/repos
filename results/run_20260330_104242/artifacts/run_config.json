@@ -1,0 +1,150 @@
+{
+  "scene_config": {
+    "scene_path": "/home/hieule/blender/models/building_floor/building_floor.xml",
+    "frequency": 6000000000.0,
+    "tx_power_dbm": 20.0,
+    "tx_positions": [
+      [
+        15.0,
+        15.0,
+        3.8
+      ],
+      [
+        30.0,
+        30.0,
+        3.8
+      ]
+    ],
+    "reflector_enabled": true,
+    "reflector_size": [
+      2.0,
+      2.0
+    ],
+    "wall_top_left": [
+      15.0,
+      34.0,
+      3.0
+    ],
+    "wall_bottom_right": [
+      34.0,
+      34.0,
+      1.0
+    ],
+    "focal_point": [
+      25.0,
+      25.0,
+      1.5
+    ],
+    "device": "cuda"
+  },
+  "output_dir": "tmp_results1/tmp_experiments_2AP/",
+  "position_bounds": {
+    "x_min": 5.5,
+    "x_max": 34.5,
+    "y_min": 5.5,
+    "y_max": 34.5
+  },
+  "fixed_z": 3.8,
+  "num_pool_workers": 2,
+  "gpu_fraction": 0.5,
+  "random_seed": 42,
+  "num_aps": 2,
+  "min_ap_separation": 2.0,
+  "optimize_orientation": true,
+  "reflector_enabled": true,
+  "focal_z": 1.5,
+  "demand_config": {
+    "enabled": true,
+    "bounding_boxes": [
+      [
+        [
+          5.5,
+          36.0
+        ],
+        [
+          10.0,
+          5.0
+        ]
+      ],
+      [
+        [
+          29.0,
+          25.5
+        ],
+        [
+          36.0,
+          5.0
+        ]
+      ],
+      [
+        [
+          15.0,
+          36.0
+        ],
+        [
+          36.0,
+          30.0
+        ]
+      ],
+      [
+        [
+          15.0,
+          25.0
+        ],
+        [
+          24.0,
+          5.5
+        ]
+      ]
+    ],
+    "box_weights": [
+      6.0,
+      6.0,
+      2.0,
+      3.0
+    ],
+    "apply_blur": false
+  },
+  "objective_params": {
+    "alpha": 0.99,
+    "beta": 0.01,
+    "softmin_temperature": 0.5,
+    "softmin_floor_dbm": -100.0,
+    "softmin_ceil_dbm": -60.0,
+    "coverage_threshold_dbm": -80.0,
+    "coverage_temperature": 1.0
+  },
+  "ga_params": {
+    "pop_size": 100,
+    "n_gen": 20,
+    "cxpb": 0.7,
+    "mutpb": 0.4,
+    "tournsize": 30,
+    "hof_size": 20
+  },
+  "ga_evaluation_params": {
+    "samples_per_tx": 1000000,
+    "max_depth": 13,
+    "verbose": false
+  },
+  "k_seeds": 2,
+  "d_corr": 0.0,
+  "gd_optimization_params": {
+    "num_iterations": 100,
+    "learning_rate": 0.005,
+    "samples_per_tx": 1000000,
+    "max_depth": 13,
+    "verbose": false
+  },
+  "coverage_plot_settings": {
+    "samples_per_tx": 1000000,
+    "max_depth": 13,
+    "resolution": [
+      1200,
+      900
+    ],
+    "render_gd_trajectory_coverage_maps": false,
+    "render_all_gd_trajectory_frames": true
+  },
+  "verbose": true
+}
