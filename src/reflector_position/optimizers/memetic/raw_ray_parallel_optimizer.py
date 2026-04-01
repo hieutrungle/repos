@@ -17,7 +17,6 @@ import torch
 from ray.util.actor_pool import ActorPool
 from sionna.rt import RadioMapSolver
 
-from reflector_position.metrics import POWER_EPSILON
 from reflector_position.optimizers.memetic.demand_weights import (
     generate_spatial_weight_map,
 )
@@ -119,11 +118,12 @@ class RawOptimizationWorker:
         if not transmitters:
             raise ValueError("Scene must contain at least one transmitter")
 
-        first_tx_position = np.array(transmitters[0].position, dtype=np.float32)
+        first_tx_position = np.asarray(transmitters[0].position, dtype=np.float32).flatten()
         fixed_z = float(first_tx_position[2])
         task: Dict[str, Any] = {
             "initial_positions": [
-                (float(np.array(tx.position)[0]), float(np.array(tx.position)[1]))
+                (float(np.asarray(tx.position, dtype=np.float32).flatten()[0]), 
+                 float(np.asarray(tx.position, dtype=np.float32).flatten()[1]))
                 for tx in transmitters
             ],
             "fixed_z": fixed_z,
@@ -136,9 +136,9 @@ class RawOptimizationWorker:
                 task["reflector_u"] = float(0.5)
                 task["reflector_v"] = float(0.5)
                 task["reflector_target"] = (
-                    float(focal_point[0]),
-                    float(focal_point[1]),
-                    float(focal_point[2]),
+                    float(np.asarray(focal_point, dtype=np.float32).flatten()[0]),
+                    float(np.asarray(focal_point, dtype=np.float32).flatten()[1]),
+                    float(np.asarray(focal_point, dtype=np.float32).flatten()[2]),
                 )
 
         return task
@@ -257,19 +257,12 @@ class RawOptimizationWorker:
         }
 
         coverage_map = torch.from_numpy(np.array(radio_map.rss)).to(self.device)
-        flat_batches = coverage_map.reshape(-1, coverage_map.shape[-2], coverage_map.shape[-1])
-        valid_mask = (flat_batches > POWER_EPSILON).any(dim=0)
-        
-        if not torch.any(valid_mask):
-            valid_mask = torch.ones_like(valid_mask, dtype=torch.bool, device=self.device)
-
-        num_rows, num_cols = int(valid_mask.shape[0]), int(valid_mask.shape[1])
+        num_rows, num_cols = int(coverage_map.shape[-2]), int(coverage_map.shape[-1])
 
         return generate_spatial_weight_map(
             num_rows=num_rows,
             num_cols=num_cols,
             demand_config=self.demand_config,
-            valid_mask=valid_mask,
         )
 
     def _has_explicit_weighted_reporting_config(self) -> bool:
@@ -451,6 +444,14 @@ class RawOptimizationWorker:
             "optimizer_result": _to_serializable(optimizer_result),
             "num_aps": int(getattr(optimizer, "num_aps", 1)),
         }
+
+        if self.spatial_weights is not None:
+            try:
+                output["spatial_weights"] = _to_serializable(
+                    self.spatial_weights.detach().cpu()
+                )
+            except Exception:
+                output["spatial_weights"] = None
 
         if hasattr(optimizer, "history"):
             output["history"] = _to_serializable(getattr(optimizer, "history"))

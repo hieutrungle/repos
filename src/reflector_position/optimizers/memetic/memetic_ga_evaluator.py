@@ -19,7 +19,7 @@ import numpy as np
 import torch
 import sionna.rt
 from sionna.rt import RadioMapSolver
-
+import mitsuba as mi
 from reflector_position.metrics import (
     compute_thresholded_reporting_metrics,
 )
@@ -93,7 +93,7 @@ class StaticConfigurationEvaluator:
 
             radio_map = self.solver(
                 self.scene,
-                cell_size=(1.0, 1.0),
+                cell_size=mi.Point2f(1.0, 1.0),
                 samples_per_tx=int(task.get("samples_per_tx", 1_000_000)),
                 max_depth=int(task.get("max_depth", 13)),
                 refraction=True,
@@ -101,9 +101,12 @@ class StaticConfigurationEvaluator:
                 **self.radio_map_geometry,
             )
             coverage_map = torch.from_numpy(np.array(radio_map.rss)).to(self.device)
-            # Sionna may expose extra singleton axes (e.g. [1,H,W] or [H,W,1]).
-            # Remove them so the demand map aligns with the spatial grid.
-            coverage_map = coverage_map.squeeze()
+            # Sionna may return shape (H, W), (1, H, W), (num_aps, H, W), or other layouts.
+            # Always reduce to 2-D (H, W) to match spatial_weights.
+            # get the maximum signal across APs.
+            # Do not squeeze blindly since some dimensions may have size > 1. Instead, use max across leading dimensions.
+            coverage_map = coverage_map.max(dim=0).values  # Take max across AP dimension(s)
+            coverage_map = coverage_map.squeeze()  # Remove any singleton dimensions
 
             total_loss, loss_components = self.loss_module(
                 coverage_map=coverage_map,
@@ -120,7 +123,6 @@ class StaticConfigurationEvaluator:
         """Compute detached physical observation metrics for one radio map."""
         metrics = compute_thresholded_reporting_metrics(
             coverage_map,
-            threshold_dbm=self.loss_module.coverage_loss.threshold_dbm,
             spatial_weights=self.spatial_weights,
             include_weighted=self.include_weighted_reporting,
         )

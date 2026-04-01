@@ -69,11 +69,8 @@ def _extract_initial_primary_loss(
     task: Mapping[str, Any],
     result: Mapping[str, Any],
 ) -> Optional[float]:
-    """Extract the starting primary loss for one targeted GD run."""
-    task_value = task.get("initial_primary_loss")
-    if task_value is not None:
-        return float(task_value)
-
+    """Extract GD starting primary loss from the first optimizer iteration."""
+    del task
     history = _extract_history(result)
     primary_series = history.get("primary_loss")
     if isinstance(primary_series, Sequence) and len(primary_series) > 0:

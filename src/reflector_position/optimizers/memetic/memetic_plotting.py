@@ -76,6 +76,58 @@ def _extract_physical_metric_series(result: Mapping[str, Any], metric_name: str)
     return []
 
 
+def _extract_region_metric_series(result: Mapping[str, Any], metric_name: str) -> List[float]:
+    """Return one region-report metric series with weighted-key fallback."""
+    history = _extract_history(result)
+    physical_metrics = history.get("physical_metrics")
+    if not isinstance(physical_metrics, Sequence):
+        return []
+
+    legacy_key_map = {
+        "region_mean_rss_dbm": "weighted_mean_rss_dbm",
+        "region_min_rss_dbm": "weighted_min_rss_dbm",
+        "region_p5_rss_dbm": "weighted_p5_rss_dbm",
+    }
+    legacy_key = legacy_key_map.get(metric_name)
+
+    series: List[float] = []
+    for item in physical_metrics:
+        if not isinstance(item, Mapping):
+            continue
+        value = item.get(metric_name)
+        if value is None and legacy_key is not None:
+            value = item.get(legacy_key)
+        if value is not None:
+            series.append(float(value))
+    return series
+
+
+def _extract_spatial_weights_map(result: Mapping[str, Any]) -> Optional[np.ndarray]:
+    """Return the spatial-weight map (2-D) when present in result payload."""
+    raw = result.get("spatial_weights")
+    if raw is None:
+        raw = _extract_results_payload(result).get("spatial_weights")
+    if raw is None:
+        return None
+
+    try:
+        arr = np.asarray(raw, dtype=np.float32)
+    except Exception:
+        return None
+
+    if arr.ndim == 0:
+        return None
+    if arr.ndim == 1:
+        side = int(np.sqrt(arr.size))
+        if side * side == arr.size:
+            arr = arr.reshape(side, side)
+        else:
+            return None
+    if arr.ndim != 2:
+        return None
+    return arr
+
+
 def _extract_best_iteration(result: Mapping[str, Any]) -> int:
     """Return best iteration index based on primary loss when available."""
     primary_loss = _extract_primary_loss_series(result)
@@ -636,7 +688,12 @@ def save_gd_trajectory_plots(
             directions_arr = directions_arr[:, np.newaxis, :]
 
         primary_loss_values = _extract_primary_loss_series(result)
+        coverage_values = _extract_physical_metric_series(result, "coverage_pct")
         secondary_metric_name, secondary_metric_values = _select_secondary_metric(result)
+        region_mean_values = _extract_region_metric_series(result, "region_mean_rss_dbm")
+        region_min_values = _extract_region_metric_series(result, "region_min_rss_dbm")
+        region_p5_values = _extract_region_metric_series(result, "region_p5_rss_dbm")
+        spatial_weights_map = _extract_spatial_weights_map(result)
         gradients = history.get("gradients", [])
         best_iter = _extract_best_iteration(result)
 
@@ -655,7 +712,7 @@ def save_gd_trajectory_plots(
             orientation_lines += f"  LookAt: {_fmt_pos(final_look_at)}"
 
         best_primary_loss = _extract_best_primary_loss(result)
-        fig, axes = plt.subplots(2, 2, figsize=(14, 11))
+        fig, axes = plt.subplots(3, 2, figsize=(14, 15))
         fig.suptitle(
             f"Task #{task_id} — Gradient Descent Trajectory\n"
             f"Best Primary Loss: {best_primary_loss:.6f} at iteration {best_iter + 1 if best_iter >= 0 else 'N/A'}"
@@ -715,14 +772,19 @@ def save_gd_trajectory_plots(
         ax.grid(True, alpha=0.3)
 
         ax = axes[1, 0]
-        if secondary_metric_values:
+        if coverage_values:
+            iterations = list(range(1, len(coverage_values) + 1))
+            ax.plot(iterations, coverage_values, "g-", linewidth=2, label="coverage_pct")
+            if 0 <= best_iter < len(coverage_values):
+                ax.axvline(best_iter + 1, color="red", linestyle="--", alpha=0.7, label=f"Best iter {best_iter + 1}")
+        elif secondary_metric_values:
             iterations = list(range(1, len(secondary_metric_values) + 1))
-            ax.plot(iterations, secondary_metric_values, "g-", linewidth=2)
+            ax.plot(iterations, secondary_metric_values, "g-", linewidth=2, label=secondary_metric_name)
             if 0 <= best_iter < len(secondary_metric_values):
                 ax.axvline(best_iter + 1, color="red", linestyle="--", alpha=0.7, label=f"Best iter {best_iter + 1}")
         ax.set_xlabel("Iteration")
-        ax.set_ylabel(secondary_metric_name)
-        ax.set_title(f"{secondary_metric_name} Evolution")
+        ax.set_ylabel("coverage_pct")
+        ax.set_title("Coverage Evolution")
         ax.legend(fontsize=9)
         ax.grid(True, alpha=0.3)
 
@@ -742,6 +804,75 @@ def save_gd_trajectory_plots(
         ax.set_title("Gradient Norm Evolution (log scale)")
         ax.legend(fontsize=9)
         ax.grid(True, alpha=0.3)
+
+        ax = axes[2, 0]
+        any_region_series = False
+        if region_mean_values:
+            any_region_series = True
+            ax.plot(range(1, len(region_mean_values) + 1), region_mean_values, "b-", linewidth=2, label="region_mean_rss_dbm")
+        if region_min_values:
+            any_region_series = True
+            ax.plot(range(1, len(region_min_values) + 1), region_min_values, "m-", linewidth=2, label="region_min_rss_dbm")
+        if region_p5_values:
+            any_region_series = True
+            ax.plot(range(1, len(region_p5_values) + 1), region_p5_values, "c-", linewidth=2, label="region_p5_rss_dbm")
+        if any_region_series and 0 <= best_iter < max(len(region_mean_values), len(region_min_values), len(region_p5_values)):
+            ax.axvline(best_iter + 1, color="red", linestyle="--", alpha=0.7, label=f"Best iter {best_iter + 1}")
+        ax.set_xlabel("Iteration")
+        ax.set_ylabel("RSSI (dBm)")
+        ax.set_title("Region Metrics Evolution")
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.3)
+
+        ax = axes[2, 1]
+        if spatial_weights_map is not None:
+            if position_bounds:
+                extent = (
+                    float(position_bounds["x_min"]),
+                    float(position_bounds["x_max"]),
+                    float(position_bounds["y_min"]),
+                    float(position_bounds["y_max"]),
+                )
+            else:
+                extent = None
+
+            image = ax.imshow(
+                spatial_weights_map,
+                cmap="magma",
+                origin="lower",
+                extent=extent,
+                aspect="equal",
+            )
+            ax.set_title("Region Weight Heatmap")
+            ax.set_xlabel("X Position (m)")
+            ax.set_ylabel("Y Position (m)")
+            if position_bounds:
+                ax.set_xlim(position_bounds["x_min"], position_bounds["x_max"])
+                ax.set_ylim(position_bounds["y_min"], position_bounds["y_max"])
+            ax.grid(False)
+            # Keep heatmap panel size comparable to other subplots.
+            cax = ax.inset_axes([1.02, 0.0, 0.035, 1.0])
+            cbar = fig.colorbar(image, cax=cax)
+            cbar.set_label("Weight")
+        else:
+            ax.axis("off")
+            note_lines = [
+                f"Task #{task_id}",
+                "Region metrics computed on explicit weighted region only.",
+                "Series: region_mean_rss_dbm, region_min_rss_dbm, region_p5_rss_dbm.",
+                "Weight heatmap unavailable in this artifact.",
+            ]
+            if not any_region_series:
+                note_lines.append("No region metric history available for this task.")
+            ax.text(
+                0.02,
+                0.95,
+                "\n".join(note_lines),
+                transform=ax.transAxes,
+                va="top",
+                ha="left",
+                fontsize=10,
+            )
 
         fig.tight_layout()
         save_path = save_dir / f"{filename_prefix}_{task_id}_trajectory.png"
@@ -803,6 +934,28 @@ def _as_positions_3d(raw: Any) -> Optional[List[List[float]]]:
 
     if len(raw) >= 3:
         return [[float(raw[0]), float(raw[1]), float(raw[2])]]
+    return None
+
+
+def _as_positions_3d_with_fixed_z(raw: Any, fixed_z: float) -> Optional[List[List[float]]]:
+    """Normalize position payloads that may be 2D XY with a shared fixed Z."""
+    if raw is None or not isinstance(raw, Sequence) or len(raw) == 0:
+        return None
+
+    first = raw[0]
+    if isinstance(first, (list, tuple, np.ndarray)):
+        output: List[List[float]] = []
+        for position in raw:
+            if len(position) >= 3:
+                output.append([float(position[0]), float(position[1]), float(position[2])])
+            elif len(position) >= 2:
+                output.append([float(position[0]), float(position[1]), float(fixed_z)])
+        return output or None
+
+    if len(raw) >= 3:
+        return [[float(raw[0]), float(raw[1]), float(raw[2])]]
+    if len(raw) >= 2:
+        return [[float(raw[0]), float(raw[1]), float(fixed_z)]]
     return None
 
 
@@ -923,6 +1076,59 @@ def _build_ga_snapshots(summary: Mapping[str, Any], scene_config: Mapping[str, A
     return snapshots
 
 
+def _build_ga_generation_best_snapshots(
+    summary: Mapping[str, Any],
+) -> List[Tuple[int, Dict[str, Any]]]:
+    """Build per-generation GA-best snapshots for optional coverage rendering."""
+    ga_results = summary.get("ga_results", {})
+    if not isinstance(ga_results, Mapping):
+        return []
+
+    generation_details = ga_results.get("generation_details")
+    if not isinstance(generation_details, Sequence):
+        return []
+
+    snapshots: List[Tuple[int, Dict[str, Any]]] = []
+    for row in generation_details:
+        if not isinstance(row, Mapping):
+            continue
+
+        raw_gen = row.get("gen")
+        try:
+            generation_index = int(raw_gen)
+        except (TypeError, ValueError):
+            continue
+
+        positions = _as_positions_3d(row.get("best_ap_positions", row.get("ap_positions")))
+        if positions is None:
+            continue
+
+        directions = _as_directions_3d(
+            row.get("best_ap_directions", row.get("ap_directions"))
+        )
+
+        reflector = None
+        best_reflector = row.get("best_reflector")
+        if isinstance(best_reflector, Mapping):
+            reflector = _extract_reflector_state({"reflector": best_reflector})
+        if reflector is None:
+            reflector = _extract_reflector_state(row)
+
+        snapshots.append(
+            (
+                generation_index,
+                {
+                    "positions": positions,
+                    "directions": directions,
+                    "reflector": reflector,
+                },
+            )
+        )
+
+    snapshots.sort(key=lambda item: item[0])
+    return snapshots
+
+
 def _build_gd_snapshots(summary: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]:
     """Build GD initial/best/final snapshots from global best task history."""
     gd_results = summary.get("gd_results", {})
@@ -992,6 +1198,82 @@ def _build_gd_snapshots(summary: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]
         snapshots["best"] = best_snapshot
     if final_snapshot is not None:
         snapshots["final"] = final_snapshot
+    return snapshots
+
+
+def _build_gd_task_ga_snapshot(result: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    """Build one GA-seed snapshot that initialized this GD trajectory."""
+    optimizer_kwargs = result.get("optimizer_kwargs")
+    if not isinstance(optimizer_kwargs, Mapping):
+        return None
+
+    fixed_z = float(optimizer_kwargs.get("fixed_z", 0.0))
+    positions = _as_positions_3d_with_fixed_z(optimizer_kwargs.get("initial_positions"), fixed_z)
+    if positions is None:
+        return None
+
+    directions = _as_directions_3d(optimizer_kwargs.get("initial_directions_xy"))
+    reflector = _extract_reflector_state(optimizer_kwargs)
+    return {
+        "positions": positions,
+        "directions": directions,
+        "reflector": reflector,
+    }
+
+
+def _build_gd_task_trajectory_snapshots(result: Mapping[str, Any]) -> List[Tuple[str, Dict[str, Any]]]:
+    """Build labeled per-iteration GD snapshots for one task result."""
+    history = result.get("history")
+    if not isinstance(history, Mapping):
+        return []
+
+    positions_seq = history.get("positions")
+    if not isinstance(positions_seq, Sequence) or len(positions_seq) == 0:
+        return []
+
+    direction_seq = history.get("directions") if isinstance(history.get("directions"), Sequence) else None
+    reflector_u = history.get("reflector_u") if isinstance(history.get("reflector_u"), Sequence) else None
+    reflector_v = history.get("reflector_v") if isinstance(history.get("reflector_v"), Sequence) else None
+    reflector_target = history.get("reflector_target") if isinstance(history.get("reflector_target"), Sequence) else None
+
+    snapshots: List[Tuple[str, Dict[str, Any]]] = []
+    for index, raw_positions in enumerate(positions_seq):
+        positions = _as_positions_3d(raw_positions)
+        if positions is None:
+            continue
+
+        directions = None
+        if direction_seq is not None and len(direction_seq) > index:
+            directions = _as_directions_3d(direction_seq[index])
+
+        reflector = None
+        if (
+            reflector_u is not None
+            and reflector_v is not None
+            and reflector_target is not None
+            and len(reflector_u) > index
+            and len(reflector_v) > index
+            and len(reflector_target) > index
+        ):
+            target = reflector_target[index]
+            if isinstance(target, Sequence) and len(target) >= 3:
+                reflector = {
+                    "u": float(reflector_u[index]),
+                    "v": float(reflector_v[index]),
+                    "target": [float(target[0]), float(target[1]), float(target[2])],
+                }
+
+        snapshots.append(
+            (
+                f"iter_{index:04d}",
+                {
+                    "positions": positions,
+                    "directions": directions,
+                    "reflector": reflector,
+                },
+            )
+        )
+
     return snapshots
 
 
@@ -1099,7 +1381,7 @@ def _render_coverage_snapshot(
         rm_db_scale=True,
         resolution=resolution,
         show_devices=True,
-        show_orientations=True,
+        show_orientations=False,
     )
     return str(save_path)
 
@@ -1109,7 +1391,7 @@ def save_memetic_coverage_maps(
     config_args: Mapping[str, Any],
     output_dir: Path,
 ) -> Dict[str, str]:
-    """Save GA/GD coverage map images for initial, best, and final states."""
+    """Save GA/GD coverage maps, including optional GA/GD trajectory frames."""
     scene_config = config_args.get("scene_config")
     if not isinstance(scene_config, Mapping):
         return {}
@@ -1125,6 +1407,36 @@ def save_memetic_coverage_maps(
         resolution = (int(resolution_raw[0]), int(resolution_raw[1]))
     else:
         resolution = (1200, 900)
+    render_gd_trajectory_coverage_maps = bool(
+        render_settings.get(
+            "render_gd_trajectory_coverage_maps",
+            render_settings.get("render_all_gd_trajectory_frames", True),
+        )
+    )
+    render_ga_generation_best_coverage_maps = bool(
+        render_settings.get("render_ga_generation_best_coverage_maps", False)
+    )
+    ga_generation_frame_stride = max(
+        1,
+        int(render_settings.get("ga_generation_frame_stride", 1)),
+    )
+    ga_generation_max_frames_raw = render_settings.get("ga_generation_max_frames")
+    ga_generation_max_frames: Optional[int] = None
+    if ga_generation_max_frames_raw is not None:
+        try:
+            ga_generation_max_frames = max(1, int(ga_generation_max_frames_raw))
+        except (TypeError, ValueError):
+            ga_generation_max_frames = None
+
+    render_all_gd_trajectory_frames = bool(render_settings.get("render_all_gd_trajectory_frames", True))
+    gd_trajectory_frame_stride = max(1, int(render_settings.get("gd_trajectory_frame_stride", 1)))
+    gd_trajectory_max_frames_raw = render_settings.get("gd_trajectory_max_frames")
+    gd_trajectory_max_frames: Optional[int] = None
+    if gd_trajectory_max_frames_raw is not None:
+        try:
+            gd_trajectory_max_frames = max(1, int(gd_trajectory_max_frames_raw))
+        except (TypeError, ValueError):
+            gd_trajectory_max_frames = None
 
     plots_dir = output_dir / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
@@ -1156,5 +1468,107 @@ def save_memetic_coverage_maps(
                     artifacts[key] = rendered
             except Exception as exc:
                 artifacts[f"coverage_map_{method}_{stage}_error"] = str(exc)
+
+    if render_ga_generation_best_coverage_maps:
+        generation_snapshots = _build_ga_generation_best_snapshots(summary)
+        if ga_generation_frame_stride > 1:
+            generation_snapshots = [
+                pair
+                for frame_index, pair in enumerate(generation_snapshots)
+                if frame_index % ga_generation_frame_stride == 0
+            ]
+        if ga_generation_max_frames is not None:
+            generation_snapshots = generation_snapshots[:ga_generation_max_frames]
+
+        base_dir = plots_dir / "ga_generation_best_coverage"
+        rendered_generation_count = 0
+        for generation_index, snapshot in generation_snapshots:
+            image_path = base_dir / f"gen_{generation_index:04d}.png"
+            try:
+                rendered = _render_coverage_snapshot(
+                    scene_config=scene_config,
+                    snapshot=snapshot,
+                    save_path=image_path,
+                    samples_per_tx=samples_per_tx,
+                    max_depth=max_depth,
+                    resolution=resolution,
+                )
+                if rendered is not None:
+                    rendered_generation_count += 1
+                    artifacts[f"coverage_map_ga_generation_{generation_index:04d}"] = rendered
+            except Exception as exc:
+                artifacts[
+                    f"coverage_map_ga_generation_{generation_index:04d}_error"
+                ] = str(exc)
+
+        artifacts["coverage_map_ga_generation_best_dir"] = str(base_dir)
+        artifacts["coverage_map_ga_generation_best_count"] = str(rendered_generation_count)
+
+    if render_gd_trajectory_coverage_maps and render_all_gd_trajectory_frames:
+        gd_results = summary.get("gd_results", {})
+        all_results = gd_results.get("all_fine_tuned_results", []) if isinstance(gd_results, Mapping) else []
+        if isinstance(all_results, Sequence):
+            base_dir = plots_dir / "gd_trajectory_coverage"
+            rendered_image_count = 0
+            rendered_task_count = 0
+
+            for fallback_task_index, result in enumerate(all_results):
+                if not isinstance(result, Mapping):
+                    continue
+
+                task_id = int(result.get("task_id", fallback_task_index))
+                task_dir = base_dir / f"task_{task_id:03d}"
+                task_rendered = 0
+
+                ga_snapshot = _build_gd_task_ga_snapshot(result)
+                if isinstance(ga_snapshot, Mapping):
+                    ga_path = task_dir / "ga_final.png"
+                    try:
+                        rendered = _render_coverage_snapshot(
+                            scene_config=scene_config,
+                            snapshot=ga_snapshot,
+                            save_path=ga_path,
+                            samples_per_tx=samples_per_tx,
+                            max_depth=max_depth,
+                            resolution=resolution,
+                        )
+                        if rendered is not None:
+                            task_rendered += 1
+                    except Exception as exc:
+                        artifacts[f"coverage_map_gd_task_{task_id}_ga_final_error"] = str(exc)
+
+                snapshots = _build_gd_task_trajectory_snapshots(result)
+                if gd_trajectory_frame_stride > 1:
+                    snapshots = [
+                        pair for frame_index, pair in enumerate(snapshots) if frame_index % gd_trajectory_frame_stride == 0
+                    ]
+                if gd_trajectory_max_frames is not None:
+                    snapshots = snapshots[:gd_trajectory_max_frames]
+
+                for label, snapshot in snapshots:
+                    image_path = task_dir / f"{label}.png"
+                    try:
+                        rendered = _render_coverage_snapshot(
+                            scene_config=scene_config,
+                            snapshot=snapshot,
+                            save_path=image_path,
+                            samples_per_tx=samples_per_tx,
+                            max_depth=max_depth,
+                            resolution=resolution,
+                        )
+                        if rendered is not None:
+                            task_rendered += 1
+                    except Exception as exc:
+                        artifacts[f"coverage_map_gd_task_{task_id}_{label}_error"] = str(exc)
+
+                if task_rendered > 0:
+                    rendered_task_count += 1
+                    rendered_image_count += task_rendered
+                    artifacts[f"coverage_map_gd_task_{task_id}_dir"] = str(task_dir)
+                    artifacts[f"coverage_map_gd_task_{task_id}_image_count"] = str(task_rendered)
+
+            artifacts["coverage_map_gd_trajectory_dir"] = str(base_dir)
+            artifacts["coverage_map_gd_trajectory_task_count"] = str(rendered_task_count)
+            artifacts["coverage_map_gd_trajectory_image_count"] = str(rendered_image_count)
 
     return artifacts

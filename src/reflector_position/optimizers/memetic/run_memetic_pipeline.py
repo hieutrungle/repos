@@ -169,6 +169,8 @@ def _resolve_demand_config(config_args: Mapping[str, Any]) -> Dict[str, Any]:
 
     demand_config = dict(_DEMAND_CONFIG_DEFAULTS)
     demand_config.update(_coerce_mapping(config_args, "demand_config"))
+    if isinstance(config_args.get("position_bounds"), Mapping):
+        demand_config["_position_bounds"] = dict(config_args["position_bounds"])
     demand_config["_report_weighted_stats"] = bool(explicit_weighted_stats)
     return demand_config
 
@@ -534,9 +536,6 @@ def run_memetic_optimization(config_args: Mapping[str, Any]) -> Dict[str, Any]:
         # Attach scene + baseline metric metadata for Phase-3 analysis.
         for seed, task in zip(seeds, gd_tasks):
             task["scene_config"] = scene_config
-            seed_primary_fitness = seed.get("primary_fitness")
-            if seed_primary_fitness is not None:
-                task["initial_primary_loss"] = -float(seed_primary_fitness)
 
         # -----------------------------------------------------------------
         # Step 4: Phase 3 - Targeted GD micro-exploitation
@@ -684,6 +683,14 @@ def _default_memetic_config() -> Dict[str, Any]:
             "samples_per_tx": 1_000_000,
             "max_depth": 13,
             "verbose": False,
+        },
+        "coverage_plot_settings": {
+            "samples_per_tx": 1_000_000,
+            "max_depth": 13,
+            "resolution": [1200, 900],
+            "render_ga_generation_best_coverage_maps": True,
+            "render_gd_trajectory_coverage_maps": True,
+            "render_all_gd_trajectory_frames": True,
         },
         "verbose": True,
     }

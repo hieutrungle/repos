@@ -27,7 +27,7 @@ import torch.nn.functional as F
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import sionna.rt
 from sionna.rt import RadioMapSolver, Transmitter
-
+import mitsuba as mi
 from reflector_position.metrics import (
     compute_thresholded_reporting_metrics,
 )
@@ -270,7 +270,7 @@ class MemeticGradientDescentOptimizer(BaseAPOptimizer):
             with torch.no_grad():
                 rm = self.radio_solver(
                     self.scene,
-                    cell_size=(5.0, 5.0),
+                    cell_size=mi.Point2f(5.0, 5.0),
                     samples_per_tx=100_000,
                     max_depth=3,
                     refraction=False,
@@ -301,8 +301,7 @@ class MemeticGradientDescentOptimizer(BaseAPOptimizer):
 
             if verbose:
                 self._log_iteration(iteration + 1, int(num_iterations), snapshot)
-                scheduler.step()
-                scheduler.zero_grad()
+            scheduler.step()
 
         with torch.no_grad():
             snapshot = self._evaluate_metrics(
@@ -386,7 +385,7 @@ class MemeticGradientDescentOptimizer(BaseAPOptimizer):
                 dir_x = args[2 * n_aps + index]
                 dir_y = args[3 * n_aps + index]
 
-                tx.position = [x_coord.array, y_coord.array, self.fixed_z]
+                tx.position = mi.Point3f([x_coord.array, y_coord.array, self.fixed_z])
                 target = [
                     x_coord.array + dir_x.array,
                     y_coord.array + dir_y.array,
@@ -396,7 +395,7 @@ class MemeticGradientDescentOptimizer(BaseAPOptimizer):
 
             radio_map = self.radio_solver(
                 self.scene,
-                cell_size=(1.0, 1.0),
+                cell_size=mi.Point2f(1.0, 1.0),
                 samples_per_tx=samples_per_tx,
                 max_depth=max_depth,
                 refraction=True,
@@ -406,6 +405,9 @@ class MemeticGradientDescentOptimizer(BaseAPOptimizer):
             return radio_map.rss
 
         coverage_map = compute_rss(*wrap_args)
+        # For multi-AP runs, aggregate as element-wise best-server coverage.
+        if coverage_map.ndim > 2:
+            coverage_map = coverage_map.max(dim=0).values
         coverage_map = coverage_map.squeeze()
         total_loss, loss_components = self.loss_module(
             coverage_map=coverage_map,
@@ -573,8 +575,8 @@ class MemeticGradientDescentOptimizer(BaseAPOptimizer):
             x_coord, y_coord = initial_positions[index]
             transmitter = Transmitter(
                 name=f"Tx{index:02d}",
-                position=[float(x_coord), float(y_coord), self.fixed_z],
-                power_dbm=ref_power,
+                position=mi.Point3f([float(x_coord), float(y_coord), self.fixed_z]),
+                power_dbm=int(ref_power),
             )
             self.scene.add(transmitter)
 
@@ -619,7 +621,7 @@ class MemeticGradientDescentOptimizer(BaseAPOptimizer):
             dx = self.tx_x[i] - self.tx_x[j]
             dy = self.tx_y[i] - self.tx_y[j]
             repulsion = repulsion + 1.0 / (dx * dx + dy * dy + eps)
-        return repulsion
+        return repulsion * 0.0
 
     def _apply_reflector_state(self) -> None:
         """Push current reflector parameters into the scene graph."""
@@ -666,7 +668,7 @@ class MemeticGradientDescentOptimizer(BaseAPOptimizer):
 
         radio_map = self.radio_solver(
             self.scene,
-            cell_size=(1.0, 1.0),
+            cell_size=mi.Point2f(1.0, 1.0),
             samples_per_tx=samples_per_tx,
             max_depth=max_depth,
             refraction=True,
@@ -674,7 +676,8 @@ class MemeticGradientDescentOptimizer(BaseAPOptimizer):
             **self.radio_map_geometry,
         )
         coverage_map = torch.from_numpy(np.array(radio_map.rss)).to(self.device)
-        coverage_map = coverage_map.squeeze()
+        coverage_map = coverage_map.max(dim=0).values  # Take max across AP dimension(s)
+        coverage_map = coverage_map.squeeze()  # Remove any singleton dimensions
 
         computed_total_loss, computed_loss_components = self.loss_module(
             coverage_map=coverage_map,
@@ -682,7 +685,6 @@ class MemeticGradientDescentOptimizer(BaseAPOptimizer):
         )
         physical_metrics = compute_thresholded_reporting_metrics(
             coverage_map,
-            threshold_dbm=self.loss_module.coverage_loss.threshold_dbm,
             spatial_weights=self.spatial_weights,
             include_weighted=self.include_weighted_reporting,
         )

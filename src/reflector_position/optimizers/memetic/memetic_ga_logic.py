@@ -323,6 +323,17 @@ class MemeticGeneticAlgorithmRunner:
             "focal_z": self.focal_z,
         }
 
+    def _build_generation_best_payload(self, individual: Sequence[float]) -> Dict[str, Any]:
+        """Build decoded best-individual payload for generation-level reporting."""
+        return {
+            "best_chromosome": [float(gene) for gene in individual],
+            "best_ap_positions": self._extract_positions(individual),
+            "best_ap_directions": self._extract_directions(individual),
+            "best_reflector": self._extract_reflector(individual),
+            "best_loss_components": dict(getattr(individual, "loss_components", {})),
+            "best_physical_metrics": dict(getattr(individual, "physical_metrics", {})),
+        }
+
     # ------------------------------------------------------------------
     # Topological distance filtering
     # ------------------------------------------------------------------
@@ -702,6 +713,7 @@ class MemeticGeneticAlgorithmRunner:
 
         record = _compile_generation_stats(population)
         logbook.record(gen=0, nevals=nevals, **record)
+        best_individual = tools.selBest(population, 1)[0]
         generation_details.append(
             {
                 "gen": 0,
@@ -712,6 +724,7 @@ class MemeticGeneticAlgorithmRunner:
                 "feasible_count": int(record["feasible_count"]),
                 "penalized_count": int(record["penalized_count"]),
                 "mean_population_fitness": float(record["mean_population"]),
+                **self._build_generation_best_payload(best_individual),
             }
         )
 
@@ -748,6 +761,7 @@ class MemeticGeneticAlgorithmRunner:
 
             record = _compile_generation_stats(population)
             logbook.record(gen=gen, nevals=nevals, **record)
+            best_individual = tools.selBest(population, 1)[0]
 
             gen_time = time.time() - gen_start
             generation_details.append(
@@ -761,6 +775,7 @@ class MemeticGeneticAlgorithmRunner:
                     "penalized_count": int(record["penalized_count"]),
                     "mean_population_fitness": float(record["mean_population"]),
                     "time": gen_time,
+                    **self._build_generation_best_payload(best_individual),
                 }
             )
 
