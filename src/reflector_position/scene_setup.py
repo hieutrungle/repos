@@ -22,7 +22,7 @@ from typing import List, Optional, Tuple, Union
 import numpy as np
 import sionna.rt
 from sionna.rt import load_scene, PlanarArray, Transmitter, Receiver
-
+import mitsuba as mi
 from .reflector_model import (
     ReflectorController,
     create_flat_reflector_mesh,
@@ -102,7 +102,7 @@ def setup_building_floor_scene(
         num_cols=1,
         vertical_spacing=0.5,
         horizontal_spacing=0.5,
-        pattern="tr38901",
+        pattern="iso",
         polarization="VH",
     )
 
@@ -113,29 +113,29 @@ def setup_building_floor_scene(
     power_per_tx = tx_power_dbm / n_txs
 
     for i, (x, y, z) in enumerate(tx_positions):
-        yaw = i * 2 * np.pi / n_txs
+        # yaw = i * 2 * np.pi / n_txs
         tx = Transmitter(
             name=f"Tx{i:02d}",
-            position=[x, y, z],
-            orientation=[yaw, 0, 0],
-            power_dbm=power_per_tx,
+            position=mi.Point3f([x, y, z]),
+            orientation=mi.Point3f([0, 0, 0]),
+            power_dbm=int(power_per_tx),
         )
         scene.add(tx)
 
     # ------------------------------------------------------------------
     # 3. Receiver array
     # ------------------------------------------------------------------
-    scene.rx_array = PlanarArray(
-        num_rows=2,
-        num_cols=2,
-        vertical_spacing=0.5,
-        horizontal_spacing=0.5,
-        pattern="iso",
-        polarization="VH",
-    )
+    # scene.rx_array = PlanarArray(
+    #     num_rows=2,
+    #     num_cols=2,
+    #     vertical_spacing=0.5,
+    #     horizontal_spacing=0.5,
+    #     pattern="iso",
+    #     polarization="VH",
+    # )
 
-    rx = Receiver(name="Rx", position=list(rx_position), orientation=[0, 0, 0])
-    scene.add(rx)
+    # rx = Receiver(name="Rx", position=mi.Point3f(list(rx_position)), orientation=mi.Point3f([0, 0, 0]))
+    # scene.add(rx)
 
     # ------------------------------------------------------------------
     # 4. (Optional) Passive Reflector
@@ -194,4 +194,4 @@ def create_camera(
     -------
     sionna.rt.Camera
     """
-    return sionna.rt.Camera(position=list(position), look_at=list(look_at))
+    return sionna.rt.Camera(position=mi.Point3f(list(position)), look_at=mi.Point3f(list(look_at)))

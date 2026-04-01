@@ -65,82 +65,77 @@ def _flatten_rss_map(rss_map: torch.Tensor) -> torch.Tensor:
     return rss_map.reshape(-1)
 
 
-def _threshold_watt_like(rss_map: torch.Tensor, threshold_dbm: float) -> torch.Tensor:
-    """Return the coverage threshold in Watts on the same dtype/device as ``rss_map``."""
-    return dbm_to_rss(
-        torch.tensor(threshold_dbm, dtype=rss_map.dtype, device=rss_map.device)
-    )
-
-
-def _valid_reporting_mask(rss_map: torch.Tensor, threshold_dbm: float) -> torch.Tensor:
-    """Return the mask for cells considered valid in thresholded reporting.
-
-    A cell is report-valid when it exceeds both the numerical power floor and
-    the configured coverage threshold.
-    """
-    flat_map = _flatten_rss_map(rss_map)
-    threshold_watt = _threshold_watt_like(flat_map, threshold_dbm)
-    epsilon_floor = torch.tensor(
-        POWER_EPSILON,
-        dtype=flat_map.dtype,
-        device=flat_map.device,
-    )
-    effective_threshold = torch.maximum(threshold_watt, epsilon_floor)
-    return flat_map > effective_threshold
+def _power_floor_dbm() -> float:
+    """Return the dBm equivalent of ``POWER_EPSILON``."""
+    return float(10.0 * torch.log10(torch.tensor(POWER_EPSILON)).item() + 30.0)
 
 
 def compute_thresholded_reporting_metrics(
     rss_map: torch.Tensor,
-    threshold_dbm: float = -120.0,
     percentile: float = 0.05,
     spatial_weights: torch.Tensor | None = None,
     include_weighted: bool = False,
 ) -> dict[str, float]:
-    """Compute report metrics using only threshold-valid cells.
+    """Compute report metrics using numerically valid cells.
 
     Reporting semantics:
 
-    - ``coverage_pct`` is the percentage of all grid cells whose RSS exceeds
-      the configured threshold.
-    - ``min_rss_dbm``, ``p5_rss_dbm``, and ``mean_rss_dbm`` are computed only
-      over those covered cells.
+        - ``coverage_pct`` is the percentage of all grid cells whose RSS exceeds
+            the numerical floor ``POWER_EPSILON``.
+        - ``min_rss_dbm``, ``p5_rss_dbm``, and ``mean_rss_dbm`` are computed only
+            over those numerically valid cells.
 
-    When no cells exceed the threshold, the dBm statistics fall back to the
-    threshold value itself and coverage is ``0``.
+    When no cells exceed the numerical floor, the dBm statistics fall back to
+    the numerical floor in dBm and coverage is ``0``.
+
+    Region-reporting semantics (when ``include_weighted=True``):
+
+        - Only cells with explicit positive spatial weights are considered part of
+            the region of interest.
+        - ``region_min_rss_dbm``, ``region_p5_rss_dbm``, and
+            ``region_mean_rss_dbm`` are plain (unweighted) statistics over the
+            numerically valid cells within that region.
+        - Cells outside the explicit weighted region are ignored.
     """
     flat_map = _flatten_rss_map(rss_map)
+    floor_dbm = _power_floor_dbm()
 
-    weighted_defaults = {
-        "weighted_min_rss_dbm": float("nan"),
-        "weighted_p5_rss_dbm": float("nan"),
-        "weighted_mean_rss_dbm": float("nan"),
-        "weighted_coverage_pct": float("nan"),
-        "weighted_valid_cell_count": float("nan"),
-        "weighted_total_cell_count": float("nan"),
+    region_defaults = {
+        "region_min_rss_dbm": float("nan"),
+        "region_p5_rss_dbm": float("nan"),
+        "region_mean_rss_dbm": float("nan"),
+        "region_coverage_pct": float("nan"),
+        "region_valid_cell_count": float("nan"),
+        "region_total_cell_count": float("nan"),
     }
 
     total_cells = int(flat_map.numel())
     if total_cells == 0:
         return {
-            "min_rss_dbm": float(threshold_dbm),
-            "p5_rss_dbm": float(threshold_dbm),
-            "mean_rss_dbm": float(threshold_dbm),
+            "min_rss_dbm": floor_dbm,
+            "p5_rss_dbm": floor_dbm,
+            "mean_rss_dbm": floor_dbm,
             "coverage_pct": 0.0,
             "valid_cell_count": 0.0,
             "total_cell_count": 0.0,
-            **weighted_defaults,
+            **region_defaults,
         }
 
-    valid_mask = _valid_reporting_mask(flat_map, threshold_dbm)
-    valid_rss = flat_map[valid_mask]
+    epsilon_floor = torch.tensor(
+        POWER_EPSILON,
+        dtype=flat_map.dtype,
+        device=flat_map.device,
+    )
+    active_cells = flat_map > epsilon_floor
+    valid_rss = flat_map[active_cells]
     valid_count = int(valid_rss.numel())
     coverage_pct = 100.0 * valid_count / total_cells
 
     if valid_count == 0:
         stats_dbm = {
-            "min_rss_dbm": float(threshold_dbm),
-            "p5_rss_dbm": float(threshold_dbm),
-            "mean_rss_dbm": float(threshold_dbm),
+            "min_rss_dbm": floor_dbm,
+            "p5_rss_dbm": floor_dbm,
+            "mean_rss_dbm": floor_dbm,
         }
     else:
         valid_dbm = rss_to_dbm(valid_rss)
@@ -161,53 +156,70 @@ def compute_thresholded_reporting_metrics(
     }
 
     if not include_weighted:
-        metrics.update(weighted_defaults)
+        metrics.update(region_defaults)
         return metrics
 
     if spatial_weights is None:
-        metrics.update(weighted_defaults)
+        metrics.update(region_defaults)
         return metrics
 
     flat_weights = _flatten_rss_map(spatial_weights).to(dtype=flat_map.dtype, device=flat_map.device)
     if int(flat_weights.numel()) != total_cells:
-        metrics.update(weighted_defaults)
+        metrics.update(region_defaults)
         return metrics
 
     non_negative_weights = torch.clamp(flat_weights, min=0.0)
-    total_weight = float(non_negative_weights.sum().item())
-    if total_weight <= 0.0:
-        metrics.update(weighted_defaults)
+    if torch.any(non_negative_weights == 0.0):
+        # Explicit zero-valued cells define the reporting region directly.
+        weighted_region_mask = non_negative_weights > 0.0
+    else:
+        # Demand maps used by GA/GD can be strictly positive everywhere
+        # (baseline=1 plus emphasized boxes). In that case, selecting
+        # weights > 0 would collapse region stats to whole-map stats.
+        # Use cells above the positive-weight median as the emphasized region.
+        positive_weights = non_negative_weights[non_negative_weights > 0.0]
+        baseline = torch.median(positive_weights)
+        eps = torch.finfo(non_negative_weights.dtype).eps * 16.0
+        emphasized_region_mask = non_negative_weights > (baseline + eps)
+        weighted_region_mask = (
+            emphasized_region_mask
+            if bool(torch.any(emphasized_region_mask).item())
+            else (non_negative_weights > 0.0)
+        )
+    weighted_total_count = int(weighted_region_mask.sum().item())
+    if weighted_total_count <= 0:
+        metrics.update(region_defaults)
         return metrics
 
-    valid_weights = non_negative_weights[valid_mask]
-    valid_weight_sum = float(valid_weights.sum().item())
+    region_active_cells = active_cells & weighted_region_mask
+    weighted_valid_rss = flat_map[region_active_cells]
+    weighted_valid_count = int(weighted_valid_rss.numel())
 
-    if valid_count == 0 or valid_weight_sum <= 0.0:
-        weighted_stats = {
-            "weighted_min_rss_dbm": float(threshold_dbm),
-            "weighted_p5_rss_dbm": float(threshold_dbm),
-            "weighted_mean_rss_dbm": float(threshold_dbm),
-            "weighted_coverage_pct": 0.0,
-            "weighted_valid_cell_count": 0.0,
-            "weighted_total_cell_count": float(total_weight),
+    if weighted_valid_count == 0:
+        region_stats = {
+            "region_min_rss_dbm": floor_dbm,
+            "region_p5_rss_dbm": floor_dbm,
+            "region_mean_rss_dbm": floor_dbm,
+            "region_coverage_pct": 0.0,
+            "region_valid_cell_count": 0.0,
+            "region_total_cell_count": float(weighted_total_count),
         }
     else:
-        valid_dbm = rss_to_dbm(valid_rss)
-        normalized_valid_weights = valid_weights / valid_weights.sum()
-        weighted_mean = torch.sum(valid_dbm * normalized_valid_weights)
-        weighted_p5 = _weighted_quantile(valid_dbm.float(), valid_weights.float(), float(percentile))
-        weighted_min = _weighted_quantile(valid_dbm.float(), valid_weights.float(), 0.0)
+        weighted_valid_dbm = rss_to_dbm(weighted_valid_rss)
+        clamped_percentile = min(max(float(percentile), 0.0), 1.0)
 
-        weighted_stats = {
-            "weighted_min_rss_dbm": float(weighted_min.item()),
-            "weighted_p5_rss_dbm": float(weighted_p5.item()),
-            "weighted_mean_rss_dbm": float(weighted_mean.item()),
-            "weighted_coverage_pct": float(100.0 * valid_weight_sum / total_weight),
-            "weighted_valid_cell_count": float(valid_weight_sum),
-            "weighted_total_cell_count": float(total_weight),
+        region_stats = {
+            "region_min_rss_dbm": float(weighted_valid_dbm.min().item()),
+            "region_p5_rss_dbm": float(
+                torch.quantile(weighted_valid_dbm.float(), clamped_percentile).item()
+            ),
+            "region_mean_rss_dbm": float(weighted_valid_dbm.mean().item()),
+            "region_coverage_pct": float(100.0 * weighted_valid_count / weighted_total_count),
+            "region_valid_cell_count": float(weighted_valid_count),
+            "region_total_cell_count": float(weighted_total_count),
         }
 
-    metrics.update(weighted_stats)
+    metrics.update(region_stats)
     return metrics
 
 
@@ -227,8 +239,8 @@ def compute_min_rss_metric(rss_map: torch.Tensor) -> torch.Tensor:
         Minimum RSS value (scalar tensor)
     """
     # Filter out invalid values (zeros or very small values)
-    valid_mask = rss_map > POWER_EPSILON
-    valid_rss = rss_map[valid_mask]
+    active_cells = rss_map > POWER_EPSILON
+    valid_rss = rss_map[active_cells]
 
     if valid_rss.numel() == 0:
         return torch.tensor(0.0, dtype=torch.float32)
@@ -256,8 +268,8 @@ def compute_p5_rss_metric(rss_map: torch.Tensor) -> torch.Tensor:
     Returns:
         5th-percentile RSS value (scalar tensor, linear Watts).
     """
-    valid_mask = rss_map > POWER_EPSILON
-    valid_rss = rss_map[valid_mask]
+    active_cells = rss_map > POWER_EPSILON
+    valid_rss = rss_map[active_cells]
 
     if valid_rss.numel() == 0:
         return torch.tensor(0.0, dtype=torch.float32)
@@ -285,8 +297,8 @@ def compute_soft_min_rss_metric(
     rss_flat = rss_map.flatten()
 
     # Filter out invalid values (zeros or very small values) to avoid log issues
-    valid_mask = rss_flat > POWER_EPSILON
-    valid_rss = rss_flat[valid_mask]
+    active_cells = rss_flat > POWER_EPSILON
+    valid_rss = rss_flat[active_cells]
 
     if valid_rss.numel() == 0:
         return torch.tensor(
@@ -317,8 +329,10 @@ def compute_coverage_metric(
         Coverage percentage (0-100)
     """
     flat_map = _flatten_rss_map(rss_map)
-    valid_mask = _valid_reporting_mask(flat_map, threshold_dbm)
-    above_threshold = valid_mask.float()
+    threshold_watt = dbm_to_rss(
+        torch.tensor(threshold_dbm, dtype=flat_map.dtype, device=flat_map.device)
+    )
+    above_threshold = (flat_map > threshold_watt).float()
     coverage = torch.mean(above_threshold) * 100.0  # Convert to percentage
 
     return coverage
@@ -531,8 +545,8 @@ class MaskedSoftMinLoss(nn.Module):
         flat = rss_watts.flatten()
 
         # Exclude numerical-noise cells
-        valid_mask = flat > POWER_EPSILON
-        valid = flat[valid_mask]
+        active_cells = flat > POWER_EPSILON
+        valid = flat[active_cells]
 
         if valid.numel() == 0:
             return torch.tensor(
