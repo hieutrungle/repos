@@ -1,10 +1,11 @@
 {
   "scene_config": {
-    "scene_path": "/home/hieule/blender/models/building_floor/building_floor.xml",
-    "frequency": 6000000000.0,
-    "tx_power_dbm": 5.0,
+    "scene_path": "/home/hieule/blender/models/building_floor_ceil/building_floor_ceil.xml",
+    "frequency": 5180000000.0,
+    "tx_power_dbm": 20.0,
     "tx_positions": [
-      [25.0, 25.0, 3.8]
+      [15.0, 15.0, 3.8],
+      [30.0, 30.0, 3.8]
     ],
     "reflector_enabled": true,
     "reflector_size": [2.0, 2.0],
@@ -13,7 +14,10 @@
     "focal_point": [25.0, 25.0, 1.5],
     "device": "cuda"
   },
-  "output_dir": "tmp_results/experiments/",
+  "visualization_scene_config": {
+    "scene_path": "/home/hieule/blender/models/building_floor/building_floor.xml"
+  },
+  "output_dir": "tmp_results1/tmp_experiments_2AP/",
   "position_bounds": {
     "x_min": 5.5,
     "x_max": 34.5,
@@ -21,50 +25,52 @@
     "y_max": 34.5
   },
   "fixed_z": 3.8,
-  "num_pool_workers": 4,
-  "gpu_fraction": 0.25,
-  "random_seed": 4,
-  "num_aps": 1,
-  "min_ap_separation": 0.0,
+  "num_pool_workers": 2,
+  "gpu_fraction": 0.5,
+  "random_seed": 43,
+  "num_aps": 2,
+  "min_ap_separation": 2.0,
   "optimize_orientation": true,
   "reflector_enabled": true,
   "focal_z": 1.5,
   "demand_config": {
     "enabled": true,
     "bounding_boxes": [
-      [[5.0, 35.0], [11.0, 5.0]],
-      [[30.0, 26.0], [35.0, 5.0]]
+      [[5.5, 36.0], [10.0, 5.0]],
+      [[29.0, 25.5], [36.0, 5.0]],
+      [[15.0, 35.0], [35.0, 30.0]],
+      [[15.0, 25.0], [24.0, 5.5]]
     ],
-    "box_weights": [4.0, 4.0],
-    "apply_blur": true
+    "box_weights": [6.0, 6.0, 2.0, 4.0],
+    "apply_blur": false
   },
   "objective_params": {
-    "alpha": 0.999,
-    "beta": 0.001,
-    "softmin_temperature": 0.05,
-    "softmin_floor_dbm": -120.0,
-    "softmin_ceil_dbm": -70.0,
-    "coverage_threshold_dbm": -120.0,
-    "coverage_temperature": 2.0
+    "alpha": 2.0,
+    "beta": 0.1,
+    "softmin_temperature": 0.2,
+    "softmin_floor_dbm": -100.0,
+    "softmin_ceil_dbm": -50.0,
+    "coverage_threshold_dbm": -70.0,
+    "coverage_temperature": 1.0
   },
   "ga_params": {
-    "pop_size": 100,
+    "pop_size": 70,
     "n_gen": 20,
-    "cxpb": 0.7,
+    "cxpb": 0.6,
     "mutpb": 0.4,
-    "tournsize": 20,
-    "hof_size": 30
+    "tournsize": 50,
+    "hof_size": 20
   },
   "ga_evaluation_params": {
     "samples_per_tx": 1000000,
     "max_depth": 13,
     "verbose": false
   },
-  "k_seeds": 8,
+  "k_seeds": 2,
   "d_corr": 0.0,
   "gd_optimization_params": {
     "num_iterations": 100,
-    "learning_rate": 0.01,
+    "learning_rate": 0.005,
     "samples_per_tx": 1000000,
     "max_depth": 13,
     "verbose": false
@@ -72,7 +78,9 @@
   "coverage_plot_settings": {
     "samples_per_tx": 1000000,
     "max_depth": 13,
-    "resolution": [1200, 900]
+    "resolution": [1200, 900],
+    "render_ga_generation_best_coverage_maps": true,
+    "render_gd_trajectory_coverage_maps": true
   },
   "verbose": true
 }
