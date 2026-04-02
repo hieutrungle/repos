@@ -1212,7 +1212,9 @@ def _build_gd_task_ga_snapshot(result: Mapping[str, Any]) -> Optional[Dict[str, 
     if positions is None:
         return None
 
-    directions = _as_directions_3d(optimizer_kwargs.get("initial_directions_xy"))
+    directions = _as_directions_3d(
+        optimizer_kwargs.get("initial_directions_xyz", optimizer_kwargs.get("initial_directions_xy"))
+    )
     reflector = _extract_reflector_state(optimizer_kwargs)
     return {
         "positions": positions,
@@ -1275,6 +1277,33 @@ def _build_gd_task_trajectory_snapshots(result: Mapping[str, Any]) -> List[Tuple
         )
 
     return snapshots
+
+
+def _resolve_render_scene_config(
+    config_args: Mapping[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Resolve plotting scene config with optional visualization overrides.
+
+    Priority order:
+    1. Base from ``scene_config`` (required)
+    2. Apply ``visualization_scene_config`` mapping overrides (optional)
+    3. Apply ``visualization_scene_path`` override for convenience (optional)
+    """
+    base_scene_config = config_args.get("scene_config")
+    if not isinstance(base_scene_config, Mapping):
+        return None
+
+    render_scene_config: Dict[str, Any] = dict(base_scene_config)
+
+    raw_visualization_scene_config = config_args.get("visualization_scene_config")
+    if isinstance(raw_visualization_scene_config, Mapping):
+        render_scene_config.update(dict(raw_visualization_scene_config))
+
+    visualization_scene_path = config_args.get("visualization_scene_path")
+    if visualization_scene_path is not None:
+        render_scene_config["scene_path"] = str(visualization_scene_path)
+
+    return render_scene_config
 
 
 def _apply_snapshot_to_scene(
@@ -1379,6 +1408,8 @@ def _render_coverage_snapshot(
         radio_map=radio_map,
         rm_metric="rss",
         rm_db_scale=True,
+        rm_vmin=-80,
+        rm_vmax=-40,
         resolution=resolution,
         show_devices=True,
         show_orientations=False,
@@ -1392,8 +1423,8 @@ def save_memetic_coverage_maps(
     output_dir: Path,
 ) -> Dict[str, str]:
     """Save GA/GD coverage maps, including optional GA/GD trajectory frames."""
-    scene_config = config_args.get("scene_config")
-    if not isinstance(scene_config, Mapping):
+    render_scene_config = _resolve_render_scene_config(config_args)
+    if render_scene_config is None:
         return {}
 
     render_settings = config_args.get("coverage_plot_settings")
@@ -1443,7 +1474,7 @@ def save_memetic_coverage_maps(
 
     artifacts: Dict[str, str] = {}
     states_by_method = {
-        "ga": _build_ga_snapshots(summary, scene_config),
+        "ga": _build_ga_snapshots(summary, render_scene_config),
         "gd": _build_gd_snapshots(summary),
     }
 
@@ -1457,7 +1488,7 @@ def save_memetic_coverage_maps(
             key = f"coverage_map_{method}_{stage}"
             try:
                 rendered = _render_coverage_snapshot(
-                    scene_config=scene_config,
+                    scene_config=render_scene_config,
                     snapshot=snapshot,
                     save_path=image_path,
                     samples_per_tx=samples_per_tx,
@@ -1486,7 +1517,7 @@ def save_memetic_coverage_maps(
             image_path = base_dir / f"gen_{generation_index:04d}.png"
             try:
                 rendered = _render_coverage_snapshot(
-                    scene_config=scene_config,
+                    scene_config=render_scene_config,
                     snapshot=snapshot,
                     save_path=image_path,
                     samples_per_tx=samples_per_tx,
@@ -1525,7 +1556,7 @@ def save_memetic_coverage_maps(
                     ga_path = task_dir / "ga_final.png"
                     try:
                         rendered = _render_coverage_snapshot(
-                            scene_config=scene_config,
+                            scene_config=render_scene_config,
                             snapshot=ga_snapshot,
                             save_path=ga_path,
                             samples_per_tx=samples_per_tx,
@@ -1549,7 +1580,7 @@ def save_memetic_coverage_maps(
                     image_path = task_dir / f"{label}.png"
                     try:
                         rendered = _render_coverage_snapshot(
-                            scene_config=scene_config,
+                            scene_config=render_scene_config,
                             snapshot=snapshot,
                             save_path=image_path,
                             samples_per_tx=samples_per_tx,
