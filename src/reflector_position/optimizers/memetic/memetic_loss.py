@@ -388,7 +388,7 @@ class MemeticCompositeLoss(nn.Module):
             spatial_weights = torch.ones_like(coverage_map_dbm)
 
         softmin_loss = self.softmin_loss(coverage_map_dbm, spatial_weights)
-        coverage_loss = self.coverage_loss(coverage_map_dbm) * 0.0
+        coverage_loss = self.coverage_loss(coverage_map_dbm)
         total_loss = self.alpha * softmin_loss + self.beta * coverage_loss
 
         components = {

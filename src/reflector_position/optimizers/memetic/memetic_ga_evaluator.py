@@ -13,7 +13,7 @@ stage.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Mapping, Optional, Sequence
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -76,7 +76,7 @@ class StaticConfigurationEvaluator:
 
             - ``initial_positions``: sequence of ``(x, y)`` AP positions
             - ``fixed_z``: shared AP height
-            - ``initial_directions_xy``: optional sequence of ``(dx, dy)``
+            - ``initial_directions_xyz``: optional sequence of ``(dx, dy, dz)``
             - ``reflector_u`` / ``reflector_v`` / ``reflector_target``
             - ``samples_per_tx`` / ``max_depth`` for the radio-map solver
 
@@ -88,7 +88,7 @@ class StaticConfigurationEvaluator:
         """
         with torch.no_grad():
             tx_positions = self._build_tx_positions(task)
-            self._configure_transmitters(tx_positions, task.get("initial_directions_xy"))
+            self._configure_transmitters(tx_positions, task.get("initial_directions_xyz"))
             self._configure_reflector(tx_positions, task)
 
             radio_map = self.solver(
@@ -149,7 +149,7 @@ class StaticConfigurationEvaluator:
     def _configure_transmitters(
         self,
         tx_positions: Sequence[Sequence[float]],
-        directions_xy: Any,
+        directions_xyz: Optional[Sequence[Tuple[float, float, float]]],
     ) -> None:
         """Update scene transmitter positions and optional look directions."""
         transmitters = list(self.scene.transmitters.values())
@@ -158,17 +158,17 @@ class StaticConfigurationEvaluator:
                 f"task defines {len(tx_positions)} APs but scene only has {len(transmitters)} transmitters"
             )
 
-        directions_list: Optional[Sequence[Any]]
-        if directions_xy is None:
+        directions_list: Optional[Sequence[Tuple[float, float, float]]]
+        if directions_xyz is None:
             directions_list = None
-        elif isinstance(directions_xy, Sequence):
-            directions_list = directions_xy
+        elif isinstance(directions_xyz, Sequence):
+            directions_list = directions_xyz
             if len(directions_list) != len(tx_positions):
                 raise ValueError(
-                    "'initial_directions_xy' must have the same length as 'initial_positions'"
+                    "'initial_directions_xyz' must have the same length as 'initial_positions'"
                 )
         else:
-            raise ValueError("'initial_directions_xy' must be a sequence or None")
+            raise ValueError("'initial_directions_xyz' must be a sequence or None")
 
         for index, transmitter in enumerate(transmitters[: len(tx_positions)]):
             position = [float(coord) for coord in tx_positions[index]]
@@ -177,15 +177,16 @@ class StaticConfigurationEvaluator:
             if directions_list is None or directions_list[index] is None:
                 continue
 
-            direction_xy = directions_list[index]
-            if not isinstance(direction_xy, Sequence) or len(direction_xy) < 2:
+            direction_xyz = directions_list[index]
+            if not isinstance(direction_xyz, Sequence) or len(direction_xyz) < 3:
                 raise ValueError(
-                    "each entry in 'initial_directions_xy' must contain at least (dx, dy)"
+                    "each entry in 'initial_directions_xyz' must contain (dx, dy, dz)"
                 )
 
-            dx = float(direction_xy[0])
-            dy = float(direction_xy[1])
-            target = [position[0] + dx, position[1] + dy, position[2]]
+            dx = float(direction_xyz[0])
+            dy = float(direction_xyz[1])
+            dz = float(direction_xyz[2])
+            target = [position[0] + dx, position[1] + dy, position[2] + dz]
             transmitter.look_at(target)
 
     def _configure_reflector(

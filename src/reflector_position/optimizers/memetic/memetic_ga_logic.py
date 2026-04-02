@@ -21,6 +21,7 @@ Design notes
 
 from __future__ import annotations
 
+import math
 import random
 import time
 from dataclasses import asdict, dataclass
@@ -38,7 +39,7 @@ if not hasattr(creator, "MemeticIndividual"):
     creator.create("MemeticIndividual", list, fitness=creator.MemeticFitnessMax)
 
 
-FIXED_DIR_Z_DEFAULT = -0.5
+DEFAULT_DIRECTION_Z = -0.5
 PENALTY_FITNESS_LINEAR = 1e-100
 PENALTY_PRIMARY_FITNESS: float = -1e15
 MIN_AP_SEPARATION_DEFAULT = 2.0
@@ -154,15 +155,13 @@ def _compile_generation_stats(population: Sequence[Any]) -> Dict[str, float | in
 def _normalize_direction(
     dx: float,
     dy: float,
-    dir_z: float = FIXED_DIR_Z_DEFAULT,
+    dz: float,
 ) -> Tuple[float, float, float]:
-    """L2-normalize ``[dx, dy, dir_z]``; fallback to ``(0,0,-1)``."""
-    raw = np.array([dx, dy, dir_z], dtype=np.float64)
-    norm = np.linalg.norm(raw)
+    """L2-normalize ``[dx, dy, dz]``; fallback to ``(0,0,-1)``."""
+    norm = math.sqrt(dx * dx + dy * dy + dz * dz)
     if norm < 1e-8:
         return (0.0, 0.0, -1.0)
-    unit = raw / norm
-    return (float(unit[0]), float(unit[1]), float(unit[2]))
+    return (float(dx / norm), float(dy / norm), float(dz / norm))
 
 
 def _split_mutate(
@@ -178,9 +177,13 @@ def _split_mutate(
     """Gaussian mutation with region-specific sigmas.
 
     Position genes use ``sigma_pos``.
-    Direction genes use ``sigma_dir``.
+    Direction genes use ``sigma_dir`` and are constrained to normalized
+    downward 3-D vectors.
     Reflector genes (if present) use ``sigma_reflector``.
     """
+    dir_start = int(num_pos_genes)
+    dir_end = int(reflector_gene_start) if reflector_gene_start >= 0 else len(individual)
+
     for i in range(len(individual)):
         if random.random() < indpb:
             if i < num_pos_genes:
@@ -190,6 +193,29 @@ def _split_mutate(
             else:
                 sigma = sigma_dir
             individual[i] += random.gauss(mu, sigma)
+
+            # Clamp mutated orientation components by axis to enforce bounds.
+            if dir_start <= i < dir_end:
+                component_idx = (i - dir_start) % 3
+                if component_idx == 2:
+                    individual[i] = max(-1.0, min(individual[i], -1e-4))
+                else:
+                    individual[i] = max(-1.0, min(individual[i], 1.0))
+
+    # Keep each orientation triplet on the unit sphere after mutation.
+    for base_idx in range(dir_start, dir_end, 3):
+        if base_idx + 2 >= dir_end:
+            break
+
+        dx = float(individual[base_idx])
+        dy = float(individual[base_idx + 1])
+        dz = float(individual[base_idx + 2])
+        dz = max(-1.0, min(dz, -1e-4))
+        dir_x, dir_y, dir_z = _normalize_direction(dx, dy, dz)
+        individual[base_idx] = dir_x
+        individual[base_idx + 1] = dir_y
+        individual[base_idx + 2] = dir_z
+
     return (individual,)
 
 
@@ -206,7 +232,6 @@ class MemeticGeneticAlgorithmRunner:
         fixed_z: float,
         executor_map: Callable[[Callable, Iterable], List[Dict[str, Any]]],
         optimize_orientation: bool = True,
-        fixed_dir_z: float = FIXED_DIR_Z_DEFAULT,
         num_aps: int = 1,
         min_ap_separation: float = MIN_AP_SEPARATION_DEFAULT,
         reflector_enabled: bool = False,
@@ -220,7 +245,6 @@ class MemeticGeneticAlgorithmRunner:
         self.fixed_z = fixed_z
         self._executor_map = executor_map
         self.optimize_orientation = optimize_orientation
-        self.fixed_dir_z = fixed_dir_z
         self.num_aps = int(num_aps)
         self.min_ap_separation = float(min_ap_separation)
 
@@ -245,7 +269,7 @@ class MemeticGeneticAlgorithmRunner:
             }
 
         self._n_pos_genes = 2 * self.num_aps
-        self._n_dir_genes = 2 * self.num_aps if self.optimize_orientation else 0
+        self._n_dir_genes = 3 * self.num_aps if self.optimize_orientation else 0
         self._n_reflector_genes = 4 if self.reflector_enabled else 0
         self._n_genes = self._n_pos_genes + self._n_dir_genes + self._n_reflector_genes
 
@@ -304,9 +328,11 @@ class MemeticGeneticAlgorithmRunner:
         directions: List[Tuple[float, float, float]] = []
         dir_base = self._n_pos_genes
         for ap_idx in range(self.num_aps):
-            dx = float(individual[dir_base + 2 * ap_idx])
-            dy = float(individual[dir_base + 2 * ap_idx + 1])
-            directions.append(_normalize_direction(dx, dy, self.fixed_dir_z))
+            offset = dir_base + 3 * ap_idx
+            dx = float(individual[offset])
+            dy = float(individual[offset + 1])
+            dz = max(-1.0, min(float(individual[offset + 2]), -1e-4))
+            directions.append(_normalize_direction(dx, dy, dz))
         return directions
 
     def _extract_reflector(self, individual: Sequence[float]) -> Optional[Dict[str, float]]:
@@ -461,14 +487,14 @@ class MemeticGeneticAlgorithmRunner:
 
         if self.optimize_orientation:
             dir_base = self._n_pos_genes
-            task_kwargs["initial_directions_xy"] = [
-                _normalize_direction(
-                    float(individual[dir_base + 2 * ap_idx]),
-                    float(individual[dir_base + 2 * ap_idx + 1]),
-                    self.fixed_dir_z,
-                )[:2]
-                for ap_idx in range(self.num_aps)
-            ]
+            directions: List[Tuple[float, float, float]] = []
+            for ap_idx in range(self.num_aps):
+                offset = dir_base + 3 * ap_idx
+                dx = float(individual[offset])
+                dy = float(individual[offset + 1])
+                dz = max(-1.0, min(float(individual[offset + 2]), -1e-4))
+                directions.append(_normalize_direction(dx, dy, dz))
+            task_kwargs["initial_directions_xyz"] = directions
 
         if self.reflector_enabled:
             rg = self._reflector_gene_start
@@ -497,7 +523,22 @@ class MemeticGeneticAlgorithmRunner:
         if self.optimize_orientation:
             dir_end = self._n_pos_genes + self._n_dir_genes
             for i in range(self._n_pos_genes, dir_end):
-                individual[i] = max(-1.0, min(individual[i], 1.0))
+                component_idx = (i - self._n_pos_genes) % 3
+                if component_idx == 2:
+                    individual[i] = max(-1.0, min(individual[i], -1e-4))
+                else:
+                    individual[i] = max(-1.0, min(individual[i], 1.0))
+
+            # Re-normalize each direction triplet after crossover/mutation clamping.
+            for ap_idx in range(self.num_aps):
+                base_idx = self._n_pos_genes + 3 * ap_idx
+                dx = float(individual[base_idx])
+                dy = float(individual[base_idx + 1])
+                dz = max(-1.0, min(float(individual[base_idx + 2]), -1e-4))
+                dir_x, dir_y, dir_z = _normalize_direction(dx, dy, dz)
+                individual[base_idx] = dir_x
+                individual[base_idx + 1] = dir_y
+                individual[base_idx + 2] = dir_z
 
         if self.reflector_enabled:
             rg = self._reflector_gene_start
@@ -638,8 +679,15 @@ class MemeticGeneticAlgorithmRunner:
 
         pos_genes = (toolbox.attr_x, toolbox.attr_y) * self.num_aps
         if self.optimize_orientation:
-            toolbox.register("attr_dir", random.uniform, -1.0, 1.0)
-            gene_cycle = pos_genes + (toolbox.attr_dir,) * self._n_dir_genes
+            toolbox.register("attr_dir_x", random.uniform, -1.0, 1.0)
+            toolbox.register("attr_dir_y", random.uniform, -1.0, 1.0)
+            toolbox.register("attr_dir_z", random.uniform, -1.0, -1e-4)
+            direction_genes = (
+                toolbox.attr_dir_x,
+                toolbox.attr_dir_y,
+                toolbox.attr_dir_z,
+            ) * self.num_aps
+            gene_cycle = pos_genes + direction_genes
         else:
             gene_cycle = pos_genes
 
@@ -702,6 +750,9 @@ class MemeticGeneticAlgorithmRunner:
         hof = tools.HallOfFame(maxsize=hof_size)
 
         population = toolbox.population(n=pop_size)
+        for individual in population:
+            self._clamp_individual(individual)
+
         total_evaluations = 0
         generation_details: List[Dict[str, Any]] = []
 

@@ -34,7 +34,7 @@ _GD_OPTIMIZE_PARAM_KEYS = {
 # be forwarded to GradientDescentAPOptimizer.__init__(...).
 _GD_NON_INIT_TASK_KEYS = {
     "scene_config",
-    "initial_orientations",  # bridge alias (3D), GD expects initial_directions_xy
+    "initial_orientations",  # bridge alias (3D), GD expects initial_directions_xyz
     "initial_primary_loss",  # analysis metadata
 }
 
@@ -157,6 +157,9 @@ def run_targeted_gd_exploitation(
         List of translated work-item dictionaries from Phase 2 bridge.
         Each item must be compatible with ``GradientDescentAPOptimizer``
         initialization fields (e.g. ``initial_positions``, ``fixed_z``, etc.).
+
+        Orientation initialization key:
+        - ``initial_directions_xyz``: optional per-AP ``(dx, dy, dz)``.
 
         Optional per-item metadata keys used by this function:
         - ``scene_config``: scene config dict (if optimizer has no cached scene)

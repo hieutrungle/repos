@@ -399,7 +399,9 @@ def run_memetic_optimization(config_args: Mapping[str, Any]) -> Dict[str, Any]:
     config_args : Mapping[str, Any]
         Pipeline configuration dictionary. Expected top-level keys:
 
-        - ``scene_config``: dict for scene setup (required by Ray workers)
+        - ``scene_config``: dict for scene setup (required by Ray workers).
+          Optional plotting overrides: ``visualization_scene_config`` and
+          ``visualization_scene_path``.
         - ``position_bounds``: dict with ``x_min``, ``x_max``, ``y_min``, ``y_max``
         - ``fixed_z``: float AP height
         - ``num_pool_workers``: int actor pool size
@@ -532,6 +534,13 @@ def run_memetic_optimization(config_args: Mapping[str, Any]) -> Dict[str, Any]:
             reflector_enabled=reflector_enabled,
             gd_optimization_params=gd_optimization_params,
         )
+        if optimize_orientation:
+            for task_index, task in enumerate(gd_tasks):
+                if "initial_directions_xyz" not in task:
+                    raise ValueError(
+                        "Bridge task missing 'initial_directions_xyz' while "
+                        f"optimize_orientation=True (task index {task_index})."
+                    )
 
         # Attach scene + baseline metric metadata for Phase-3 analysis.
         for seed, task in zip(seeds, gd_tasks):

@@ -164,7 +164,7 @@ def generate_gd_tasks_from_seeds(
         - ``num_aps``: int
         - ``optimize_orientation``: bool
         - ``initial_orientations``: list[(dx, dy, dz)] | None (bridge alias)
-        - ``initial_directions_xy``: list[(dx, dy)] | None (GD-compatible)
+        - ``initial_directions_xyz``: list[(dx, dy, dz)] | None (GD-compatible)
         - ``reflector_u`` / ``reflector_v`` / ``reflector_target`` (bridge keys)
         - ``initial_focal_point`` (GD-compatible reflector focal-point init)
         - + any ``gd_optimization_params`` keys
@@ -224,14 +224,14 @@ def generate_gd_tasks_from_seeds(
                 )
 
             task_kwargs["initial_orientations"] = directions
-            task_kwargs["initial_directions_xy"] = (
-                [(float(d[0]), float(d[1])) for d in directions]
+            task_kwargs["initial_directions_xyz"] = (
+                [(float(d[0]), float(d[1]), float(d[2])) for d in directions]
                 if directions is not None
                 else None
             )
         else:
             task_kwargs["initial_orientations"] = None
-            task_kwargs["initial_directions_xy"] = None
+            task_kwargs["initial_directions_xyz"] = None
 
         if reflector_enabled:
             reflector_u, reflector_v, focal_point = _extract_reflector(seed_view, idx)

@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import drjit as dr
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import sionna.rt
@@ -54,12 +55,8 @@ class MemeticGradientDescentOptimizer(BaseAPOptimizer):
         Shared AP height.
     position_bounds : dict[str, float] | None
         Optional XY clamp bounds.
-    initial_directions_xy : list[tuple[float, float]] | None
-        Optional per-AP XY look directions.
-    initial_direction_xy : tuple[float, float] | None
-        Optional single direction replicated across APs.
-    fixed_dir_z : float
-        Shared Z component for normalized AP look directions.
+    initial_directions_xyz : Sequence[tuple[float, float, float]] | None
+        Optional per-AP 3-D look directions from the GA bridge.
     optimize_orientation : bool
         Whether AP directions are trainable.
     repulsion_weight : float
@@ -84,9 +81,7 @@ class MemeticGradientDescentOptimizer(BaseAPOptimizer):
         num_aps: Optional[int] = None,
         fixed_z: float = 3.8,
         position_bounds: Optional[Dict[str, float]] = None,
-        initial_directions_xy: Optional[List[Tuple[float, float]]] = None,
-        initial_direction_xy: Optional[Tuple[float, float]] = None,
-        fixed_dir_z: float = -0.3,
+        initial_directions_xyz: Optional[Sequence[Tuple[float, float, float]]] = None,
         optimize_orientation: bool = True,
         repulsion_weight: float = 1.0,
         reflector_controller: Optional[ReflectorController] = None,
@@ -107,7 +102,6 @@ class MemeticGradientDescentOptimizer(BaseAPOptimizer):
         )
         self.optimize_orientation = bool(optimize_orientation)
         self.repulsion_weight = float(repulsion_weight)
-        self.fixed_dir_z = float(fixed_dir_z)
 
         positions = self._resolve_initial_positions(
             initial_positions=initial_positions,
@@ -131,13 +125,14 @@ class MemeticGradientDescentOptimizer(BaseAPOptimizer):
         )
 
         direction_inits = self._resolve_initial_directions(
-            initial_directions_xy=initial_directions_xy,
-            initial_direction_xy=initial_direction_xy,
+            initial_directions_xyz=initial_directions_xyz,
         )
-        self.tx_dir_xy = torch.tensor(
-            direction_inits,
-            dtype=torch.float32,
-            device=self.device,
+        self.directions_raw = nn.Parameter(
+            torch.tensor(
+                direction_inits,
+                dtype=torch.float32,
+                device=self.device,
+            ),
             requires_grad=self.optimize_orientation,
         )
 
@@ -235,7 +230,7 @@ class MemeticGradientDescentOptimizer(BaseAPOptimizer):
         ]
         if self.optimize_orientation:
             param_groups.append(
-                {"params": [self.tx_dir_xy], "lr": float(learning_rate) * 2.0}
+                {"params": [self.directions_raw], "lr": float(learning_rate) * 2.0}
             )
         reflector_params = self._reflector_parameter_list()
         if reflector_params:
@@ -248,7 +243,7 @@ class MemeticGradientDescentOptimizer(BaseAPOptimizer):
         # part of the memetic loss and can make the logged loss rise even when
         # the optimizer is following its internal objective.
         optimizer = torch.optim.AdamW(param_groups, weight_decay=0.0, betas=(0.0, 0.999))
-        scheduler = CosineAnnealingLR(optimizer, T_max=int(num_iterations), eta_min=1e-5)
+        scheduler = CosineAnnealingLR(optimizer, T_max=int(num_iterations), eta_min=5e-6)
 
         start_time = time.time()
         with torch.no_grad():
@@ -366,7 +361,6 @@ class MemeticGradientDescentOptimizer(BaseAPOptimizer):
             self._apply_reflector_state()
 
         directions = self.get_current_directions()
-        dir_z_values = [float(directions[i, 2].item()) for i in range(self.num_aps)]
         tx_list = [self.scene.transmitters[name] for name in self.tx_names]
 
         wrap_args: List[torch.Tensor] = []
@@ -374,6 +368,7 @@ class MemeticGradientDescentOptimizer(BaseAPOptimizer):
         wrap_args.extend(self.tx_y[i] for i in range(self.num_aps))
         wrap_args.extend(directions[i, 0] for i in range(self.num_aps))
         wrap_args.extend(directions[i, 1] for i in range(self.num_aps))
+        wrap_args.extend(directions[i, 2] for i in range(self.num_aps))
 
         @dr.wrap(source="torch", target="drjit")
         def compute_rss(*args: torch.Tensor) -> torch.Tensor:
@@ -384,12 +379,13 @@ class MemeticGradientDescentOptimizer(BaseAPOptimizer):
                 y_coord = args[n_aps + index]
                 dir_x = args[2 * n_aps + index]
                 dir_y = args[3 * n_aps + index]
+                dir_z = args[4 * n_aps + index]
 
                 tx.position = mi.Point3f([x_coord.array, y_coord.array, self.fixed_z])
                 target = [
                     x_coord.array + dir_x.array,
                     y_coord.array + dir_y.array,
-                    self.fixed_z + dir_z_values[index],
+                    self.fixed_z + dir_z.array,
                 ]
                 tx.look_at(target)
 
@@ -433,15 +429,23 @@ class MemeticGradientDescentOptimizer(BaseAPOptimizer):
         return np.stack([x_coords, y_coords, z_coords], axis=-1)
 
     def get_current_directions(self) -> torch.Tensor:
-        """Return normalized AP look directions of shape ``[num_aps, 3]``."""
-        dir_z = torch.full(
-            (self.num_aps, 1),
-            self.fixed_dir_z,
-            dtype=torch.float32,
-            device=self.device,
-        )
-        full_dir = torch.cat([self.tx_dir_xy, dir_z], dim=1)
-        return F.normalize(full_dir, dim=1)
+        """Return projected AP look directions of shape ``[num_aps, 3]``."""
+        return self._get_physical_directions()
+
+    def _get_physical_directions(self) -> torch.Tensor:
+        """Project raw 3-D directions to unit vectors with strict downward tilt.
+
+        The optimizer runs in unconstrained Cartesian 3-D to avoid topological
+        wrap-around discontinuities from angular parameterizations. Before
+        normalization, ``z`` is clamped with ``max=-1e-4`` so beams never
+        become perfectly horizontal, which can trigger ray-tracing numerical
+        artifacts while still allowing smooth gradient-based updates.
+        """
+        xy_components = self.directions_raw[:, :2]
+        z_component = self.directions_raw[:, 2]
+        clamped_z = torch.clamp(z_component, max=-1e-4)
+        full_direction = torch.cat([xy_components, clamped_z.unsqueeze(1)], dim=1)
+        return F.normalize(full_direction, p=2, dim=1)
 
     def _resolve_initial_positions(
         self,
@@ -451,14 +455,17 @@ class MemeticGradientDescentOptimizer(BaseAPOptimizer):
     ) -> List[Tuple[float, float]]:
         """Resolve initial AP positions from the accepted constructor inputs."""
         if initial_positions is not None:
-            if (
-                isinstance(initial_positions, tuple)
-                and len(initial_positions) == 2
-                and all(isinstance(value, (int, float)) for value in initial_positions)
-            ):
-                return [
-                    (float(initial_positions[0]), float(initial_positions[1]))
-                ]
+            if isinstance(initial_positions, tuple):
+                if (
+                    len(initial_positions) == 2
+                    and all(isinstance(value, (int, float)) for value in initial_positions)
+                ):
+                    return [
+                        (float(initial_positions[0]), float(initial_positions[1]))
+                    ]
+                raise ValueError(
+                    "'initial_positions' tuple form must be a single (x, y) pair."
+                )
             return [
                 (float(position[0]), float(position[1]))
                 for position in initial_positions
@@ -472,27 +479,30 @@ class MemeticGradientDescentOptimizer(BaseAPOptimizer):
 
     def _resolve_initial_directions(
         self,
-        initial_directions_xy: Optional[List[Tuple[float, float]]],
-        initial_direction_xy: Optional[Tuple[float, float]],
+        initial_directions_xyz: Optional[Sequence[Tuple[float, float, float]]],
     ) -> List[List[float]]:
-        """Resolve per-AP initial XY directions."""
-        if initial_directions_xy is not None:
-            if len(initial_directions_xy) != self.num_aps:
+        """Resolve per-AP initial XYZ directions.
+
+        When no explicit directions are provided, all APs start with a strict
+        downward direction ``(0, 0, -1)``.
+        """
+        if initial_directions_xyz is not None:
+            if len(initial_directions_xyz) != self.num_aps:
                 raise ValueError(
-                    "'initial_directions_xy' must match the number of AP positions."
+                    "'initial_directions_xyz' must match the number of AP positions."
                 )
-            return [
-                [float(direction[0]), float(direction[1])]
-                for direction in initial_directions_xy
-            ]
+            resolved_directions: List[List[float]] = []
+            for direction in initial_directions_xyz:
+                if len(direction) < 3:
+                    raise ValueError(
+                        "each entry in 'initial_directions_xyz' must contain (dx, dy, dz)."
+                    )
+                resolved_directions.append(
+                    [float(direction[0]), float(direction[1]), float(direction[2])]
+                )
+            return resolved_directions
 
-        if initial_direction_xy is not None:
-            return [
-                [float(initial_direction_xy[0]), float(initial_direction_xy[1])]
-                for _ in range(self.num_aps)
-            ]
-
-        return [[1.0, 0.0] for _ in range(self.num_aps)]
+        return [[0.0, 0.0, -1.0] for _ in range(self.num_aps)]
 
     def _configure_reflector_params(
         self,
@@ -741,12 +751,12 @@ class MemeticGradientDescentOptimizer(BaseAPOptimizer):
             [[float(grad_x[i]), float(grad_y[i])] for i in range(self.num_aps)]
         )
 
-        if self.tx_dir_xy.grad is not None:
-            dir_grad = self.tx_dir_xy.grad.detach().cpu().numpy()
+        if self.directions_raw.grad is not None:
+            dir_grad = self.directions_raw.grad.detach().cpu().numpy()
             self.history["direction_gradients"].append(dir_grad.tolist())
         else:
             self.history["direction_gradients"].append(
-                np.zeros((self.num_aps, 2)).tolist()
+                np.zeros((self.num_aps, 3)).tolist()
             )
 
         self.history["ap_distances"].append(self._pairwise_distances())
@@ -780,7 +790,7 @@ class MemeticGradientDescentOptimizer(BaseAPOptimizer):
 
     def _sanitize_gradients(self) -> None:
         """Zero out NaN gradients before the optimizer step."""
-        params: List[torch.Tensor] = [self.tx_x, self.tx_y, self.tx_dir_xy]
+        params: List[torch.Tensor] = [self.tx_x, self.tx_y, self.directions_raw]
         params.extend(self._reflector_parameter_list())
         for param in params:
             if param.grad is None:
