@@ -98,8 +98,8 @@ def setup_building_floor_scene(
     # 2. Transmitter array
     # ------------------------------------------------------------------
     scene.tx_array = PlanarArray(
-        num_rows=2,
-        num_cols=1,
+        num_rows=1,
+        num_cols=2,
         vertical_spacing=0.5,
         horizontal_spacing=0.5,
         pattern="iso",
