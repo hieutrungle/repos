@@ -122,7 +122,8 @@ def generate_spatial_weight_map(
     if current_weight_sum <= 0:
         raise ValueError("weight_map sum must be positive")
 
-    normalized_weight_map = weight_map * (num_cells / current_weight_sum)
+    normalized_weight_map = weight_map
+    # normalized_weight_map = weight_map * (num_cells / current_weight_sum)
     return normalized_weight_map
 
 
