@@ -19,7 +19,7 @@ import json
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, MutableMapping, Optional
+from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence
 
 import ray
 
@@ -74,6 +74,11 @@ _DEMAND_CONFIG_DEFAULTS: Dict[str, Any] = {
     "bounding_boxes": [],
     "box_weights": [],
     "apply_blur": False,
+}
+
+_CAMERA_CONFIG_DEFAULTS: Dict[str, Any] = {
+    "position": [20.0, 20.0, 70.0],
+    "look_at": [20.0, 20.1, 1.5],
 }
 
 _LEGACY_OBJECTIVE_KEY_MAP = {
@@ -173,6 +178,37 @@ def _resolve_demand_config(config_args: Mapping[str, Any]) -> Dict[str, Any]:
         demand_config["_position_bounds"] = dict(config_args["position_bounds"])
     demand_config["_report_weighted_stats"] = bool(explicit_weighted_stats)
     return demand_config
+
+
+def _coerce_xyz_triplet(raw_value: Any, field_name: str) -> List[float]:
+    """Validate and coerce an XYZ triplet from config."""
+    if (
+        not isinstance(raw_value, Sequence)
+        or isinstance(raw_value, (str, bytes))
+        or len(raw_value) != 3
+    ):
+        raise ValueError(f"'{field_name}' must be a length-3 numeric sequence")
+
+    try:
+        return [float(raw_value[0]), float(raw_value[1]), float(raw_value[2])]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"'{field_name}' must contain numeric values") from exc
+
+
+def _resolve_camera_config(config_args: Mapping[str, Any]) -> Dict[str, Any]:
+    """Resolve camera config used by final coverage-map rendering."""
+    camera = dict(_CAMERA_CONFIG_DEFAULTS)
+    raw_camera = config_args.get("camera")
+    if raw_camera is None:
+        return camera
+    if not isinstance(raw_camera, Mapping):
+        raise ValueError("'camera' must be a mapping when provided")
+
+    if "position" in raw_camera:
+        camera["position"] = _coerce_xyz_triplet(raw_camera.get("position"), "camera.position")
+    if "look_at" in raw_camera:
+        camera["look_at"] = _coerce_xyz_triplet(raw_camera.get("look_at"), "camera.look_at")
+    return camera
 
 
 def _deep_update(base: Dict[str, Any], updates: Mapping[str, Any]) -> Dict[str, Any]:
@@ -418,6 +454,8 @@ def run_memetic_optimization(config_args: Mapping[str, Any]) -> Dict[str, Any]:
         - ``k_seeds``: int number of spatial seeds to extract
         - ``d_corr``: float topological distance threshold
         - ``gd_optimization_params``: dict GD optimizer settings
+        - ``camera``: optional dict for final-plot rendering camera
+          with keys ``position`` and ``look_at`` (XYZ triplets)
         - ``output_dir``: str|Path base folder for run artifacts
         - ``run_name``: optional run label subfolder name
         - ``verbose``: bool
@@ -459,6 +497,7 @@ def run_memetic_optimization(config_args: Mapping[str, Any]) -> Dict[str, Any]:
     demand_config = _resolve_demand_config(config_args)
     ga_evaluation_params = _resolve_ga_evaluation_params(config_args, objective_params)
     gd_optimization_params = _resolve_gd_optimization_params(config_args, objective_params)
+    camera_config = _resolve_camera_config(config_args)
 
     output_base_dir = Path(str(config_args.get("output_dir", "results/experiments/")))
     run_name = config_args.get("run_name")
@@ -585,9 +624,12 @@ def run_memetic_optimization(config_args: Mapping[str, Any]) -> Dict[str, Any]:
             },
         }
 
+        artifacts_config_args = dict(config_args)
+        artifacts_config_args["camera"] = camera_config
+
         saved_artifacts = _save_memetic_artifacts(
             summary=summary,
-            config_args=config_args,
+            config_args=artifacts_config_args,
             output_dir=run_dir,
         )
 
@@ -645,6 +687,7 @@ def _default_memetic_config() -> Dict[str, Any]:
     """Default memetic pipeline config used when no --config is provided."""
     return {
         "scene_config": _default_scene_config(),
+        "camera": dict(_CAMERA_CONFIG_DEFAULTS),
         "output_dir": "results/experiments/",
         "position_bounds": {
             "x_min": 5.5,

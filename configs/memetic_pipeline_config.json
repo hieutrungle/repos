@@ -17,6 +17,10 @@
   "visualization_scene_config": {
     "scene_path": "/home/hieule/blender/models/building_floor/building_floor.xml"
   },
+  "camera": {
+    "position": [20.0, 20.0, 70.0],
+    "look_at": [20.0, 20.1, 1.5]
+  },
   "output_dir": "tmp_results1/tmp_experiments_2AP/",
   "position_bounds": {
     "x_min": 5.5,

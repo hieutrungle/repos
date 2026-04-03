@@ -1306,6 +1306,56 @@ def _resolve_render_scene_config(
     return render_scene_config
 
 
+def _coerce_xyz_triplet(
+    raw_value: Any,
+    default: Tuple[float, float, float],
+) -> Tuple[float, float, float]:
+    """Convert a raw value into an XYZ triplet, or return default."""
+    if (
+        not isinstance(raw_value, Sequence)
+        or isinstance(raw_value, (str, bytes))
+        or len(raw_value) < 3
+    ):
+        return default
+
+    try:
+        return (float(raw_value[0]), float(raw_value[1]), float(raw_value[2]))
+    except (TypeError, ValueError):
+        return default
+
+
+def _resolve_render_camera(
+    config_args: Mapping[str, Any],
+    render_settings: Mapping[str, Any],
+) -> Tuple[Tuple[float, float, float], Tuple[float, float, float]]:
+    """Resolve render camera position/look_at with optional config overrides."""
+    default_position = (20.0, 20.0, 55.0)
+    default_look_at = (20.0, 20.1, 1.5)
+
+    merged_camera: Dict[str, Any] = {}
+
+    raw_top_level_camera = config_args.get("camera")
+    if isinstance(raw_top_level_camera, Mapping):
+        merged_camera.update(dict(raw_top_level_camera))
+
+    raw_plot_camera = render_settings.get("camera")
+    if isinstance(raw_plot_camera, Mapping):
+        merged_camera.update(dict(raw_plot_camera))
+
+    if "camera_position" in config_args:
+        merged_camera["position"] = config_args.get("camera_position")
+    if "camera_look_at" in config_args:
+        merged_camera["look_at"] = config_args.get("camera_look_at")
+    if "camera_position" in render_settings:
+        merged_camera["position"] = render_settings.get("camera_position")
+    if "camera_look_at" in render_settings:
+        merged_camera["look_at"] = render_settings.get("camera_look_at")
+
+    position = _coerce_xyz_triplet(merged_camera.get("position"), default_position)
+    look_at = _coerce_xyz_triplet(merged_camera.get("look_at"), default_look_at)
+    return position, look_at
+
+
 def _apply_snapshot_to_scene(
     scene: Any,
     reflector_controller: Any,
@@ -1359,12 +1409,13 @@ def _render_coverage_snapshot(
     samples_per_tx: int,
     max_depth: int,
     resolution: Tuple[int, int],
+    camera_position: Tuple[float, float, float],
+    camera_look_at: Tuple[float, float, float],
 ) -> Optional[str]:
     """Render one coverage-map image using Sionna Scene.render_to_file."""
-    from sionna import rt as sionna_rt
     from sionna.rt import RadioMapSolver
 
-    from reflector_position.scene_setup import setup_building_floor_scene
+    from reflector_position.scene_setup import create_camera, setup_building_floor_scene
 
     loaded = setup_building_floor_scene(
         scene_path=str(scene_config["scene_path"]),
@@ -1396,10 +1447,7 @@ def _render_coverage_snapshot(
         diffraction=True,
     )
 
-    camera = sionna_rt.Camera(
-        position=[20, 20, 55],
-        look_at=[20, 20.1, 1.5],
-    )
+    camera = create_camera(position=camera_position, look_at=camera_look_at)
 
     save_path.parent.mkdir(parents=True, exist_ok=True)
     scene.render_to_file(
@@ -1430,6 +1478,11 @@ def save_memetic_coverage_maps(
     render_settings = config_args.get("coverage_plot_settings")
     if not isinstance(render_settings, Mapping):
         render_settings = {}
+
+    camera_position, camera_look_at = _resolve_render_camera(
+        config_args=config_args,
+        render_settings=render_settings,
+    )
 
     samples_per_tx = int(render_settings.get("samples_per_tx", 1_000_000))
     max_depth = int(render_settings.get("max_depth", 13))
@@ -1494,6 +1547,8 @@ def save_memetic_coverage_maps(
                     samples_per_tx=samples_per_tx,
                     max_depth=max_depth,
                     resolution=resolution,
+                    camera_position=camera_position,
+                    camera_look_at=camera_look_at,
                 )
                 if rendered is not None:
                     artifacts[key] = rendered
@@ -1523,6 +1578,8 @@ def save_memetic_coverage_maps(
                     samples_per_tx=samples_per_tx,
                     max_depth=max_depth,
                     resolution=resolution,
+                    camera_position=camera_position,
+                    camera_look_at=camera_look_at,
                 )
                 if rendered is not None:
                     rendered_generation_count += 1
@@ -1562,6 +1619,8 @@ def save_memetic_coverage_maps(
                             samples_per_tx=samples_per_tx,
                             max_depth=max_depth,
                             resolution=resolution,
+                            camera_position=camera_position,
+                            camera_look_at=camera_look_at,
                         )
                         if rendered is not None:
                             task_rendered += 1
@@ -1586,6 +1645,8 @@ def save_memetic_coverage_maps(
                             samples_per_tx=samples_per_tx,
                             max_depth=max_depth,
                             resolution=resolution,
+                            camera_position=camera_position,
+                            camera_look_at=camera_look_at,
                         )
                         if rendered is not None:
                             task_rendered += 1
