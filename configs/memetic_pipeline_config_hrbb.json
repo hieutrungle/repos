@@ -60,7 +60,7 @@
     "coverage_temperature": 1.0
   },
   "ga_params": {
-    "pop_size": 70,
+    "pop_size": 150,
     "n_gen": 20,
     "cxpb": 0.6,
     "mutpb": 0.4,
