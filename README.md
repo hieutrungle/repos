@@ -64,6 +64,53 @@ Run AP-count by seed sweeps:
 python scripts/run_num_aps_seed_sweep.py --help
 ```
 
+## Unified Experiments Runner (Memetic + Baselines)
+
+Use the unified runner to execute one method or compare multiple methods with
+shared config and memetic-style artifacts.
+
+Recommended config:
+
+- configs/run_experiments_cuda_hrbb.json
+
+Run one method:
+
+```bash
+python scripts/run_experiments.py \
+  --method random_gd \
+  --config configs/run_experiments_cuda_hrbb.json \
+  --output_dir results/experiments \
+  --run_name hrbb_random_gd
+```
+
+Run all baselines in one command:
+
+```bash
+python scripts/run_experiments.py \
+  --method all_baselines \
+  --config configs/run_experiments_cuda_hrbb.json \
+  --output_dir results/experiments \
+  --run_name hrbb_baselines
+```
+
+Run all methods (memetic + baselines):
+
+```bash
+python scripts/run_experiments.py \
+  --method all \
+  --config configs/run_experiments_cuda_hrbb.json \
+  --output_dir results/experiments \
+  --run_name hrbb_all
+```
+
+Important:
+
+- Baseline methods are forced to CUDA/GPU execution in scripts/run_experiments.py.
+- The runner keeps workers persistent for each method run and destroys them only
+  after that method finishes.
+- Per-method iteration traces are exported and plotted automatically.
+- Output layout mirrors memetic style with artifacts and plots folders.
+
 ## Pipeline Flow
 
 The memetic pipeline executes in three phases with shared Ray actors:
@@ -125,6 +172,15 @@ Key artifacts:
 - artifacts/ga_generation_details.csv (when GA generation details are present)
 - artifacts/gd_per_seed_analysis.csv (when per-seed GD analysis is present)
 - plots/* (trend plots, trajectory plots, coverage maps)
+
+Unified runner artifacts (scripts/run_experiments.py):
+
+- `RUN_DIR/artifacts/experiment_summary.json`
+- `RUN_DIR/artifacts/method_summary.csv`
+- `RUN_DIR/artifacts/METHOD_results.json`
+- `RUN_DIR/artifacts/METHOD_iteration_trace.csv`
+- `RUN_DIR/plots/METHOD_trend.html`
+- `RUN_DIR/plots/method_comparison_trend.html` (when running multiple methods)
 
 ## Python API
 
