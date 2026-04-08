@@ -18,7 +18,7 @@ from ray.util.actor_pool import ActorPool
 from sionna.rt import RadioMapSolver
 
 from reflector_position.optimizers.memetic.demand_weights import (
-    generate_spatial_weight_map,
+    generate_spatial_priority_map,
 )
 from reflector_position.optimizers.memetic.memetic_ga_evaluator import (
     StaticConfigurationEvaluator,
@@ -259,14 +259,17 @@ class RawOptimizationWorker:
         coverage_map = torch.from_numpy(np.array(radio_map.rss)).to(self.device)
         num_rows, num_cols = int(coverage_map.shape[-2]), int(coverage_map.shape[-1])
 
-        return generate_spatial_weight_map(
+        return generate_spatial_priority_map(
             num_rows=num_rows,
             num_cols=num_cols,
             demand_config=self.demand_config,
         )
 
-    def _has_explicit_weighted_reporting_config(self) -> bool:
-        """Return True when weighted reporting was explicitly requested."""
+    def _has_explicit_priority_reporting_config(self) -> bool:
+        """Return True when priority-area reporting was explicitly requested."""
+        if "_report_priority_stats" in self.demand_config:
+            return bool(self.demand_config.get("_report_priority_stats", False))
+
         if "_report_weighted_stats" in self.demand_config:
             return bool(self.demand_config.get("_report_weighted_stats", False))
 
@@ -279,6 +282,10 @@ class RawOptimizationWorker:
             and len(bounding_boxes) > 0
             and len(box_weights) > 0
         )
+
+    def _has_explicit_weighted_reporting_config(self) -> bool:
+        """Backward-compatible alias for priority reporting checks."""
+        return self._has_explicit_priority_reporting_config()
 
     def optimize(
         self,
@@ -333,7 +340,7 @@ class RawOptimizationWorker:
             loss_kwargs=loss_kwargs,
             spatial_weights=self.spatial_weights,
             radio_map_geometry=self.radio_map_geometry,
-            include_weighted_reporting=self._has_explicit_weighted_reporting_config(),
+            include_weighted_reporting=self._has_explicit_priority_reporting_config(),
         )
 
         start_time = time.time()
@@ -375,7 +382,7 @@ class RawOptimizationWorker:
             scene=self.scene,
             spatial_weights=self.spatial_weights,
             radio_map_geometry=self.radio_map_geometry,
-            include_weighted_reporting=self._has_explicit_weighted_reporting_config(),
+            include_weighted_reporting=self._has_explicit_priority_reporting_config(),
             **optimizer_kwargs_local,
         )
 

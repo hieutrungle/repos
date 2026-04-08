@@ -161,11 +161,11 @@ def _resolve_gd_optimization_params(
 def _resolve_demand_config(config_args: Mapping[str, Any]) -> Dict[str, Any]:
     """Resolve spatial demand-map configuration from the top-level config."""
     raw_demand = config_args.get("demand_config")
-    explicit_weighted_stats = False
+    explicit_priority_stats = False
     if isinstance(raw_demand, Mapping):
         raw_boxes = raw_demand.get("bounding_boxes")
         raw_weights = raw_demand.get("box_weights")
-        explicit_weighted_stats = (
+        explicit_priority_stats = (
             isinstance(raw_boxes, list)
             and isinstance(raw_weights, list)
             and len(raw_boxes) > 0
@@ -176,7 +176,9 @@ def _resolve_demand_config(config_args: Mapping[str, Any]) -> Dict[str, Any]:
     demand_config.update(_coerce_mapping(config_args, "demand_config"))
     if isinstance(config_args.get("position_bounds"), Mapping):
         demand_config["_position_bounds"] = dict(config_args["position_bounds"])
-    demand_config["_report_weighted_stats"] = bool(explicit_weighted_stats)
+    demand_config["_report_priority_stats"] = bool(explicit_priority_stats)
+    # Legacy compatibility for older workers/scripts.
+    demand_config["_report_weighted_stats"] = bool(explicit_priority_stats)
     return demand_config
 
 
@@ -302,7 +304,7 @@ def _write_json(path: Path, payload: Any) -> None:
         json.dump(_to_jsonable(payload), handle, indent=2, ensure_ascii=False)
 
 
-def _write_csv(path: Path, rows: List[Mapping[str, Any]], fieldnames: List[str]) -> None:
+def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]], fieldnames: Sequence[str]) -> None:
     """Write rows to CSV; missing columns are emitted as empty fields."""
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -323,7 +325,7 @@ def _flatten_row(row: Mapping[str, Any], prefix: str = "") -> Dict[str, Any]:
     return flattened
 
 
-def _collect_fieldnames(rows: List[Mapping[str, Any]]) -> List[str]:
+def _collect_fieldnames(rows: Sequence[Mapping[str, Any]]) -> List[str]:
     """Collect stable CSV fieldnames from a sequence of flattened rows."""
     fieldnames: List[str] = []
     seen = set()
@@ -333,6 +335,112 @@ def _collect_fieldnames(rows: List[Mapping[str, Any]]) -> List[str]:
                 seen.add(key)
                 fieldnames.append(str(key))
     return fieldnames
+
+
+def _build_ga_generation_metric_rows(generation_rows: Sequence[Any]) -> List[Dict[str, Any]]:
+    """Build per-generation GA rows including best-individual physical metrics."""
+    output_rows: List[Dict[str, Any]] = []
+    for fallback_gen, raw_row in enumerate(generation_rows):
+        if not isinstance(raw_row, Mapping):
+            continue
+
+        best_primary_fitness = raw_row.get("best_primary_fitness")
+        best_primary_loss: Optional[float] = None
+        if best_primary_fitness is not None:
+            try:
+                best_primary_loss = -float(best_primary_fitness)
+            except (TypeError, ValueError):
+                best_primary_loss = None
+
+        second_primary_fitness = raw_row.get("second_primary_fitness")
+        second_primary_loss: Optional[float] = None
+        if second_primary_fitness is not None:
+            try:
+                second_primary_loss = -float(second_primary_fitness)
+            except (TypeError, ValueError):
+                second_primary_loss = None
+
+        row: Dict[str, Any] = {
+            "gen": raw_row.get("gen", fallback_gen),
+            "nevals": raw_row.get("nevals"),
+            "best_primary_fitness": best_primary_fitness,
+            "best_primary_loss": best_primary_loss,
+            "second_primary_fitness": second_primary_fitness,
+            "second_primary_loss": second_primary_loss,
+            "mean_primary_fitness": raw_row.get("mean_primary_fitness"),
+            "std": raw_row.get("std"),
+            "feasible_count": raw_row.get("feasible_count"),
+            "penalized_count": raw_row.get("penalized_count"),
+            "mean_population_fitness": raw_row.get("mean_population_fitness"),
+            "time": raw_row.get("time"),
+        }
+
+        top_individuals = raw_row.get("top_individuals")
+        if isinstance(top_individuals, Sequence):
+            for fallback_rank, ranked in enumerate(top_individuals, start=1):
+                if not isinstance(ranked, Mapping):
+                    continue
+
+                raw_rank = ranked.get("rank", fallback_rank)
+                try:
+                    rank = int(raw_rank)
+                except (TypeError, ValueError):
+                    rank = fallback_rank
+                if rank <= 0:
+                    continue
+
+                rank_prefix = f"rank_{rank}_"
+
+                rank_primary_fitness = ranked.get("primary_fitness")
+                row[f"{rank_prefix}primary_fitness"] = rank_primary_fitness
+                if rank_primary_fitness is not None:
+                    try:
+                        row[f"{rank_prefix}primary_loss"] = -float(rank_primary_fitness)
+                    except (TypeError, ValueError):
+                        row[f"{rank_prefix}primary_loss"] = None
+
+                rank_metrics = ranked.get("physical_metrics")
+                if isinstance(rank_metrics, Mapping):
+                    for metric_name, metric_value in rank_metrics.items():
+                        if metric_value is None:
+                            continue
+                        try:
+                            row[f"{rank_prefix}{metric_name}"] = float(metric_value)
+                        except (TypeError, ValueError):
+                            continue
+
+                if rank == 2:
+                    if row.get("second_primary_fitness") is None:
+                        row["second_primary_fitness"] = row.get(f"{rank_prefix}primary_fitness")
+                    if row.get("second_primary_loss") is None:
+                        row["second_primary_loss"] = row.get(f"{rank_prefix}primary_loss")
+
+        best_physical_metrics = raw_row.get("best_physical_metrics")
+        if isinstance(best_physical_metrics, Mapping):
+            for metric_name, metric_value in best_physical_metrics.items():
+                if metric_value is None:
+                    continue
+                try:
+                    row[str(metric_name)] = float(metric_value)
+                except (TypeError, ValueError):
+                    continue
+
+        for metric_name in (
+            "mean_rss_dbm",
+            "min_rss_dbm",
+            "p5_rss_dbm",
+            "coverage_pct",
+            "priority_mean_rss_dbm",
+            "priority_min_rss_dbm",
+            "priority_p5_rss_dbm",
+            "priority_coverage_pct",
+        ):
+            if row.get(metric_name) is None and row.get(f"rank_1_{metric_name}") is not None:
+                row[metric_name] = row[f"rank_1_{metric_name}"]
+
+        output_rows.append(row)
+
+    return output_rows
 
 
 def _save_memetic_artifacts(
@@ -366,15 +474,10 @@ def _save_memetic_artifacts(
 
     generation_rows = ga_results.get("generation_details", [])
     if isinstance(generation_rows, list) and generation_rows:
-        fieldnames = [
-            "gen",
-            "nevals",
-            "best_primary_fitness",
-            "mean_primary_fitness",
-            "std",
-            "time",
-        ]
-        _write_csv(artifacts_dir / "ga_generation_details.csv", generation_rows, fieldnames)
+        ga_generation_metric_rows = _build_ga_generation_metric_rows(generation_rows)
+        if ga_generation_metric_rows:
+            fieldnames = _collect_fieldnames(ga_generation_metric_rows)
+            _write_csv(artifacts_dir / "ga_generation_details.csv", ga_generation_metric_rows, fieldnames)
 
     seed_rows = gd_results.get("per_seed_analysis", [])
     if isinstance(seed_rows, list) and seed_rows:
@@ -582,8 +685,29 @@ def run_memetic_optimization(config_args: Mapping[str, Any]) -> Dict[str, Any]:
                     )
 
         # Attach scene + baseline metric metadata for Phase-3 analysis.
-        for seed, task in zip(seeds, gd_tasks):
+        for seed_index, (seed, task) in enumerate(zip(seeds, gd_tasks)):
             task["scene_config"] = scene_config
+            if isinstance(seed, Mapping):
+                task["ga_seed_index"] = seed_index
+
+                raw_rank = seed.get("rank", seed_index + 1)
+                try:
+                    task["ga_seed_rank"] = int(raw_rank)
+                except (TypeError, ValueError):
+                    task["ga_seed_rank"] = seed_index + 1
+
+                raw_primary_fitness = seed.get("primary_fitness")
+                if raw_primary_fitness is not None:
+                    try:
+                        primary_fitness = float(raw_primary_fitness)
+                        task["ga_seed_primary_fitness"] = primary_fitness
+                        task["ga_seed_primary_loss"] = -primary_fitness
+                    except (TypeError, ValueError):
+                        pass
+
+                raw_seed_metrics = seed.get("physical_metrics")
+                if isinstance(raw_seed_metrics, Mapping):
+                    task["ga_seed_physical_metrics"] = dict(raw_seed_metrics)
 
         # -----------------------------------------------------------------
         # Step 4: Phase 3 - Targeted GD micro-exploitation

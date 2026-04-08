@@ -360,6 +360,87 @@ class MemeticGeneticAlgorithmRunner:
             "best_physical_metrics": dict(getattr(individual, "physical_metrics", {})),
         }
 
+    def _build_ranked_generation_payload(
+        self,
+        individual: Sequence[float],
+        rank: int,
+    ) -> Dict[str, Any]:
+        """Build one rank-aware generation payload for reporting and plotting."""
+        primary_fitness = float(individual.fitness.values[0])
+        return {
+            "rank": int(rank),
+            "primary_fitness": primary_fitness,
+            "primary_loss": float(-primary_fitness),
+            "chromosome": [float(gene) for gene in individual],
+            "ap_positions": self._extract_positions(individual),
+            "ap_directions": self._extract_directions(individual),
+            "reflector": self._extract_reflector(individual),
+            "loss_components": dict(getattr(individual, "loss_components", {})),
+            "physical_metrics": dict(getattr(individual, "physical_metrics", {})),
+        }
+
+    def _build_generation_detail_row(
+        self,
+        gen: int,
+        nevals: int,
+        record: Mapping[str, Any],
+        population: Sequence[Any],
+        top_k: int,
+        gen_time: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Build one generation-detail row with rank-aware top-individual payloads."""
+        effective_top_k = max(1, min(int(top_k), len(population)))
+        ranked_individuals = tools.selBest(population, effective_top_k)
+        ranked_payloads = [
+            self._build_ranked_generation_payload(individual, rank=index + 1)
+            for index, individual in enumerate(ranked_individuals)
+        ]
+
+        row: Dict[str, Any] = {
+            "gen": int(gen),
+            "nevals": int(nevals),
+            "best_primary_fitness": float(record["max"]),
+            "mean_primary_fitness": float(record["mean"]),
+            "std": float(record["std"]),
+            "feasible_count": int(record["feasible_count"]),
+            "penalized_count": int(record["penalized_count"]),
+            "mean_population_fitness": float(record["mean_population"]),
+            "top_individuals": ranked_payloads,
+            "generation_top_k": len(ranked_payloads),
+        }
+        if gen_time is not None:
+            row["time"] = float(gen_time)
+
+        if ranked_payloads:
+            best_payload = ranked_payloads[0]
+            row.update(
+                {
+                    "best_chromosome": list(best_payload["chromosome"]),
+                    "best_ap_positions": list(best_payload["ap_positions"]),
+                    "best_ap_directions": best_payload["ap_directions"],
+                    "best_reflector": best_payload["reflector"],
+                    "best_loss_components": dict(best_payload["loss_components"]),
+                    "best_physical_metrics": dict(best_payload["physical_metrics"]),
+                }
+            )
+
+        if len(ranked_payloads) > 1:
+            second_payload = ranked_payloads[1]
+            row.update(
+                {
+                    "second_primary_fitness": second_payload["primary_fitness"],
+                    "second_primary_loss": second_payload["primary_loss"],
+                    "second_chromosome": list(second_payload["chromosome"]),
+                    "second_ap_positions": list(second_payload["ap_positions"]),
+                    "second_ap_directions": second_payload["ap_directions"],
+                    "second_reflector": second_payload["reflector"],
+                    "second_loss_components": dict(second_payload["loss_components"]),
+                    "second_physical_metrics": dict(second_payload["physical_metrics"]),
+                }
+            )
+
+        return row
+
     # ------------------------------------------------------------------
     # Topological distance filtering
     # ------------------------------------------------------------------
@@ -647,6 +728,7 @@ class MemeticGeneticAlgorithmRunner:
 
         eff_k_seeds = int(self.default_k_seeds if k_seeds is None else k_seeds)
         eff_d_corr = float(self.default_d_corr if d_corr is None else d_corr)
+        top_k_for_reporting = max(1, eff_k_seeds)
 
         self._opt_params = optimization_params or {
             "samples_per_tx": 1_000_000,
@@ -764,25 +846,25 @@ class MemeticGeneticAlgorithmRunner:
 
         record = _compile_generation_stats(population)
         logbook.record(gen=0, nevals=nevals, **record)
-        best_individual = tools.selBest(population, 1)[0]
-        generation_details.append(
-            {
-                "gen": 0,
-                "nevals": nevals,
-                "best_primary_fitness": float(record["max"]),
-                "mean_primary_fitness": float(record["mean"]),
-                "std": float(record["std"]),
-                "feasible_count": int(record["feasible_count"]),
-                "penalized_count": int(record["penalized_count"]),
-                "mean_population_fitness": float(record["mean_population"]),
-                **self._build_generation_best_payload(best_individual),
-            }
+        initial_row = self._build_generation_detail_row(
+            gen=0,
+            nevals=nevals,
+            record=record,
+            population=population,
+            top_k=top_k_for_reporting,
         )
+        generation_details.append(initial_row)
 
         if verbose:
+            second_fitness = initial_row.get("second_primary_fitness")
+            second_txt = (
+                f" | second={float(second_fitness):.6f}"
+                if second_fitness is not None
+                else ""
+            )
             print(
                 f"  Gen  0 | evals={nevals:>3d} | best={record['max']:.6f} | "
-                f"mean={record['mean']:.6f} | penalized={record['penalized_count']}"
+                f"mean={record['mean']:.6f}{second_txt} | penalized={record['penalized_count']}"
             )
 
         for gen in range(1, n_gen + 1):
@@ -812,28 +894,28 @@ class MemeticGeneticAlgorithmRunner:
 
             record = _compile_generation_stats(population)
             logbook.record(gen=gen, nevals=nevals, **record)
-            best_individual = tools.selBest(population, 1)[0]
 
             gen_time = time.time() - gen_start
-            generation_details.append(
-                {
-                    "gen": gen,
-                    "nevals": nevals,
-                    "best_primary_fitness": float(record["max"]),
-                    "mean_primary_fitness": float(record["mean"]),
-                    "std": float(record["std"]),
-                    "feasible_count": int(record["feasible_count"]),
-                    "penalized_count": int(record["penalized_count"]),
-                    "mean_population_fitness": float(record["mean_population"]),
-                    "time": gen_time,
-                    **self._build_generation_best_payload(best_individual),
-                }
+            generation_row = self._build_generation_detail_row(
+                gen=gen,
+                nevals=nevals,
+                record=record,
+                population=population,
+                top_k=top_k_for_reporting,
+                gen_time=gen_time,
             )
+            generation_details.append(generation_row)
 
             if verbose:
+                second_fitness = generation_row.get("second_primary_fitness")
+                second_txt = (
+                    f" | second={float(second_fitness):.6f}"
+                    if second_fitness is not None
+                    else ""
+                )
                 print(
                     f"  Gen {gen:>2d} | evals={nevals:>3d} | best={record['max']:.6f} | "
-                    f"mean={record['mean']:.6f} | penalized={record['penalized_count']} | "
+                    f"mean={record['mean']:.6f}{second_txt} | penalized={record['penalized_count']} | "
                     f"time={gen_time:.1f}s"
                 )
 
@@ -874,6 +956,7 @@ class MemeticGeneticAlgorithmRunner:
             "best_physical_metrics": dict(getattr(best, "physical_metrics", {})),
             "seeds": [asdict(seed) for seed in selected_seeds],
             "num_selected_seeds": len(selected_seeds),
+            "generation_top_k": int(top_k_for_reporting),
             "seed_extraction": {
                 "k_requested": eff_k_seeds,
                 "d_corr": eff_d_corr,
@@ -903,6 +986,10 @@ class MemeticGeneticAlgorithmRunner:
                 "d_corr": eff_d_corr,
             },
         }
+        if generation_details:
+            results["final_generation_top_individuals"] = list(
+                generation_details[-1].get("top_individuals", [])
+            )
 
         if verbose:
             print("-" * 80)

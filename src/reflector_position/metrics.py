@@ -88,25 +88,25 @@ def compute_thresholded_reporting_metrics(
     When no cells exceed the numerical floor, the dBm statistics fall back to
     the numerical floor in dBm and coverage is ``0``.
 
-    Region-reporting semantics (when ``include_weighted=True``):
+    Priority-reporting semantics (when ``include_weighted=True``):
 
         - Only cells with explicit positive spatial weights are considered part of
-            the region of interest.
-        - ``region_min_rss_dbm``, ``region_p5_rss_dbm``, and
-            ``region_mean_rss_dbm`` are plain (unweighted) statistics over the
-            numerically valid cells within that region.
-        - Cells outside the explicit weighted region are ignored.
+            the priority area of interest.
+        - ``priority_min_rss_dbm``, ``priority_p5_rss_dbm``, and
+            ``priority_mean_rss_dbm`` are plain (unweighted) statistics over the
+            numerically valid cells within that priority area.
+        - Cells outside the explicit priority area are ignored.
     """
     flat_map = _flatten_rss_map(rss_map)
     floor_dbm = _power_floor_dbm()
 
-    region_defaults = {
-        "region_min_rss_dbm": float("nan"),
-        "region_p5_rss_dbm": float("nan"),
-        "region_mean_rss_dbm": float("nan"),
-        "region_coverage_pct": float("nan"),
-        "region_valid_cell_count": float("nan"),
-        "region_total_cell_count": float("nan"),
+    priority_defaults = {
+        "priority_min_rss_dbm": float("nan"),
+        "priority_p5_rss_dbm": float("nan"),
+        "priority_mean_rss_dbm": float("nan"),
+        "priority_coverage_pct": float("nan"),
+        "priority_valid_cell_count": float("nan"),
+        "priority_total_cell_count": float("nan"),
     }
 
     total_cells = int(flat_map.numel())
@@ -118,7 +118,7 @@ def compute_thresholded_reporting_metrics(
             "coverage_pct": 0.0,
             "valid_cell_count": 0.0,
             "total_cell_count": 0.0,
-            **region_defaults,
+            **priority_defaults,
         }
 
     epsilon_floor = torch.tensor(
@@ -156,70 +156,70 @@ def compute_thresholded_reporting_metrics(
     }
 
     if not include_weighted:
-        metrics.update(region_defaults)
+        metrics.update(priority_defaults)
         return metrics
 
     if spatial_weights is None:
-        metrics.update(region_defaults)
+        metrics.update(priority_defaults)
         return metrics
 
     flat_weights = _flatten_rss_map(spatial_weights).to(dtype=flat_map.dtype, device=flat_map.device)
     if int(flat_weights.numel()) != total_cells:
-        metrics.update(region_defaults)
+        metrics.update(priority_defaults)
         return metrics
 
     non_negative_weights = torch.clamp(flat_weights, min=0.0)
     if torch.any(non_negative_weights == 0.0):
-        # Explicit zero-valued cells define the reporting region directly.
-        weighted_region_mask = non_negative_weights > 0.0
+        # Explicit zero-valued cells define the priority area directly.
+        priority_mask = non_negative_weights > 0.0
     else:
         # Demand maps used by GA/GD can be strictly positive everywhere
         # (baseline=1 plus emphasized boxes). In that case, selecting
-        # weights > 0 would collapse region stats to whole-map stats.
-        # Use cells above the positive-weight median as the emphasized region.
+        # weights > 0 would collapse priority stats to whole-map stats.
+        # Use cells above the positive-weight median as the emphasized area.
         positive_weights = non_negative_weights[non_negative_weights > 0.0]
         baseline = torch.median(positive_weights)
         eps = torch.finfo(non_negative_weights.dtype).eps * 16.0
-        emphasized_region_mask = non_negative_weights > (baseline + eps)
-        weighted_region_mask = (
-            emphasized_region_mask
-            if bool(torch.any(emphasized_region_mask).item())
+        emphasized_priority_mask = non_negative_weights > (baseline + eps)
+        priority_mask = (
+            emphasized_priority_mask
+            if bool(torch.any(emphasized_priority_mask).item())
             else (non_negative_weights > 0.0)
         )
-    weighted_total_count = int(weighted_region_mask.sum().item())
-    if weighted_total_count <= 0:
-        metrics.update(region_defaults)
+    priority_total_count = int(priority_mask.sum().item())
+    if priority_total_count <= 0:
+        metrics.update(priority_defaults)
         return metrics
 
-    region_active_cells = active_cells & weighted_region_mask
-    weighted_valid_rss = flat_map[region_active_cells]
-    weighted_valid_count = int(weighted_valid_rss.numel())
+    priority_active_cells = active_cells & priority_mask
+    priority_valid_rss = flat_map[priority_active_cells]
+    priority_valid_count = int(priority_valid_rss.numel())
 
-    if weighted_valid_count == 0:
-        region_stats = {
-            "region_min_rss_dbm": floor_dbm,
-            "region_p5_rss_dbm": floor_dbm,
-            "region_mean_rss_dbm": floor_dbm,
-            "region_coverage_pct": 0.0,
-            "region_valid_cell_count": 0.0,
-            "region_total_cell_count": float(weighted_total_count),
+    if priority_valid_count == 0:
+        priority_stats = {
+            "priority_min_rss_dbm": floor_dbm,
+            "priority_p5_rss_dbm": floor_dbm,
+            "priority_mean_rss_dbm": floor_dbm,
+            "priority_coverage_pct": 0.0,
+            "priority_valid_cell_count": 0.0,
+            "priority_total_cell_count": float(priority_total_count),
         }
     else:
-        weighted_valid_dbm = rss_to_dbm(weighted_valid_rss)
+        priority_valid_dbm = rss_to_dbm(priority_valid_rss)
         clamped_percentile = min(max(float(percentile), 0.0), 1.0)
 
-        region_stats = {
-            "region_min_rss_dbm": float(weighted_valid_dbm.min().item()),
-            "region_p5_rss_dbm": float(
-                torch.quantile(weighted_valid_dbm.float(), clamped_percentile).item()
+        priority_stats = {
+            "priority_min_rss_dbm": float(priority_valid_dbm.min().item()),
+            "priority_p5_rss_dbm": float(
+                torch.quantile(priority_valid_dbm.float(), clamped_percentile).item()
             ),
-            "region_mean_rss_dbm": float(weighted_valid_dbm.mean().item()),
-            "region_coverage_pct": float(100.0 * weighted_valid_count / weighted_total_count),
-            "region_valid_cell_count": float(weighted_valid_count),
-            "region_total_cell_count": float(weighted_total_count),
+            "priority_mean_rss_dbm": float(priority_valid_dbm.mean().item()),
+            "priority_coverage_pct": float(100.0 * priority_valid_count / priority_total_count),
+            "priority_valid_cell_count": float(priority_valid_count),
+            "priority_total_cell_count": float(priority_total_count),
         }
 
-    metrics.update(region_stats)
+    metrics.update(priority_stats)
     return metrics
 
 

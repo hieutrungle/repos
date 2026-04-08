@@ -99,6 +99,21 @@ def _append_mapping_section(
         report_lines.append(f"- {key}: {_fmt_value(value, precision=precision)}")
 
 
+def _coerce_optional_float(value: Any) -> Optional[float]:
+    """Coerce value to float when possible, else return None."""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_metric(metrics: Mapping[str, Any], metric_key: str) -> Optional[float]:
+    """Read one metric with float coercion."""
+    return _coerce_optional_float(metrics.get(metric_key))
+
+
 def build_memetic_summary_report(summary: Mapping[str, Any]) -> str:
     """Build a Markdown summary report for one memetic run."""
     ga_results = summary.get("ga_results", {})
@@ -137,6 +152,123 @@ def build_memetic_summary_report(summary: Mapping[str, Any]) -> str:
 
     _append_mapping_section(report_lines, "## GA Best Loss Components", ga_results.get("best_loss_components", {}))
     _append_mapping_section(report_lines, "## GA Best Physical Metrics", ga_results.get("best_physical_metrics", {}))
+
+    generation_details = ga_results.get("generation_details")
+    final_generation_top_individuals: List[Dict[str, Any]] = []
+    if isinstance(generation_details, Sequence) and generation_details:
+        last_generation = generation_details[-1]
+        if isinstance(last_generation, Mapping):
+            top_individuals = last_generation.get("top_individuals")
+            if isinstance(top_individuals, Sequence):
+                for fallback_rank, ranked in enumerate(top_individuals, start=1):
+                    if not isinstance(ranked, Mapping):
+                        continue
+                    payload = dict(ranked)
+                    if "rank" not in payload:
+                        payload["rank"] = fallback_rank
+                    final_generation_top_individuals.append(payload)
+
+            if not final_generation_top_individuals:
+                best_payload = {
+                    "rank": 1,
+                    "primary_fitness": last_generation.get("best_primary_fitness"),
+                    "physical_metrics": last_generation.get(
+                        "best_physical_metrics",
+                        ga_results.get("best_physical_metrics", {}),
+                    ),
+                }
+                if best_payload["primary_fitness"] is not None or isinstance(
+                    best_payload.get("physical_metrics"),
+                    Mapping,
+                ):
+                    final_generation_top_individuals.append(best_payload)
+
+                second_payload = {
+                    "rank": 2,
+                    "primary_fitness": last_generation.get("second_primary_fitness"),
+                    "physical_metrics": last_generation.get("second_physical_metrics", {}),
+                }
+                if second_payload["primary_fitness"] is not None or isinstance(
+                    second_payload.get("physical_metrics"),
+                    Mapping,
+                ):
+                    final_generation_top_individuals.append(second_payload)
+
+    if final_generation_top_individuals:
+        report_lines.extend(["", "## GA Final Generation Top Individuals"])
+        for ranked in final_generation_top_individuals:
+            raw_rank = ranked.get("rank", "?")
+            try:
+                rank = int(raw_rank)
+            except (TypeError, ValueError):
+                rank = raw_rank
+
+            primary_fitness = _coerce_optional_float(ranked.get("primary_fitness"))
+            primary_loss = (
+                -float(primary_fitness)
+                if primary_fitness is not None
+                else None
+            )
+            metrics = ranked.get("physical_metrics")
+            metrics_mapping = metrics if isinstance(metrics, Mapping) else {}
+
+            mean_rssi = _coerce_metric(metrics_mapping, "mean_rss_dbm")
+            priority_mean_rssi = _coerce_metric(metrics_mapping, "priority_mean_rss_dbm")
+            p5_rssi = _coerce_metric(metrics_mapping, "p5_rss_dbm")
+            priority_p5_rssi = _coerce_metric(metrics_mapping, "priority_p5_rss_dbm")
+
+            report_lines.append(
+                "- Rank #{rank}: fitness={fitness}, loss={loss}, "
+                "mean_rssi={mean_rssi}, priority_mean_rssi={priority_mean_rssi}, "
+                "p5_rssi={p5_rssi}, priority_p5_rssi={priority_p5_rssi}".format(
+                    rank=rank,
+                    fitness=_fmt_value(primary_fitness, precision=6),
+                    loss=_fmt_value(primary_loss, precision=6),
+                    mean_rssi=_fmt_value(mean_rssi, precision=3),
+                    priority_mean_rssi=_fmt_value(priority_mean_rssi, precision=3),
+                    p5_rssi=_fmt_value(p5_rssi, precision=3),
+                    priority_p5_rssi=_fmt_value(priority_p5_rssi, precision=3),
+                )
+            )
+
+    selected_seeds = ga_results.get("seeds")
+    if isinstance(selected_seeds, Sequence) and selected_seeds:
+        report_lines.extend(["", "## GA Seeds Used For GD"])
+        for fallback_seed_index, seed in enumerate(selected_seeds, start=1):
+            if not isinstance(seed, Mapping):
+                continue
+
+            raw_rank = seed.get("rank", fallback_seed_index)
+            try:
+                seed_rank = int(raw_rank)
+            except (TypeError, ValueError):
+                seed_rank = fallback_seed_index
+
+            primary_fitness = _coerce_optional_float(seed.get("primary_fitness"))
+            primary_loss = (
+                -float(primary_fitness)
+                if primary_fitness is not None
+                else None
+            )
+            min_distance = _coerce_optional_float(seed.get("min_distance_to_previous"))
+
+            metrics = seed.get("physical_metrics")
+            metrics_mapping = metrics if isinstance(metrics, Mapping) else {}
+            mean_rssi = _coerce_metric(metrics_mapping, "mean_rss_dbm")
+            priority_mean_rssi = _coerce_metric(metrics_mapping, "priority_mean_rss_dbm")
+
+            report_lines.append(
+                "- Seed rank #{rank}: fitness={fitness}, loss={loss}, "
+                "mean_rssi={mean_rssi}, priority_mean_rssi={priority_mean_rssi}, "
+                "min_distance_to_previous={min_distance}".format(
+                    rank=seed_rank,
+                    fitness=_fmt_value(primary_fitness, precision=6),
+                    loss=_fmt_value(primary_loss, precision=6),
+                    mean_rssi=_fmt_value(mean_rssi, precision=3),
+                    priority_mean_rssi=_fmt_value(priority_mean_rssi, precision=3),
+                    min_distance=_fmt_value(min_distance, precision=3),
+                )
+            )
 
     if isinstance(global_best, Mapping):
         best_components = _extract_best_loss_components(global_best)

@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import matplotlib
 import numpy as np
+from matplotlib.ticker import MaxNLocator
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -20,6 +21,42 @@ import matplotlib.pyplot as plt
 _AP_COLORS = ["#1f77b4", "#d62728", "#2ca02c", "#ff7f0e", "#9467bd", "#8c564b"]
 _AP_MARKERS = ["o", "s", "^", "D", "v", "P"]
 _PHYSICAL_METRIC_PRIORITY = ("coverage_pct", "p5_rss_dbm", "min_rss_dbm", "mean_rss_dbm")
+_RSSI_Y_AXIS_ROUND_STEP = 5.0
+_DEFAULT_MEAN_P5_COMBINED_Y_RANGE = (-80.0, -40.0)
+_GA_BEST_METRIC_PLOT_SPECS = (
+    (
+        "mean_rss_dbm",
+        "priority_mean_rss_dbm",
+        "Mean RSSI (dBm)",
+        "ga_best_mean_rssi_trend_plot",
+        "ga_best_mean_rssi_trend.png",
+        "ga_gd_stitched_mean_rssi_plot",
+        "ga_gd_stitched_mean_rssi.png",
+    ),
+    (
+        "p5_rss_dbm",
+        "priority_p5_rss_dbm",
+        "P5 RSSI (dBm)",
+        "ga_best_p5_rssi_trend_plot",
+        "ga_best_p5_rssi_trend.png",
+        "ga_gd_stitched_p5_rssi_plot",
+        "ga_gd_stitched_p5_rssi.png",
+    ),
+    (
+        "min_rss_dbm",
+        "priority_min_rss_dbm",
+        "Min RSSI (dBm)",
+        "ga_best_min_rssi_trend_plot",
+        "ga_best_min_rssi_trend.png",
+        "ga_gd_stitched_min_rssi_plot",
+        "ga_gd_stitched_min_rssi.png",
+    ),
+)
+
+
+def _set_integer_x_ticks(ax: Any) -> None:
+    """Force integer-only major ticks for generation/iteration axes."""
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
 
 
 def _extract_history(result: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -76,34 +113,25 @@ def _extract_physical_metric_series(result: Mapping[str, Any], metric_name: str)
     return []
 
 
-def _extract_region_metric_series(result: Mapping[str, Any], metric_name: str) -> List[float]:
-    """Return one region-report metric series with weighted-key fallback."""
+def _extract_priority_metric_series(result: Mapping[str, Any], metric_name: str) -> List[float]:
+    """Return one priority-report metric series when available."""
     history = _extract_history(result)
     physical_metrics = history.get("physical_metrics")
     if not isinstance(physical_metrics, Sequence):
         return []
-
-    legacy_key_map = {
-        "region_mean_rss_dbm": "weighted_mean_rss_dbm",
-        "region_min_rss_dbm": "weighted_min_rss_dbm",
-        "region_p5_rss_dbm": "weighted_p5_rss_dbm",
-    }
-    legacy_key = legacy_key_map.get(metric_name)
 
     series: List[float] = []
     for item in physical_metrics:
         if not isinstance(item, Mapping):
             continue
         value = item.get(metric_name)
-        if value is None and legacy_key is not None:
-            value = item.get(legacy_key)
         if value is not None:
             series.append(float(value))
     return series
 
 
-def _extract_spatial_weights_map(result: Mapping[str, Any]) -> Optional[np.ndarray]:
-    """Return the spatial-weight map (2-D) when present in result payload."""
+def _extract_spatial_priority_map(result: Mapping[str, Any]) -> Optional[np.ndarray]:
+    """Return the spatial-priority map (2-D) when present in result payload."""
     raw = result.get("spatial_weights")
     if raw is None:
         raw = _extract_results_payload(result).get("spatial_weights")
@@ -317,30 +345,915 @@ def _fmt_pos(position: Any) -> str:
 
 
 def save_ga_training_curve(ga_results: Mapping[str, Any], save_path: Path) -> Optional[str]:
-    """Save GA best/mean primary-fitness curve."""
+    """Save GA primary-fitness curve with optional second-rank history."""
     details = ga_results.get("generation_details", [])
     if not isinstance(details, list) or len(details) == 0:
         return None
 
-    generations = [int(row.get("gen", idx)) for idx, row in enumerate(details)]
-    best_values = [float(row.get("best_primary_fitness")) for row in details if row.get("best_primary_fitness") is not None]
-    mean_values = [float(row.get("mean_primary_fitness")) for row in details if row.get("mean_primary_fitness") is not None]
-    if len(generations) != len(best_values) or len(generations) != len(mean_values):
+    generations: List[int] = []
+    best_values: List[float] = []
+    second_values: List[float] = []
+    mean_values: List[float] = []
+
+    for fallback_gen, row in enumerate(details):
+        if not isinstance(row, Mapping):
+            continue
+
+        raw_gen = row.get("gen", fallback_gen)
+        try:
+            generation_index = int(raw_gen)
+        except (TypeError, ValueError):
+            generation_index = fallback_gen
+        generations.append(generation_index)
+
+        best_values.append(_coerce_optional_float(row.get("best_primary_fitness")))
+        mean_values.append(_coerce_optional_float(row.get("mean_primary_fitness")))
+
+        second_fitness = row.get("second_primary_fitness")
+        top_individuals = row.get("top_individuals")
+        if (
+            second_fitness is None
+            and isinstance(top_individuals, Sequence)
+            and len(top_individuals) > 1
+            and isinstance(top_individuals[1], Mapping)
+        ):
+            second_fitness = top_individuals[1].get("primary_fitness")
+        second_values.append(_coerce_optional_float(second_fitness))
+
+    if not generations:
+        return None
+
+    best_array = np.asarray(best_values, dtype=np.float64)
+    mean_array = np.asarray(mean_values, dtype=np.float64)
+    second_array = np.asarray(second_values, dtype=np.float64)
+    has_best = bool(np.any(np.isfinite(best_array)))
+    has_mean = bool(np.any(np.isfinite(mean_array)))
+    has_second = bool(np.any(np.isfinite(second_array)))
+    if not any((has_best, has_mean, has_second)):
         return None
 
     fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(generations, best_values, marker="o", linewidth=2.0, label="GA Best")
-    ax.plot(generations, mean_values, marker="s", linewidth=1.6, label="GA Mean")
+    if has_best:
+        ax.plot(generations, best_values, marker="o", linewidth=2.0, label="GA Best")
+    if has_second:
+        ax.plot(generations, second_values, marker="^", linewidth=1.8, label="GA 2nd Best")
+    if has_mean:
+        ax.plot(generations, mean_values, marker="s", linewidth=1.6, label="GA Mean")
+
     ax.set_xlabel("Generation")
     ax.set_ylabel("Primary Fitness")
     ax.set_title("Memetic Phase-1 Training Curve")
+    _set_integer_x_ticks(ax)
     ax.grid(True, alpha=0.3)
-    ax.legend()
+    # legend at bottom right
+    ax.legend(loc="lower right")
     fig.tight_layout()
     save_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     return str(save_path)
+
+
+def _coerce_optional_float(value: Any) -> float:
+    """Convert one value to float; return NaN when conversion fails."""
+    if value is None:
+        return float("nan")
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _coerce_metric(metrics: Mapping[str, Any], metric_key: str) -> float:
+    """Read one metric as float when possible, else NaN."""
+    candidate = metrics.get(metric_key)
+    if candidate is None:
+        return float("nan")
+    try:
+        return float(candidate)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _round_down_to_step(value: float, step: float) -> float:
+    """Round one value down to the nearest multiple of ``step``."""
+    return float(step * np.floor(float(value) / step))
+
+
+def _round_up_to_step(value: float, step: float) -> float:
+    """Round one value up to the nearest multiple of ``step``."""
+    return float(step * np.ceil(float(value) / step))
+
+
+def _collect_finite(values: Sequence[float]) -> List[float]:
+    """Collect finite float values from one sequence."""
+    return [float(value) for value in values if np.isfinite(value)]
+
+
+def _compute_rssi_metric_y_limits(
+    ga_results: Mapping[str, Any],
+    gd_results: Optional[Mapping[str, Any]] = None,
+    rounding_step: float = _RSSI_Y_AXIS_ROUND_STEP,
+) -> Dict[str, Tuple[float, float]]:
+    """Compute shared per-metric RSSI y-limits across all ranks.
+
+    Limits are expanded to outer multiples of ``rounding_step`` so all plots for
+    the same metric share a stable, easy-to-read range.
+    """
+    ranks = _resolve_ga_plot_ranks(ga_results)
+    limits: Dict[str, Tuple[float, float]] = {}
+
+    for (
+        metric_key,
+        priority_metric_key,
+        _,
+        _,
+        _,
+        _,
+        _,
+    ) in _GA_BEST_METRIC_PLOT_SPECS:
+        collected: List[float] = []
+
+        for rank in ranks:
+            _, area_values, priority_values = _extract_ga_ranked_metric_series(
+                ga_results=ga_results,
+                metric_key=metric_key,
+                priority_metric_key=priority_metric_key,
+                rank=rank,
+            )
+            collected.extend(_collect_finite(area_values))
+            collected.extend(_collect_finite(priority_values))
+
+            if gd_results is not None:
+                gd_area, gd_priority = _extract_gd_seed_metric_pair(
+                    gd_results=gd_results,
+                    seed_index=rank - 1,
+                    metric_key=metric_key,
+                    priority_metric_key=priority_metric_key,
+                )
+                use_seed_specific = bool(np.isfinite(gd_area) or np.isfinite(gd_priority))
+                if not use_seed_specific:
+                    gd_area, gd_priority = _extract_gd_best_metric_pair(
+                        gd_results=gd_results,
+                        metric_key=metric_key,
+                        priority_metric_key=priority_metric_key,
+                    )
+                if np.isfinite(gd_area):
+                    collected.append(float(gd_area))
+                if np.isfinite(gd_priority):
+                    collected.append(float(gd_priority))
+
+        if not collected:
+            continue
+
+        raw_min = min(collected)
+        raw_max = max(collected)
+        ymin = _round_down_to_step(raw_min, rounding_step)
+        ymax = _round_up_to_step(raw_max, rounding_step)
+        if ymin == ymax:
+            ymin -= rounding_step
+            ymax += rounding_step
+
+        limits[metric_key] = (ymin, ymax)
+
+    return limits
+
+
+def _resolve_ga_plot_ranks(ga_results: Mapping[str, Any]) -> List[int]:
+    """Resolve GA rank indices to render based on available payloads."""
+    max_rank = 1
+
+    raw_num_selected = ga_results.get("num_selected_seeds")
+    if raw_num_selected is not None:
+        try:
+            max_rank = max(max_rank, int(raw_num_selected))
+        except (TypeError, ValueError):
+            pass
+
+    generation_details = ga_results.get("generation_details")
+    if isinstance(generation_details, Sequence):
+        for row in generation_details:
+            if not isinstance(row, Mapping):
+                continue
+
+            top_individuals = row.get("top_individuals")
+            if isinstance(top_individuals, Sequence):
+                for fallback_rank, ranked in enumerate(top_individuals, start=1):
+                    if not isinstance(ranked, Mapping):
+                        continue
+                    raw_rank = ranked.get("rank", fallback_rank)
+                    try:
+                        rank = int(raw_rank)
+                    except (TypeError, ValueError):
+                        rank = fallback_rank
+                    max_rank = max(max_rank, rank)
+            elif row.get("second_primary_fitness") is not None:
+                max_rank = max(max_rank, 2)
+
+    if max_rank <= 0:
+        return [1]
+    return list(range(1, max_rank + 1))
+
+
+def _ranked_artifact_key(base_key: str, rank: int) -> str:
+    """Build a rank-aware artifact key while preserving rank-1 keys."""
+    if rank == 1:
+        return base_key
+    if base_key.startswith("ga_best_"):
+        return base_key.replace("ga_best_", f"ga_rank{rank}_", 1)
+    if base_key.startswith("ga_gd_stitched_"):
+        return base_key.replace("ga_gd_stitched_", f"ga_gd_stitched_rank{rank}_", 1)
+    return f"{base_key}_rank{rank}"
+
+
+def _ranked_filename(base_filename: str, rank: int) -> str:
+    """Build a rank-aware filename with explicit rank numbering."""
+    if base_filename.startswith("ga_best_"):
+        return base_filename.replace("ga_best_", f"ga_rank{rank}_", 1)
+    if base_filename.startswith("ga_gd_stitched_"):
+        return base_filename.replace("ga_gd_stitched_", f"ga_gd_stitched_rank{rank}_", 1)
+
+    suffix = Path(base_filename).suffix
+    stem = Path(base_filename).stem
+    return f"{stem}_rank{rank}{suffix}"
+
+
+def _extract_ga_ranked_metric_series(
+    ga_results: Mapping[str, Any],
+    metric_key: str,
+    priority_metric_key: str,
+    rank: int = 1,
+) -> Tuple[List[int], List[float], List[float]]:
+    """Extract one GA-rank metric series per generation for all/priority metrics."""
+    if rank <= 0:
+        return [], [], []
+
+    generation_details = ga_results.get("generation_details")
+    if not isinstance(generation_details, Sequence):
+        return [], [], []
+
+    generations: List[int] = []
+    area_values: List[float] = []
+    priority_values: List[float] = []
+
+    for fallback_gen, row in enumerate(generation_details):
+        if not isinstance(row, Mapping):
+            continue
+
+        raw_gen = row.get("gen", fallback_gen)
+        try:
+            generation_index = int(raw_gen)
+        except (TypeError, ValueError):
+            generation_index = fallback_gen
+
+        area_metric = float("nan")
+        priority_metric = float("nan")
+
+        metrics: Optional[Mapping[str, Any]] = None
+        top_individuals = row.get("top_individuals")
+        if (
+            isinstance(top_individuals, Sequence)
+            and len(top_individuals) >= rank
+            and isinstance(top_individuals[rank - 1], Mapping)
+        ):
+            ranked_metrics = top_individuals[rank - 1].get("physical_metrics")
+            if isinstance(ranked_metrics, Mapping):
+                metrics = ranked_metrics
+
+        if metrics is None:
+            if rank == 1:
+                fallback_metrics = row.get("best_physical_metrics")
+                if isinstance(fallback_metrics, Mapping):
+                    metrics = fallback_metrics
+            elif rank == 2:
+                fallback_metrics = row.get("second_physical_metrics")
+                if isinstance(fallback_metrics, Mapping):
+                    metrics = fallback_metrics
+
+        if isinstance(metrics, Mapping):
+            area_metric = _coerce_metric(metrics, metric_key)
+            priority_metric = _coerce_metric(metrics, priority_metric_key)
+
+        generations.append(generation_index)
+        area_values.append(area_metric)
+        priority_values.append(priority_metric)
+
+    return generations, area_values, priority_values
+
+
+def _extract_ga_best_metric_series(
+    ga_results: Mapping[str, Any],
+    metric_key: str,
+    priority_metric_key: str,
+) -> Tuple[List[int], List[float], List[float]]:
+    """Backward-compatible wrapper for rank-1 GA metric extraction."""
+    return _extract_ga_ranked_metric_series(
+        ga_results=ga_results,
+        metric_key=metric_key,
+        priority_metric_key=priority_metric_key,
+        rank=1,
+    )
+
+
+def save_ga_generation_best_metric_trend_plot(
+    ga_results: Mapping[str, Any],
+    save_path: Path,
+    metric_key: str,
+    priority_metric_key: str,
+    metric_label: str,
+    rank: int = 1,
+    y_limits: Optional[Tuple[float, float]] = None,
+    gd_results: Optional[Mapping[str, Any]] = None,
+    gd_seed_index: Optional[int] = None,
+) -> Optional[str]:
+    """Plot one GA rank metric trend for all-area vs priority-area."""
+    generations, area_values, priority_values = _extract_ga_ranked_metric_series(
+        ga_results=ga_results,
+        metric_key=metric_key,
+        priority_metric_key=priority_metric_key,
+        rank=rank,
+    )
+    area_array = np.asarray(area_values, dtype=np.float64)
+    priority_array = np.asarray(priority_values, dtype=np.float64)
+    has_area = bool(np.any(np.isfinite(area_array)))
+    has_priority = bool(np.any(np.isfinite(priority_array)))
+
+    gd_area_value = float("nan")
+    gd_priority_value = float("nan")
+    use_seed_specific_label = False
+    if isinstance(gd_results, Mapping):
+        if gd_seed_index is not None:
+            gd_area_value, gd_priority_value = _extract_gd_seed_metric_pair(
+                gd_results=gd_results,
+                seed_index=gd_seed_index,
+                metric_key=metric_key,
+                priority_metric_key=priority_metric_key,
+            )
+            use_seed_specific_label = bool(np.isfinite(gd_area_value) or np.isfinite(gd_priority_value))
+
+        if not use_seed_specific_label:
+            gd_area_value, gd_priority_value = _extract_gd_best_metric_pair(
+                gd_results=gd_results,
+                metric_key=metric_key,
+                priority_metric_key=priority_metric_key,
+            )
+
+    has_gd_area = bool(np.isfinite(gd_area_value))
+    has_gd_priority = bool(np.isfinite(gd_priority_value))
+
+    if not any((has_area, has_priority, has_gd_area, has_gd_priority)):
+        return None
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    if has_area:
+        ax.plot(
+            generations,
+            area_values,
+            marker="o",
+            linewidth=2.0,
+            label="All-area",
+        )
+    if has_priority:
+        ax.plot(
+            generations,
+            priority_values,
+            marker="s",
+            linewidth=2.0,
+            label="Priority-area",
+        )
+
+    gd_x = (max(generations) + 1) if generations else 0
+    if has_gd_area:
+        ax.scatter(
+            [gd_x],
+            [gd_area_value],
+            marker="*",
+            s=180,
+            color="tab:blue",
+            zorder=6,
+            label="GD all-area",
+        )
+        if has_area and generations and np.isfinite(area_values[-1]):
+            ax.plot([generations[-1], gd_x], [area_values[-1], gd_area_value], "--", color="tab:blue", alpha=0.65)
+
+    if has_gd_priority:
+        ax.scatter(
+            [gd_x],
+            [gd_priority_value],
+            marker="*",
+            s=180,
+            color="tab:orange",
+            zorder=6,
+            label="GD priority-area",
+        )
+        if has_priority and generations and np.isfinite(priority_values[-1]):
+            ax.plot(
+                [generations[-1], gd_x],
+                [priority_values[-1], gd_priority_value],
+                "--",
+                color="tab:orange",
+                alpha=0.65,
+            )
+
+    ax.set_xlabel("Optimization Steps")
+    ax.set_ylabel(metric_label)
+    # title_prefix = f"GA Rank-{rank} Individual"
+    title_prefix = ""
+    ax.set_title(f"{title_prefix} {metric_label} Trend")
+    if y_limits is not None:
+        ax.set_ylim(float(y_limits[0]), float(y_limits[1]))
+    _set_integer_x_ticks(ax)
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="lower right")
+
+    fig.tight_layout()
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    return str(save_path)
+
+
+def save_ga_generation_best_metric_trend_plots(
+    ga_results: Mapping[str, Any],
+    save_dir: Path,
+    gd_results: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, str]:
+    """Save GA rank-aware metric-trend plots for key all/priority metrics."""
+    save_dir.mkdir(parents=True, exist_ok=True)
+    artifacts: Dict[str, str] = {"ga_best_metric_trend_dir": str(save_dir)}
+
+    ranks = _resolve_ga_plot_ranks(ga_results)
+    artifacts["ga_best_metric_ranks"] = ",".join(str(rank) for rank in ranks)
+    y_limits_by_metric = _compute_rssi_metric_y_limits(
+        ga_results=ga_results,
+        gd_results=gd_results,
+    )
+
+    rendered_count = 0
+    for rank in ranks:
+        for (
+            metric_key,
+            priority_metric_key,
+            metric_label,
+            ga_artifact_key,
+            ga_filename,
+            _,
+            _,
+        ) in _GA_BEST_METRIC_PLOT_SPECS:
+            rendered = save_ga_generation_best_metric_trend_plot(
+                ga_results=ga_results,
+                save_path=save_dir / _ranked_filename(ga_filename, rank),
+                metric_key=metric_key,
+                priority_metric_key=priority_metric_key,
+                metric_label=metric_label,
+                rank=rank,
+                y_limits=y_limits_by_metric.get(metric_key),
+                gd_results=gd_results,
+                gd_seed_index=rank - 1,
+            )
+            if rendered is not None:
+                rendered_count += 1
+                artifacts[_ranked_artifact_key(ga_artifact_key, rank)] = rendered
+
+    artifacts["ga_best_metric_trend_plot_count"] = str(rendered_count)
+    return artifacts
+
+
+def save_ga_generation_combined_plot(
+    ga_results: Mapping[str, Any],
+    save_path: Path,
+    rank: int = 1,
+    y_limits: Optional[Tuple[float, float]] = _DEFAULT_MEAN_P5_COMBINED_Y_RANGE,
+    gd_results: Optional[Mapping[str, Any]] = None,
+    gd_seed_index: Optional[int] = None,
+) -> Optional[str]:
+    """Plot one rank with mean, p5, and min RSSI trends in one combined chart."""
+    metric_specs: Tuple[Tuple[str, str, str, str, str, str], ...] = (
+        ("mean_rss_dbm", "priority_mean_rss_dbm", "Mean RSSI", "tab:blue", "o", "s"),
+        ("p5_rss_dbm", "priority_p5_rss_dbm", "P5 RSSI", "tab:orange", "^", "D"),
+        ("min_rss_dbm", "priority_min_rss_dbm", "Min RSSI", "tab:green", "v", "P"),
+    )
+
+    series_by_metric: Dict[str, Tuple[List[int], List[float], List[float]]] = {}
+    has_area_by_metric: Dict[str, bool] = {}
+    has_priority_by_metric: Dict[str, bool] = {}
+    for metric_key, priority_metric_key, _, _, _, _ in metric_specs:
+        generations, area_values, priority_values = _extract_ga_ranked_metric_series(
+            ga_results=ga_results,
+            metric_key=metric_key,
+            priority_metric_key=priority_metric_key,
+            rank=rank,
+        )
+        series_by_metric[metric_key] = (generations, area_values, priority_values)
+        has_area_by_metric[metric_key] = bool(np.any(np.isfinite(np.asarray(area_values, dtype=np.float64))))
+        has_priority_by_metric[metric_key] = bool(np.any(np.isfinite(np.asarray(priority_values, dtype=np.float64))))
+
+    gd_by_metric: Dict[str, Tuple[float, float]] = {
+        metric_key: (float("nan"), float("nan"))
+        for metric_key, _, _, _, _, _ in metric_specs
+    }
+    use_seed_specific_label = False
+    if isinstance(gd_results, Mapping):
+        if gd_seed_index is not None:
+            gd_by_metric = {}
+            for metric_key, priority_metric_key, _, _, _, _ in metric_specs:
+                gd_by_metric[metric_key] = _extract_gd_seed_metric_pair(
+                    gd_results=gd_results,
+                    seed_index=gd_seed_index,
+                    metric_key=metric_key,
+                    priority_metric_key=priority_metric_key,
+                )
+            use_seed_specific_label = any(
+                np.isfinite(area_value) or np.isfinite(priority_value)
+                for area_value, priority_value in gd_by_metric.values()
+            )
+
+        if not use_seed_specific_label:
+            gd_by_metric = {}
+            for metric_key, priority_metric_key, _, _, _, _ in metric_specs:
+                gd_by_metric[metric_key] = _extract_gd_best_metric_pair(
+                    gd_results=gd_results,
+                    metric_key=metric_key,
+                    priority_metric_key=priority_metric_key,
+                )
+
+    if not any(
+        has_area_by_metric[metric_key]
+        or has_priority_by_metric[metric_key]
+        or np.isfinite(gd_by_metric[metric_key][0])
+        or np.isfinite(gd_by_metric[metric_key][1])
+        for metric_key, _, _, _, _, _ in metric_specs
+    ):
+        return None
+
+    fig, ax = plt.subplots(figsize=(11, 5))
+
+    for metric_key, _, display_label, color, area_marker, priority_marker in metric_specs:
+        generations, area_values, priority_values = series_by_metric[metric_key]
+        if has_area_by_metric[metric_key]:
+            ax.plot(
+                generations,
+                area_values,
+                marker=area_marker,
+                linewidth=2.0,
+                color=color,
+                label=f"{display_label} (All-area)",
+            )
+        if has_priority_by_metric[metric_key]:
+            ax.plot(
+                generations,
+                priority_values,
+                marker=priority_marker,
+                linewidth=2.0,
+                linestyle="--",
+                color=color,
+                label=f"{display_label} (Priority-area)",
+            )
+
+    gd_x = max(
+        max(generations) if generations else 0
+        for generations, _, _ in series_by_metric.values()
+    ) + 1
+
+    finite_values: List[float] = []
+    for metric_key, _, display_label, color, _, _ in metric_specs:
+        generations, area_values, priority_values = series_by_metric[metric_key]
+        finite_values.extend(_collect_finite(area_values))
+        finite_values.extend(_collect_finite(priority_values))
+
+        gd_area_value, gd_priority_value = gd_by_metric[metric_key]
+        if np.isfinite(gd_area_value):
+            finite_values.append(float(gd_area_value))
+            ax.scatter(
+                [gd_x],
+                [gd_area_value],
+                marker="*",
+                s=180,
+                color=color,
+                zorder=6,
+                label=f"GD {display_label} (All-area)",
+            )
+            if has_area_by_metric[metric_key] and generations and np.isfinite(area_values[-1]):
+                ax.plot(
+                    [generations[-1], gd_x],
+                    [area_values[-1], gd_area_value],
+                    "--",
+                    color=color,
+                    alpha=0.65,
+                )
+
+        if np.isfinite(gd_priority_value):
+            finite_values.append(float(gd_priority_value))
+            ax.scatter(
+                [gd_x],
+                [gd_priority_value],
+                marker="*",
+                s=180,
+                color=color,
+                zorder=6,
+                label=f"GD {display_label} (Priority-area)",
+            )
+            if has_priority_by_metric[metric_key] and generations and np.isfinite(priority_values[-1]):
+                ax.plot(
+                    [generations[-1], gd_x],
+                    [priority_values[-1], gd_priority_value],
+                    "--",
+                    color=color,
+                    alpha=0.65,
+                )
+
+    if y_limits is None:
+        if finite_values:
+            ymin = _round_down_to_step(min(finite_values), _RSSI_Y_AXIS_ROUND_STEP)
+            ymax = _round_up_to_step(max(finite_values), _RSSI_Y_AXIS_ROUND_STEP)
+            ymin = min(ymin, _DEFAULT_MEAN_P5_COMBINED_Y_RANGE[0])
+            ymax = max(ymax, _DEFAULT_MEAN_P5_COMBINED_Y_RANGE[1])
+            if ymin == ymax:
+                ymin -= _RSSI_Y_AXIS_ROUND_STEP
+                ymax += _RSSI_Y_AXIS_ROUND_STEP
+            resolved_y_limits = (ymin, ymax)
+        else:
+            resolved_y_limits = _DEFAULT_MEAN_P5_COMBINED_Y_RANGE
+    else:
+        resolved_y_limits = y_limits
+
+    ax.set_xlabel("Optimization Steps")
+    ax.set_ylabel("RSSI (dBm)")
+    ax.set_title("Mean, P5, and Min RSSI Trend")
+    ax.set_ylim(float(resolved_y_limits[0]), float(resolved_y_limits[1]))
+    _set_integer_x_ticks(ax)
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="lower right")
+
+    fig.tight_layout()
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    return str(save_path)
+
+
+def save_ga_generation_combined_plots(
+    ga_results: Mapping[str, Any],
+    save_dir: Path,
+    gd_results: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, str]:
+    """Save one combined mean+p5+min RSSI trend plot per GA rank."""
+    save_dir.mkdir(parents=True, exist_ok=True)
+    artifacts: Dict[str, str] = {"ga_combined_trend_dir": str(save_dir)}
+
+    ranks = _resolve_ga_plot_ranks(ga_results)
+    artifacts["ga_combined_ranks"] = ",".join(str(rank) for rank in ranks)
+
+    rendered_count = 0
+    base_artifact_key = "ga_combined_trend_plot"
+    base_filename = "ga_combined_trend.png"
+    for rank in ranks:
+        rendered = save_ga_generation_combined_plot(
+            ga_results=ga_results,
+            save_path=save_dir / _ranked_filename(base_filename, rank),
+            rank=rank,
+            y_limits=None,
+            gd_results=gd_results,
+            gd_seed_index=rank - 1,
+        )
+        if rendered is not None:
+            rendered_count += 1
+            artifacts[_ranked_artifact_key(base_artifact_key, rank)] = rendered
+
+    artifacts["ga_combined_trend_plot_count"] = str(rendered_count)
+    return artifacts
+
+
+def _extract_gd_best_metric_pair(
+    gd_results: Mapping[str, Any],
+    metric_key: str,
+    priority_metric_key: str,
+) -> Tuple[float, float]:
+    """Extract best GD all-area and priority-area metric values."""
+    best_result = gd_results.get("global_best_result")
+    if not isinstance(best_result, Mapping):
+        return float("nan"), float("nan")
+
+    metrics = _extract_best_physical_metrics(best_result)
+    if not metrics:
+        return float("nan"), float("nan")
+
+    return (
+        _coerce_metric(metrics, metric_key),
+        _coerce_metric(metrics, priority_metric_key),
+    )
+
+
+def _extract_gd_seed_metric_pair(
+    gd_results: Mapping[str, Any],
+    seed_index: int,
+    metric_key: str,
+    priority_metric_key: str,
+) -> Tuple[float, float]:
+    """Extract one seed-specific GD metric pair using per-seed analysis first."""
+    if seed_index < 0:
+        return float("nan"), float("nan")
+
+    per_seed = gd_results.get("per_seed_analysis")
+    if (
+        isinstance(per_seed, Sequence)
+        and len(per_seed) > seed_index
+        and isinstance(per_seed[seed_index], Mapping)
+    ):
+        metrics = per_seed[seed_index].get("physical_metrics")
+        if isinstance(metrics, Mapping):
+            return (
+                _coerce_metric(metrics, metric_key),
+                _coerce_metric(metrics, priority_metric_key),
+            )
+
+    all_results = gd_results.get("all_fine_tuned_results")
+    if isinstance(all_results, Sequence):
+        task_result: Optional[Mapping[str, Any]] = None
+        for candidate in all_results:
+            if not isinstance(candidate, Mapping):
+                continue
+            raw_task_id = candidate.get("task_id")
+            if raw_task_id is None:
+                continue
+            try:
+                task_id = int(raw_task_id)
+            except (TypeError, ValueError):
+                continue
+            if task_id == seed_index:
+                task_result = candidate
+                break
+
+        if task_result is None:
+            if len(all_results) > seed_index and isinstance(all_results[seed_index], Mapping):
+                task_result = all_results[seed_index]
+
+        if task_result is not None:
+            metrics = _extract_best_physical_metrics(task_result)
+            if metrics:
+                return (
+                    _coerce_metric(metrics, metric_key),
+                    _coerce_metric(metrics, priority_metric_key),
+                )
+
+    return float("nan"), float("nan")
+
+
+def save_ga_gd_stitched_metric_trend_plot(
+    ga_results: Mapping[str, Any],
+    gd_results: Mapping[str, Any],
+    save_path: Path,
+    metric_key: str,
+    priority_metric_key: str,
+    metric_label: str,
+    rank: int = 1,
+    gd_seed_index: Optional[int] = None,
+    y_limits: Optional[Tuple[float, float]] = None,
+) -> Optional[str]:
+    """Plot one GA-rank trend stitched with one final GD metric point."""
+    generations, area_values, priority_values = _extract_ga_ranked_metric_series(
+        ga_results=ga_results,
+        metric_key=metric_key,
+        priority_metric_key=priority_metric_key,
+        rank=rank,
+    )
+
+    gd_area_value = float("nan")
+    gd_priority_value = float("nan")
+    use_seed_specific_label = False
+    if gd_seed_index is not None:
+        gd_area_value, gd_priority_value = _extract_gd_seed_metric_pair(
+            gd_results=gd_results,
+            seed_index=gd_seed_index,
+            metric_key=metric_key,
+            priority_metric_key=priority_metric_key,
+        )
+        use_seed_specific_label = bool(
+            np.isfinite(gd_area_value) or np.isfinite(gd_priority_value)
+        )
+
+    if not use_seed_specific_label:
+        gd_area_value, gd_priority_value = _extract_gd_best_metric_pair(
+            gd_results=gd_results,
+            metric_key=metric_key,
+            priority_metric_key=priority_metric_key,
+        )
+
+    area_array = np.asarray(area_values, dtype=np.float64)
+    priority_array = np.asarray(priority_values, dtype=np.float64)
+    has_ga_area = bool(generations) and bool(np.any(np.isfinite(area_array)))
+    has_ga_priority = bool(generations) and bool(np.any(np.isfinite(priority_array)))
+    has_gd_area = bool(np.isfinite(gd_area_value))
+    has_gd_priority = bool(np.isfinite(gd_priority_value))
+    if not any((has_ga_area, has_ga_priority, has_gd_area, has_gd_priority)):
+        return None
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    if has_ga_area:
+        ax.plot(
+            generations,
+            area_values,
+            marker="o",
+            linewidth=2.0,
+            label="GA all-area",
+        )
+    if has_ga_priority:
+        ax.plot(
+            generations,
+            priority_values,
+            marker="s",
+            linewidth=2.0,
+            label="GA priority-area",
+        )
+
+    gd_x = (max(generations) + 1) if generations else 0
+    if has_gd_area:
+        ax.scatter(
+            [gd_x],
+            [gd_area_value],
+            marker="*",
+            s=180,
+            color="tab:blue",
+            zorder=6,
+            label="GD all-area",
+        )
+        if has_ga_area and np.isfinite(area_values[-1]):
+            ax.plot([generations[-1], gd_x], [area_values[-1], gd_area_value], "--", color="tab:blue", alpha=0.65)
+    if has_gd_priority:
+        ax.scatter(
+            [gd_x],
+            [gd_priority_value],
+            marker="*",
+            s=180,
+            color="tab:orange",
+            zorder=6,
+            label="GD priority-area",
+        )
+        if has_ga_priority and np.isfinite(priority_values[-1]):
+            ax.plot([generations[-1], gd_x], [priority_values[-1], gd_priority_value], "--", color="tab:orange", alpha=0.65)
+
+    ax.set_xlabel("Optimization Steps")
+    ax.set_ylabel(metric_label)
+    # title_prefix = f"GA Rank-{rank} to GD Stitched"
+    title_prefix = ""
+    ax.set_title(f"{title_prefix} {metric_label} Trend")
+    if y_limits is not None:
+        ax.set_ylim(float(y_limits[0]), float(y_limits[1]))
+    _set_integer_x_ticks(ax)
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="lower right")
+
+    fig.tight_layout()
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    return str(save_path)
+
+
+def save_ga_gd_stitched_metric_trend_plots(
+    ga_results: Mapping[str, Any],
+    gd_results: Mapping[str, Any],
+    save_dir: Path,
+) -> Dict[str, str]:
+    """Save stitched GA-rank and GD endpoint plots for key metrics."""
+    save_dir.mkdir(parents=True, exist_ok=True)
+    artifacts: Dict[str, str] = {"ga_gd_stitched_metric_trend_dir": str(save_dir)}
+
+    ranks = _resolve_ga_plot_ranks(ga_results)
+    artifacts["ga_gd_stitched_metric_ranks"] = ",".join(str(rank) for rank in ranks)
+    y_limits_by_metric = _compute_rssi_metric_y_limits(
+        ga_results=ga_results,
+        gd_results=gd_results,
+    )
+
+    rendered_count = 0
+    for rank in ranks:
+        for (
+            metric_key,
+            priority_metric_key,
+            metric_label,
+            _,
+            _,
+            stitched_artifact_key,
+            stitched_filename,
+        ) in _GA_BEST_METRIC_PLOT_SPECS:
+            rendered = save_ga_gd_stitched_metric_trend_plot(
+                ga_results=ga_results,
+                gd_results=gd_results,
+                save_path=save_dir / _ranked_filename(stitched_filename, rank),
+                metric_key=metric_key,
+                priority_metric_key=priority_metric_key,
+                metric_label=metric_label,
+                rank=rank,
+                gd_seed_index=rank - 1,
+                y_limits=y_limits_by_metric.get(metric_key),
+            )
+            if rendered is not None:
+                rendered_count += 1
+                artifacts[_ranked_artifact_key(stitched_artifact_key, rank)] = rendered
+
+    artifacts["ga_gd_stitched_metric_trend_plot_count"] = str(rendered_count)
+    return artifacts
 
 
 def save_gd_seed_improvements(gd_results: Mapping[str, Any], save_path: Path) -> Optional[str]:
@@ -499,7 +1412,7 @@ def save_gd_parallel_summary_plot(
     ax.set_xlabel("Primary Loss")
     ax.set_ylabel("Number of Tasks")
     ax.set_title("Distribution of Primary Loss Across GD Tasks")
-    ax.legend()
+    ax.legend(loc="lower right")
     ax.grid(True, alpha=0.3)
 
     ax = axes[0, 1]
@@ -602,7 +1515,7 @@ def save_gd_parallel_summary_plot(
     ax.set_ylabel("Y Position (m)")
     ax.set_title("Best GD Positions (color = primary loss)")
     plt.colorbar(scatter, ax=ax, label="Primary Loss")
-    ax.legend()
+    ax.legend(loc="lower right")
     ax.grid(True, alpha=0.3)
     ax.set_aspect("equal", adjustable="box")
 
@@ -690,10 +1603,10 @@ def save_gd_trajectory_plots(
         primary_loss_values = _extract_primary_loss_series(result)
         coverage_values = _extract_physical_metric_series(result, "coverage_pct")
         secondary_metric_name, secondary_metric_values = _select_secondary_metric(result)
-        region_mean_values = _extract_region_metric_series(result, "region_mean_rss_dbm")
-        region_min_values = _extract_region_metric_series(result, "region_min_rss_dbm")
-        region_p5_values = _extract_region_metric_series(result, "region_p5_rss_dbm")
-        spatial_weights_map = _extract_spatial_weights_map(result)
+        priority_mean_values = _extract_priority_metric_series(result, "priority_mean_rss_dbm")
+        priority_min_values = _extract_priority_metric_series(result, "priority_min_rss_dbm")
+        priority_p5_values = _extract_priority_metric_series(result, "priority_p5_rss_dbm")
+        spatial_priority_map = _extract_spatial_priority_map(result)
         gradients = history.get("gradients", [])
         best_iter = _extract_best_iteration(result)
 
@@ -754,7 +1667,7 @@ def save_gd_trajectory_plots(
         ax.set_xlabel("X Position (m)")
         ax.set_ylabel("Y Position (m)")
         ax.set_title("AP Position Trajectories")
-        ax.legend(fontsize=8)
+        ax.legend(loc="lower right", fontsize=8)
         ax.grid(True, alpha=0.3)
         ax.set_aspect("equal", adjustable="box")
 
@@ -768,7 +1681,8 @@ def save_gd_trajectory_plots(
         ax.set_xlabel("Iteration")
         ax.set_ylabel("Primary Loss")
         ax.set_title("Primary Loss Evolution")
-        ax.legend(fontsize=9)
+        _set_integer_x_ticks(ax)
+        ax.legend(loc="lower right", fontsize=9)
         ax.grid(True, alpha=0.3)
 
         ax = axes[1, 0]
@@ -785,7 +1699,8 @@ def save_gd_trajectory_plots(
         ax.set_xlabel("Iteration")
         ax.set_ylabel("coverage_pct")
         ax.set_title("Coverage Evolution")
-        ax.legend(fontsize=9)
+        _set_integer_x_ticks(ax)
+        ax.legend(loc="lower right", fontsize=9)
         ax.grid(True, alpha=0.3)
 
         ax = axes[1, 1]
@@ -802,30 +1717,32 @@ def save_gd_trajectory_plots(
         ax.set_xlabel("Iteration")
         ax.set_ylabel("Gradient Norm")
         ax.set_title("Gradient Norm Evolution (log scale)")
-        ax.legend(fontsize=9)
+        _set_integer_x_ticks(ax)
+        ax.legend(loc="lower right", fontsize=9)
         ax.grid(True, alpha=0.3)
 
         ax = axes[2, 0]
-        any_region_series = False
-        if region_mean_values:
-            any_region_series = True
-            ax.plot(range(1, len(region_mean_values) + 1), region_mean_values, "b-", linewidth=2, label="region_mean_rss_dbm")
-        if region_min_values:
-            any_region_series = True
-            ax.plot(range(1, len(region_min_values) + 1), region_min_values, "m-", linewidth=2, label="region_min_rss_dbm")
-        if region_p5_values:
-            any_region_series = True
-            ax.plot(range(1, len(region_p5_values) + 1), region_p5_values, "c-", linewidth=2, label="region_p5_rss_dbm")
-        if any_region_series and 0 <= best_iter < max(len(region_mean_values), len(region_min_values), len(region_p5_values)):
+        any_priority_series = False
+        if priority_mean_values:
+            any_priority_series = True
+            ax.plot(range(1, len(priority_mean_values) + 1), priority_mean_values, "b-", linewidth=2, label="priority_mean_rss_dbm")
+        if priority_min_values:
+            any_priority_series = True
+            ax.plot(range(1, len(priority_min_values) + 1), priority_min_values, "m-", linewidth=2, label="priority_min_rss_dbm")
+        if priority_p5_values:
+            any_priority_series = True
+            ax.plot(range(1, len(priority_p5_values) + 1), priority_p5_values, "c-", linewidth=2, label="priority_p5_rss_dbm")
+        if any_priority_series and 0 <= best_iter < max(len(priority_mean_values), len(priority_min_values), len(priority_p5_values)):
             ax.axvline(best_iter + 1, color="red", linestyle="--", alpha=0.7, label=f"Best iter {best_iter + 1}")
         ax.set_xlabel("Iteration")
         ax.set_ylabel("RSSI (dBm)")
-        ax.set_title("Region Metrics Evolution")
-        ax.legend(fontsize=9)
+        ax.set_title("Priority Metrics Evolution")
+        _set_integer_x_ticks(ax)
+        ax.legend(loc="lower right", fontsize=9)
         ax.grid(True, alpha=0.3)
 
         ax = axes[2, 1]
-        if spatial_weights_map is not None:
+        if spatial_priority_map is not None:
             if position_bounds:
                 extent = (
                     float(position_bounds["x_min"]),
@@ -837,13 +1754,13 @@ def save_gd_trajectory_plots(
                 extent = None
 
             image = ax.imshow(
-                spatial_weights_map,
+                spatial_priority_map,
                 cmap="magma",
                 origin="lower",
                 extent=extent,
                 aspect="equal",
             )
-            ax.set_title("Region Weight Heatmap")
+            ax.set_title("Priority Map Heatmap")
             ax.set_xlabel("X Position (m)")
             ax.set_ylabel("Y Position (m)")
             if position_bounds:
@@ -853,17 +1770,17 @@ def save_gd_trajectory_plots(
             # Keep heatmap panel size comparable to other subplots.
             cax = ax.inset_axes([1.02, 0.0, 0.035, 1.0])
             cbar = fig.colorbar(image, cax=cax)
-            cbar.set_label("Weight")
+            cbar.set_label("Priority")
         else:
             ax.axis("off")
             note_lines = [
                 f"Task #{task_id}",
-                "Region metrics computed on explicit weighted region only.",
-                "Series: region_mean_rss_dbm, region_min_rss_dbm, region_p5_rss_dbm.",
-                "Weight heatmap unavailable in this artifact.",
+                "Priority metrics computed on explicit priority area only.",
+                "Series: priority_mean_rss_dbm, priority_min_rss_dbm, priority_p5_rss_dbm.",
+                "Priority map unavailable in this artifact.",
             ]
-            if not any_region_series:
-                note_lines.append("No region metric history available for this task.")
+            if not any_priority_series:
+                note_lines.append("No priority metric history available for this task.")
             ax.text(
                 0.02,
                 0.95,
@@ -910,6 +1827,21 @@ def save_memetic_plots(
         position_bounds=position_bounds,
         rss_range_dbm=rss_range_dbm,
     )
+    ga_metric_trend_artifacts = save_ga_generation_best_metric_trend_plots(
+        ga_results=summary.get("ga_results", {}),
+        save_dir=plots_dir / "ga_generation_metric_trends",
+        gd_results=summary.get("gd_results", {}),
+    )
+    ga_gd_stitched_metric_trend_artifacts = save_ga_gd_stitched_metric_trend_plots(
+        ga_results=summary.get("ga_results", {}),
+        gd_results=summary.get("gd_results", {}),
+        save_dir=plots_dir / "ga_gd_stitched_metric_trends",
+    )
+    ga_combined_artifacts = save_ga_generation_combined_plots(
+        ga_results=summary.get("ga_results", {}),
+        save_dir=plots_dir / "ga_combined_trends",
+        gd_results=summary.get("gd_results", {}),
+    )
 
     if ga_plot is not None:
         artifacts["ga_training_plot"] = ga_plot
@@ -920,6 +1852,9 @@ def save_memetic_plots(
         artifacts["gd_parallel_summary_plot"] = gd_summary_plot
     artifacts["gd_trajectory_dir"] = str(plots_dir / "gd_trajectories")
     artifacts["gd_trajectory_count"] = str(len(gd_trajectory_paths))
+    artifacts.update(ga_metric_trend_artifacts)
+    artifacts.update(ga_gd_stitched_metric_trend_artifacts)
+    artifacts.update(ga_combined_artifacts)
     return artifacts
 
 

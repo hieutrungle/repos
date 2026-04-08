@@ -36,6 +36,11 @@ _GD_NON_INIT_TASK_KEYS = {
     "scene_config",
     "initial_orientations",  # bridge alias (3D), GD expects initial_directions_xyz
     "initial_primary_loss",  # analysis metadata
+    "ga_seed_index",
+    "ga_seed_rank",
+    "ga_seed_primary_fitness",
+    "ga_seed_primary_loss",
+    "ga_seed_physical_metrics",
 }
 
 
@@ -275,10 +280,58 @@ def run_targeted_gd_exploitation(
     deltas: List[float] = []
 
     for idx, original_task in enumerate(gd_tasks):
+        raw_seed_rank = original_task.get("ga_seed_rank", idx + 1)
+        try:
+            seed_rank = int(raw_seed_rank)
+        except (TypeError, ValueError):
+            seed_rank = idx + 1
+
+        ga_seed_primary_fitness: Optional[float]
+        raw_ga_seed_primary_fitness = original_task.get("ga_seed_primary_fitness")
+        if raw_ga_seed_primary_fitness is None:
+            ga_seed_primary_fitness = None
+        else:
+            try:
+                ga_seed_primary_fitness = float(raw_ga_seed_primary_fitness)
+            except (TypeError, ValueError):
+                ga_seed_primary_fitness = None
+
+        ga_seed_primary_loss: Optional[float]
+        raw_ga_seed_primary_loss = original_task.get("ga_seed_primary_loss")
+        if raw_ga_seed_primary_loss is None:
+            ga_seed_primary_loss = (
+                float(-ga_seed_primary_fitness)
+                if ga_seed_primary_fitness is not None
+                else None
+            )
+        else:
+            try:
+                ga_seed_primary_loss = float(raw_ga_seed_primary_loss)
+            except (TypeError, ValueError):
+                ga_seed_primary_loss = (
+                    float(-ga_seed_primary_fitness)
+                    if ga_seed_primary_fitness is not None
+                    else None
+                )
+
+        ga_seed_physical_metrics: Dict[str, float] = {}
+        raw_ga_seed_metrics = original_task.get("ga_seed_physical_metrics")
+        if isinstance(raw_ga_seed_metrics, Mapping):
+            ga_seed_physical_metrics = {
+                str(name): float(value)
+                for name, value in raw_ga_seed_metrics.items()
+                if value is not None
+            }
+
         result = task_by_id.get(idx)
         if result is None:
             analysis = {
                 "seed_index": idx,
+                "seed_rank": seed_rank,
+                "ga_seed_rank": seed_rank,
+                "ga_seed_primary_fitness": ga_seed_primary_fitness,
+                "ga_seed_primary_loss": ga_seed_primary_loss,
+                "ga_seed_physical_metrics": ga_seed_physical_metrics,
                 "initial_primary_loss": None,
                 "best_primary_loss": None,
                 "final_primary_loss": None,
@@ -310,6 +363,11 @@ def run_targeted_gd_exploitation(
 
         analysis = {
             "seed_index": idx,
+            "seed_rank": seed_rank,
+            "ga_seed_rank": seed_rank,
+            "ga_seed_primary_fitness": ga_seed_primary_fitness,
+            "ga_seed_primary_loss": ga_seed_primary_loss,
+            "ga_seed_physical_metrics": ga_seed_physical_metrics,
             "task_id": int(result.get("task_id", idx)),
             "worker_id": result.get("worker_id"),
             "initial_primary_loss": initial_primary_loss,

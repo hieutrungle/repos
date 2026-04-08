@@ -1,4 +1,4 @@
-"""Utilities for constructing static spatial demand-weight maps.
+"""Utilities for constructing static spatial demand-priority maps.
 
 The demand map is defined over the 2-D optimization grid and is intended to be
 shared by all objective evaluations in a run. The returned weights obey a
@@ -17,12 +17,12 @@ import torch.nn.functional as F
 from torch import Tensor
 
 
-def generate_spatial_weight_map(
+def generate_spatial_priority_map(
     num_rows: int,
     num_cols: int,
     demand_config: dict[str, Any] | Mapping[str, Any],
 ) -> Tensor:
-    """Generate a normalized 2-D spatial demand-weight tensor.
+    """Generate a normalized 2-D spatial demand-priority tensor.
 
     Parameters
     ----------
@@ -45,7 +45,7 @@ def generate_spatial_weight_map(
     """
     if num_rows <= 0 or num_cols <= 0:
         raise ValueError("num_rows and num_cols must be positive")
-    weight_map = torch.ones((num_rows, num_cols), dtype=torch.float32)
+    priority_map = torch.ones((num_rows, num_cols), dtype=torch.float32)
 
     if bool(demand_config.get("enabled", True)):
         bounding_boxes = list(demand_config.get("bounding_boxes", []))
@@ -102,29 +102,42 @@ def generate_spatial_weight_map(
             if r2 <= r1 or c2 <= c1:
                 continue
 
-            weight_map[r1:r2, c1:c2] = float(weight)
+            priority_map[r1:r2, c1:c2] = float(weight)
 
     if bool(demand_config.get("enabled", True)) and bool(demand_config.get("apply_blur", False)):
         blurred = F.avg_pool2d(
-            weight_map.unsqueeze(0).unsqueeze(0),
+            priority_map.unsqueeze(0).unsqueeze(0),
             kernel_size=3,
             stride=1,
             padding=1,
         )
-        weight_map = blurred.squeeze(0).squeeze(0)
+        priority_map = blurred.squeeze(0).squeeze(0)
 
     num_cells = torch.tensor(
         float(num_rows * num_cols),
-        dtype=weight_map.dtype,
-        device=weight_map.device,
+        dtype=priority_map.dtype,
+        device=priority_map.device,
     )
-    current_weight_sum = weight_map.sum()
-    if current_weight_sum <= 0:
-        raise ValueError("weight_map sum must be positive")
+    current_priority_sum = priority_map.sum()
+    if current_priority_sum <= 0:
+        raise ValueError("priority_map sum must be positive")
 
-    normalized_weight_map = weight_map
-    # normalized_weight_map = weight_map * (num_cells / current_weight_sum)
-    return normalized_weight_map
+    normalized_priority_map = priority_map
+    # normalized_priority_map = priority_map * (num_cells / current_priority_sum)
+    return normalized_priority_map
 
 
-__all__ = ["generate_spatial_weight_map"]
+def generate_spatial_weight_map(
+    num_rows: int,
+    num_cols: int,
+    demand_config: dict[str, Any] | Mapping[str, Any],
+) -> Tensor:
+    """Backward-compatible alias for ``generate_spatial_priority_map``."""
+    return generate_spatial_priority_map(
+        num_rows=num_rows,
+        num_cols=num_cols,
+        demand_config=demand_config,
+    )
+
+
+__all__ = ["generate_spatial_priority_map", "generate_spatial_weight_map"]
