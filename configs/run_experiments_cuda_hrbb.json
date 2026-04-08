@@ -1,0 +1,111 @@
+{
+  "scene_config": {
+    "scene_path": "/home/hieule/blender/models/hrbb_ceil/complex.xml",
+    "frequency": 5180000000.0,
+    "tx_power_dbm": 20.0,
+    "tx_positions": [
+      [10.0, 15.0, 3.8],
+      [25.0, 30.0, 3.8],
+      [40.0, 25.0, 3.8],
+      [30.0, 10.0, 3.8],
+      [20.0, 40.0, 3.8],
+      [35.0, 35.0, 3.8],
+      [15.0, 25.0, 3.8]
+    ],
+    "reflector_enabled": false,
+    "reflector_size": [2.0, 2.0],
+    "wall_top_left": [15.0, 34.0, 3.0],
+    "wall_bottom_right": [34.0, 34.0, 1.0],
+    "focal_point": [25.0, 25.0, 1.5],
+    "device": "cuda"
+  },
+  "visualization_scene_config": {
+    "scene_path": "/home/hieule/blender/models/hrbb/complex.xml"
+  },
+  "position_bounds": {
+    "x_min": 5.5,
+    "x_max": 44.5,
+    "y_min": 5.5,
+    "y_max": 44.5
+  },
+  "fixed_z": 3.8,
+  "num_pool_workers": 1,
+  "gpu_fraction": 1.0,
+  "random_seed": 43,
+  "num_aps": 3,
+  "min_ap_separation": 2.0,
+  "optimize_orientation": true,
+  "reflector_enabled": false,
+  "focal_z": 1.5,
+  "demand_config": {
+    "enabled": true,
+    "bounding_boxes": [
+      [[5.5, 36.0], [11.0, 5.0]],
+      [[12.0, 46.0], [36.0, 38.0]],
+      [[40.0, 26.0], [46.0, 5.0]],
+      [[16.0, 35.0], [36.0, 11.0]]
+    ],
+    "box_weights": [5.0, 5.0, 5.0, 8.0],
+    "apply_blur": false
+  },
+  "objective_params": {
+    "alpha": 2.0,
+    "beta": 0.1,
+    "softmin_temperature": 0.3,
+    "softmin_floor_dbm": -85.0,
+    "softmin_ceil_dbm": -45.0,
+    "coverage_threshold_dbm": -70.0,
+    "coverage_temperature": 1.0
+  },
+  "ga_params": {
+    "pop_size": 120,
+    "n_gen": 30,
+    "cxpb": 0.6,
+    "mutpb": 0.4,
+    "tournsize": 50,
+    "hof_size": 20
+  },
+  "ga_evaluation_params": {
+    "samples_per_tx": 1000000,
+    "max_depth": 13,
+    "verbose": false
+  },
+  "gd_optimization_params": {
+    "num_iterations": 100,
+    "learning_rate": 0.01,
+    "samples_per_tx": 1000000,
+    "max_depth": 13,
+    "verbose": false
+  },
+  "random_params": {
+    "num_samples": 150
+  },
+  "kmeans_params": {
+    "grid_size": 300
+  },
+  "random_gd_params": {
+    "num_samples": 10
+  },
+  "pso_params": {
+    "swarm_size": 120,
+    "num_iterations": 30,
+    "w": 0.6,
+    "c1": 1.6,
+    "c2": 1.6
+  },
+  "k_seeds": 2,
+  "d_corr": 0.0,
+  "camera": {
+    "position": [25.0, 25.0, 80.0],
+    "look_at": [25.0, 25.1, 1.5]
+  },
+  "coverage_plot_settings": {
+    "samples_per_tx": 1000000,
+    "max_depth": 13,
+    "resolution": [1200, 900],
+    "render_ga_generation_best_coverage_maps": false,
+    "render_gd_trajectory_coverage_maps": false
+  },
+  "output_dir": "tmp_comparison_results/experiments",
+  "verbose": true
+}
