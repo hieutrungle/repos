@@ -329,10 +329,10 @@ def _extract_physical_metric_fields(d: Mapping[str, Any], prefix: str) -> Dict[s
         f"{prefix}min_rssi": d.get("min_rss_dbm"),
         f"{prefix}p5_rssi": d.get("p5_rss_dbm"),
         f"{prefix}coverage_pct": d.get("coverage_pct"),
-        f"{prefix}region_mean_rssi": d.get("region_mean_rss_dbm", d.get("weighted_mean_rss_dbm")),
-        f"{prefix}region_min_rssi": d.get("region_min_rss_dbm", d.get("weighted_min_rss_dbm")),
-        f"{prefix}region_p5_rssi": d.get("region_p5_rss_dbm", d.get("weighted_p5_rss_dbm")),
-        f"{prefix}region_coverage_pct": d.get("region_coverage_pct", d.get("weighted_coverage_pct")),
+        f"{prefix}priority_mean_rssi": d.get("priority_mean_rss_dbm"),
+        f"{prefix}priority_min_rssi": d.get("priority_min_rss_dbm"),
+        f"{prefix}priority_p5_rssi": d.get("priority_p5_rss_dbm"),
+        f"{prefix}priority_coverage_pct": d.get("priority_coverage_pct"),
     }
 
 
@@ -363,8 +363,8 @@ def _summarize_trial(
 
         Physical metrics reported:
         - unweighted: mean_rssi, min_rssi, p5_rssi, coverage_pct
-        - region    : region_mean_rssi, region_min_rssi,
-            region_p5_rssi, region_coverage_pct
+        - priority  : priority_mean_rssi, priority_min_rssi,
+            priority_p5_rssi, priority_coverage_pct
     Loss components reported : softmin_loss, coverage_loss, repulsion_loss
     """
     result = result or {}
@@ -521,16 +521,16 @@ def _write_trial_trends(
                 "min_rssi": pm.get("min_rss_dbm"),
                 "p5_rssi": pm.get("p5_rss_dbm"),
                 "coverage_pct": pm.get("coverage_pct"),
-                "region_mean_rssi": pm.get("region_mean_rss_dbm", pm.get("weighted_mean_rss_dbm")),
-                "region_min_rssi": pm.get("region_min_rss_dbm", pm.get("weighted_min_rss_dbm")),
-                "region_p5_rssi": pm.get("region_p5_rss_dbm", pm.get("weighted_p5_rss_dbm")),
-                "region_coverage_pct": pm.get("region_coverage_pct", pm.get("weighted_coverage_pct")),
+                "priority_mean_rssi": pm.get("priority_mean_rss_dbm"),
+                "priority_min_rssi": pm.get("priority_min_rss_dbm"),
+                "priority_p5_rssi": pm.get("priority_p5_rss_dbm"),
+                "priority_coverage_pct": pm.get("priority_coverage_pct"),
             })
         gd_fieldnames = [
             "step", "primary_loss", "softmin_loss", "coverage_loss",
             "repulsion_loss", "mean_rssi", "min_rssi", "p5_rssi", "coverage_pct",
-            "region_mean_rssi", "region_min_rssi", "region_p5_rssi",
-            "region_coverage_pct",
+            "priority_mean_rssi", "priority_min_rssi", "priority_p5_rssi",
+            "priority_coverage_pct",
         ]
         _write_csv(trends_dir / f"{trial_name}_gd_history.csv", gd_rows, gd_fieldnames)
 
@@ -751,10 +751,10 @@ def main() -> int:
             "ga_best_min_rssi",
             "ga_best_p5_rssi",
             "ga_best_coverage_pct",
-            "ga_best_region_mean_rssi",
-            "ga_best_region_min_rssi",
-            "ga_best_region_p5_rssi",
-            "ga_best_region_coverage_pct",
+            "ga_best_priority_mean_rssi",
+            "ga_best_priority_min_rssi",
+            "ga_best_priority_p5_rssi",
+            "ga_best_priority_coverage_pct",
             # GD — initial snapshot (before any GD update)
             "gd_initial_primary_loss",
             "gd_initial_softmin_loss",
@@ -764,10 +764,10 @@ def main() -> int:
             "gd_initial_min_rssi",
             "gd_initial_p5_rssi",
             "gd_initial_coverage_pct",
-            "gd_initial_region_mean_rssi",
-            "gd_initial_region_min_rssi",
-            "gd_initial_region_p5_rssi",
-            "gd_initial_region_coverage_pct",
+            "gd_initial_priority_mean_rssi",
+            "gd_initial_priority_min_rssi",
+            "gd_initial_priority_p5_rssi",
+            "gd_initial_priority_coverage_pct",
             # GD — best snapshot (lowest primary loss)
             "gd_best_primary_loss",
             "gd_best_softmin_loss",
@@ -777,10 +777,10 @@ def main() -> int:
             "gd_best_min_rssi",
             "gd_best_p5_rssi",
             "gd_best_coverage_pct",
-            "gd_best_region_mean_rssi",
-            "gd_best_region_min_rssi",
-            "gd_best_region_p5_rssi",
-            "gd_best_region_coverage_pct",
+            "gd_best_priority_mean_rssi",
+            "gd_best_priority_min_rssi",
+            "gd_best_priority_p5_rssi",
+            "gd_best_priority_coverage_pct",
             # GD — final snapshot (last iteration)
             "gd_final_primary_loss",
             "gd_final_softmin_loss",
@@ -790,10 +790,10 @@ def main() -> int:
             "gd_final_min_rssi",
             "gd_final_p5_rssi",
             "gd_final_coverage_pct",
-            "gd_final_region_mean_rssi",
-            "gd_final_region_min_rssi",
-            "gd_final_region_p5_rssi",
-            "gd_final_region_coverage_pct",
+            "gd_final_priority_mean_rssi",
+            "gd_final_priority_min_rssi",
+            "gd_final_priority_p5_rssi",
+            "gd_final_priority_coverage_pct",
             # Timing and counts
             "ga_duration_sec",
             "gd_duration_sec",
