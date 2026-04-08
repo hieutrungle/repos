@@ -17,7 +17,7 @@ collisions during concurrent evaluations.
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Mapping, Optional, Tuple, Union
 
 import numpy as np
 import sionna.rt
@@ -29,10 +29,96 @@ from .reflector_model import (
 )
 
 
+def _coerce_position_bounds(
+    position_bounds: Optional[Mapping[str, float]],
+) -> Optional[Tuple[float, float, float, float]]:
+    """Return (x_min, x_max, y_min, y_max) when bounds are valid."""
+    if not isinstance(position_bounds, Mapping):
+        return None
+
+    required_keys = ("x_min", "x_max", "y_min", "y_max")
+    if not all(key in position_bounds for key in required_keys):
+        return None
+
+    x_min = float(position_bounds["x_min"])
+    x_max = float(position_bounds["x_max"])
+    y_min = float(position_bounds["y_min"])
+    y_max = float(position_bounds["y_max"])
+
+    if x_min >= x_max or y_min >= y_max:
+        raise ValueError("position_bounds must satisfy x_min < x_max and y_min < y_max")
+
+    return x_min, x_max, y_min, y_max
+
+
+def _resolve_tx_positions(
+    tx_positions: Optional[List[Tuple[float, float, float]]],
+    num_aps: Optional[int],
+    position_bounds: Optional[Mapping[str, float]],
+    default_z: float = 3.8,
+) -> List[Tuple[float, float, float]]:
+    """Resolve final transmitter positions used to instantiate scene TX nodes.
+
+    Rules:
+    - If ``num_aps`` is not provided, use all provided positions.
+    - If provided positions >= ``num_aps``, keep the first ``num_aps``.
+    - If provided positions < ``num_aps``, append new positions sequentially.
+      Each appended XY is the mean of all existing XY positions plus the four
+      position-bound corners.
+    """
+    raw_positions = tx_positions if tx_positions is not None else [(25.0, 25.0, default_z)]
+
+    resolved: List[Tuple[float, float, float]] = []
+    for index, position in enumerate(raw_positions):
+        if not isinstance(position, (list, tuple, np.ndarray)) or len(position) != 3:
+            raise ValueError(
+                f"tx_positions[{index}] must be a length-3 sequence (x, y, z)"
+            )
+        resolved.append((float(position[0]), float(position[1]), float(position[2])))
+
+    if not resolved:
+        resolved = [(25.0, 25.0, float(default_z))]
+
+    if num_aps is None:
+        return resolved
+
+    target_num_aps = int(num_aps)
+    if target_num_aps <= 0:
+        raise ValueError(f"num_aps must be positive, got {target_num_aps}")
+
+    if len(resolved) >= target_num_aps:
+        return resolved[:target_num_aps]
+
+    bounds = _coerce_position_bounds(position_bounds)
+    if bounds is None:
+        raise ValueError(
+            "position_bounds with keys x_min/x_max/y_min/y_max is required when "
+            "num_aps exceeds available tx_positions"
+        )
+
+    x_min, x_max, y_min, y_max = bounds
+    corners_xy = [
+        (x_min, y_min),
+        (x_min, y_max),
+        (x_max, y_min),
+        (x_max, y_max),
+    ]
+
+    while len(resolved) < target_num_aps:
+        xs = [position[0] for position in resolved] + [corner[0] for corner in corners_xy]
+        ys = [position[1] for position in resolved] + [corner[1] for corner in corners_xy]
+        z_value = float(resolved[-1][2]) if resolved else float(default_z)
+        resolved.append((float(np.mean(xs)), float(np.mean(ys)), z_value))
+
+    return resolved
+
+
 def setup_building_floor_scene(
     scene_path: str,
     frequency: float = 5.18e9,
     tx_positions: Optional[List[Tuple[float, float, float]]] = None,
+    num_aps: Optional[int] = None,
+    position_bounds: Optional[Mapping[str, float]] = None,
     tx_power_dbm: float = 5.0,
     rx_position: Tuple[float, float, float] = (16.0, 16.5, 1.5),
     # --- reflector parameters (all optional) ---
@@ -59,6 +145,16 @@ def setup_building_floor_scene(
         Operating frequency in Hz (default 5.18 GHz).
     tx_positions : list of (float, float, float), optional
         Transmitter world positions.  Defaults to ``[(10, 20, 3.8)]``.
+    num_aps : int, optional
+        Number of AP transmitters to instantiate in the scene.
+        If smaller than ``len(tx_positions)``, only the first ``num_aps``
+        positions are used.
+        If larger than ``len(tx_positions)``, additional positions are
+        generated sequentially using the mean of existing positions and the
+        four corners from ``position_bounds``.
+    position_bounds : mapping, optional
+        Bounds with keys ``x_min``, ``x_max``, ``y_min``, ``y_max`` used when
+        auto-generating additional transmitter positions.
     tx_power_dbm : float
         Total transmitter power in dBm, split equally across APs.
     rx_position : tuple of float
@@ -106,13 +202,17 @@ def setup_building_floor_scene(
         polarization="VH",
     )
 
-    if tx_positions is None:
-        tx_positions = [(25.0, 25.0, 3.8)]
+    resolved_tx_positions = _resolve_tx_positions(
+        tx_positions=tx_positions,
+        num_aps=num_aps,
+        position_bounds=position_bounds,
+        default_z=3.8,
+    )
 
     n_txs = 1  # power-split kept at 1 AP for legacy compat
     power_per_tx = tx_power_dbm / n_txs
 
-    for i, (x, y, z) in enumerate(tx_positions):
+    for i, (x, y, z) in enumerate(resolved_tx_positions):
         # yaw = i * 2 * np.pi / n_txs
         tx = Transmitter(
             name=f"Tx{i:02d}",
@@ -163,7 +263,7 @@ def setup_building_floor_scene(
     scene.edit(add=reflector_obj)
 
     # 4d. Controller
-    tx_pos_arr = np.asarray(tx_positions[0], dtype=np.float32)
+    tx_pos_arr = np.asarray(resolved_tx_positions[0], dtype=np.float32)
 
     controller = ReflectorController(
         reflector=reflector_obj,
