@@ -9,12 +9,6 @@ __version__ = "0.1.0"
 
 from .optimizers import (
     BaseAPOptimizer,
-    SinglePointGridSearchOptimizer,
-    generate_alternating_grid_tasks,
-    generate_reflector_grid_tasks,
-    GradientDescentAPOptimizer,
-    OptimizerFactory,
-    create_optimizer,
 )
 from .scene_setup import setup_building_floor_scene, create_camera
 from .reflector_model import ReflectorController, create_flat_reflector_mesh
@@ -43,12 +37,6 @@ __all__ = [
     "__version__",
     # Optimizers
     "BaseAPOptimizer",
-    "SinglePointGridSearchOptimizer",
-    "generate_alternating_grid_tasks",
-    "generate_reflector_grid_tasks",
-    "GradientDescentAPOptimizer",
-    "OptimizerFactory",
-    "create_optimizer",
     # Scene setup
     "setup_building_floor_scene",
     "create_camera",

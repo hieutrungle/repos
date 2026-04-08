@@ -76,7 +76,7 @@ def _fmt_value(value: Optional[float], precision: int = 2) -> str:
     return f"{float(value):.{precision}f}"
 
 
-def _fmt_position(position: Any) -> str:
+def _fmt_position(position: Optional[list]) -> str:
     """Format one or more 3D positions for report output."""
     if position is None:
         return "N/A"

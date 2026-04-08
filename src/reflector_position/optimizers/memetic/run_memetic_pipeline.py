@@ -592,6 +592,11 @@ def run_memetic_optimization(config_args: Mapping[str, Any]) -> Dict[str, Any]:
     reflector_enabled = bool(config_args.get("reflector_enabled", True))
     focal_z = float(config_args.get("focal_z", 1.5))
 
+    # Ensure worker-side scene construction can honor num_aps and generate
+    # extra TX positions inside configured position bounds when needed.
+    scene_config["num_aps"] = num_aps
+    scene_config["position_bounds"] = dict(position_bounds)
+
     ga_params = dict(config_args.get("ga_params", {}))
     k_seeds = int(config_args.get("k_seeds", 5))
     d_corr = float(config_args.get("d_corr", 3.0))

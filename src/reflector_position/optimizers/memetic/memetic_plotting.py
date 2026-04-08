@@ -318,7 +318,7 @@ def _select_secondary_metric(result: Mapping[str, Any]) -> Tuple[str, List[float
     return "physical_metric", []
 
 
-def _fmt_dir(direction: Any) -> str:
+def _fmt_dir(direction: Optional[list]) -> str:
     """Format one or more direction vectors for display."""
     if direction is None:
         return "N/A"
@@ -331,7 +331,7 @@ def _fmt_dir(direction: Any) -> str:
     return f"({direction[0]:+.4f}, {direction[1]:+.4f}, {direction[2]:+.4f})"
 
 
-def _fmt_pos(position: Any) -> str:
+def _fmt_pos(position: Optional[list]) -> str:
     """Format one or more positions for display."""
     if position is None:
         return "N/A"

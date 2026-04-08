@@ -26,7 +26,6 @@ from reflector_position.optimizers.memetic.memetic_ga_evaluator import (
 from reflector_position.optimizers.memetic.memetic_gd_optimizer import (
     MemeticGradientDescentOptimizer,
 )
-from reflector_position.optimizers.optimizer_factory import OptimizerFactory
 
 
 def _to_serializable(value: Any) -> Any:
@@ -83,6 +82,8 @@ class RawOptimizationWorker:
             scene_path=str(scene_config["scene_path"]),
             frequency=scene_config.get("frequency", 6e9),
             tx_positions=scene_config.get("tx_positions", None),
+            num_aps=scene_config.get("num_aps", None),
+            position_bounds=scene_config.get("position_bounds", None),
             tx_power_dbm=scene_config.get("tx_power_dbm", 5.0),
             rx_position=scene_config.get("rx_position", (16.0, 16.5, 1.5)),
             reflector_enabled=scene_config.get("reflector_enabled", False),
@@ -307,20 +308,9 @@ class RawOptimizationWorker:
                 optimization_params=optimization_params,
             )
 
-        optimizer_kwargs_local = self._prepare_optimizer_kwargs(optimizer_kwargs)
-        optimizer = self._create_optimizer(optimizer_method, optimizer_kwargs_local)
-
-        start_time = time.time()
-        optimizer_result = optimizer.optimize(**optimization_params)
-        elapsed_time = time.time() - start_time
-        return self._build_raw_output(
-            task_id=task_id,
-            optimizer_method=optimizer_method,
-            optimizer_kwargs=optimizer_kwargs,
-            optimization_params=optimization_params,
-            optimizer=optimizer,
-            optimizer_result=optimizer_result,
-            elapsed_time=elapsed_time,
+        raise ValueError(
+            "RawOptimizationWorker supports only memetic methods: "
+            f"received optimizer_method={optimizer_method!r}"
         )
 
     def _run_memetic_eval(
@@ -397,37 +387,6 @@ class RawOptimizationWorker:
             optimizer=optimizer,
             optimizer_result=optimizer_result,
             elapsed_time=elapsed_time,
-        )
-
-    def _prepare_optimizer_kwargs(self, optimizer_kwargs: Dict[str, Any]) -> Dict[str, Any]:
-        """Prepare per-task optimizer kwargs for local worker execution."""
-        optimizer_kwargs_local = dict(optimizer_kwargs)
-
-        # Reuse per-worker reflector controller instead of serializing it in tasks.
-        if self.reflector_controller is not None and "reflector_controller" not in optimizer_kwargs_local:
-            optimizer_kwargs_local["reflector_controller"] = self.reflector_controller
-
-        # Build percentile objective in-worker from scalar quantile payload.
-        if (
-            "percentile_target_quantile" in optimizer_kwargs_local
-            and "percentile_objective" not in optimizer_kwargs_local
-        ):
-            from reflector_position.metrics import PercentileCoverageObjective
-
-            target_quantile = float(optimizer_kwargs_local.pop("percentile_target_quantile"))
-            optimizer_kwargs_local["percentile_objective"] = PercentileCoverageObjective(
-                target_quantile=target_quantile,
-                mode="maximize",
-            )
-
-        return optimizer_kwargs_local
-
-    def _create_optimizer(self, optimizer_method: str, optimizer_kwargs: Dict[str, Any]) -> Any:
-        """Instantiate optimizer for one task."""
-        return OptimizerFactory.create(
-            method=optimizer_method,
-            scene=self.scene,
-            **optimizer_kwargs,
         )
 
     def _build_raw_output(
