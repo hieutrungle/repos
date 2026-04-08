@@ -55,7 +55,7 @@ def test_generate_gd_tasks_from_seeds_schema_2ap_reflector() -> None:
 
         # Orientation mapping (bridge alias + GD-compatible key)
         assert "initial_orientations" in task
-        assert "initial_directions_xy" in task
+        assert "initial_directions_xyz" in task
 
         # Reflector mapping
         assert "reflector_u" in task
@@ -69,11 +69,12 @@ def test_generate_gd_tasks_from_seeds_schema_2ap_reflector() -> None:
 
         # 2-AP shape checks
         assert len(task["initial_positions"]) == 2
-        assert len(task["initial_directions_xy"]) == 2
+        assert len(task["initial_directions_xyz"]) == 2
 
     # Specific value checks for first task
     assert tasks[0]["initial_positions"] == [(10.0, 12.0), (22.0, 24.0)]
     assert tasks[0]["fixed_z"] == 3.8
+    assert tasks[0]["initial_directions_xyz"] == [(0.1, 0.9, -0.4), (-0.8, 0.3, -0.5)]
     assert tasks[0]["reflector_u"] == 0.25
     assert tasks[0]["reflector_v"] == 0.75
     assert tasks[0]["reflector_target"] == (20.0, 20.0, 1.5)

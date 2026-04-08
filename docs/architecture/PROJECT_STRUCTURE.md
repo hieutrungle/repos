@@ -9,7 +9,6 @@ reflector-position/
 │
 ├── src/reflector_position/          # Main package source code
 │   ├── __init__.py                  # Package initialization & exports
-│   ├── cli.py                       # Command-line interface
 │   ├── config.py                    # Configuration dataclasses
 │   ├── metrics.py                   # RSS metrics (min, soft-min, coverage)
 │   ├── scene_setup.py               # Scene loading & configuration
@@ -54,29 +53,23 @@ reflector-position/
    - Version information
    - Convenience imports
 
-2. **`cli.py`** - Command-line interface
-   - Argument parsing
-   - Method selection (grid-search, gradient-descent, all)
-   - Progress reporting
-   - Results comparison
-
-3. **`config.py`** - Configuration management
+2. **`config.py`** - Configuration management
    - `SceneConfig`: Scene setup parameters
    - `GridSearchConfig`: Grid search parameters
    - `GradientDescentConfig`: Gradient descent parameters
    - `OptimizationConfig`: Complete configuration container
 
-4. **`metrics.py`** - RSS metrics
+3. **`metrics.py`** - RSS metrics
    - `compute_min_rss_metric()`: Hard minimum RSS
    - `compute_soft_min_rss_metric()`: Differentiable soft minimum
    - `compute_coverage_metric()`: Coverage area calculation
    - `rss_to_dbm()`: Unit conversion
 
-5. **`scene_setup.py`** - Scene configuration
+4. **`scene_setup.py`** - Scene configuration
    - `setup_building_floor_scene()`: Load and configure scene
    - `create_camera()`: Camera for visualization
 
-6. **`utils.py`** - Utility functions
+5. **`utils.py`** - Utility functions
    - `compute_radio_map_with_tx_position()`: Radio map computation
 
 #### Optimizers (`src/reflector_position/optimizers/`)
@@ -121,7 +114,7 @@ reflector-position/
    - Troubleshooting
 
 3. **`USAGE.md`** - Usage guide
-   - CLI examples
+   - Script launcher and Python API examples
    - Python API examples
    - Advanced usage
    - Tips and best practices
@@ -134,19 +127,18 @@ Modern Python packaging configuration:
 - Project metadata
 - Dependencies
 - Development tools (black, ruff, pytest)
-- CLI entry points
+- Script launchers (root and `scripts/`)
 
-### Entry Points
+### Script Launchers
 
-The package defines a CLI entry point:
-```toml
-[project.scripts]
-reflector-optimize = "reflector_position.cli:main"
-```
-
-After installation, you can run:
+The repository uses script launchers instead of a packaged console entry point.
+Use:
 ```bash
-reflector-optimize scene.xml --method gradient-descent
+python run_memetic_pipeline.py --config configs/memetic_pipeline_config.json
+
+python scripts/run_memetic_hparam_sweep.py \
+   --base-config configs/memetic_pipeline_config.json \
+   --sweep-config configs/memetic_hparam_sweep.example.json
 ```
 
 ## Migration from Notebook
@@ -176,10 +168,10 @@ The code has been refactored from [building_floor.ipynb](../notebooks/building_f
 
 ### What was added:
 
-1. **CLI interface** (`cli.py`)
-   - Argument parsing
-   - Method selection
-   - Progress reporting
+1. **Script launchers** (`run_memetic_pipeline.py`, `scripts/*.py`)
+   - Config-driven execution from repository root
+   - Batch sweep orchestration
+   - Helper flags (`--help`, `--hints`)
 
 2. **Configuration management** (`config.py`)
    - Structured configuration
@@ -238,7 +230,7 @@ The code has been refactored from [building_floor.ipynb](../notebooks/building_f
    - Version control ready
 
 4. **Usability**
-   - CLI for quick experiments
+   - Script launchers for quick experiments
    - API for integration
    - Examples for learning
 
@@ -253,8 +245,8 @@ pip install -e .
 # Run quick test
 python examples/quick_test.py
 
-# Use CLI for experiments
-reflector-optimize scene.xml --method gradient-descent --gd-iterations 5
+# Run configured experiments
+python run_memetic_pipeline.py --config configs/memetic_pipeline_config.json
 
 # Format code
 black src/ examples/
