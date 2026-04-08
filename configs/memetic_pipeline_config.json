@@ -52,13 +52,13 @@
     "alpha": 2.0,
     "beta": 0.1,
     "softmin_temperature": 0.2,
-    "softmin_floor_dbm": -100.0,
+    "softmin_floor_dbm": -80.0,
     "softmin_ceil_dbm": -50.0,
     "coverage_threshold_dbm": -70.0,
     "coverage_temperature": 1.0
   },
   "ga_params": {
-    "pop_size": 70,
+    "pop_size": 100,
     "n_gen": 20,
     "cxpb": 0.6,
     "mutpb": 0.4,

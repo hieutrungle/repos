@@ -7,7 +7,10 @@
       [10.0, 15.0, 3.8],
       [25.0, 30.0, 3.8],
       [40.0, 25.0, 3.8],
-      [41.0, 7.0, 3.8] 
+      [30.0, 10.0, 3.8],
+      [20.0, 40.0, 3.8],  
+      [35.0, 35.0, 3.8],
+      [15.0, 25.0, 3.8]
     ],
     "reflector_enabled": false,
     "reflector_size": [2.0, 2.0],
@@ -34,7 +37,7 @@
   "num_pool_workers": 1,
   "gpu_fraction": 1.0,
   "random_seed": 43,
-  "num_aps": 4,
+  "num_aps": 3,
   "min_ap_separation": 2.0,
   "optimize_orientation": true,
   "reflector_enabled": false,
@@ -60,7 +63,7 @@
     "coverage_temperature": 1.0
   },
   "ga_params": {
-    "pop_size": 150,
+    "pop_size": 120,
     "n_gen": 20,
     "cxpb": 0.6,
     "mutpb": 0.4,
