@@ -16,6 +16,9 @@ Outputs are written under one timestamped sweep folder and include:
     - mean_rss_dbm, min_rss_dbm, p5_rss_dbm
     - priority_mean_rss_dbm, priority_min_rss_dbm, priority_p5_rss_dbm
 
+By default, all plots use the same fixed y-axis range [-100, -40] dBm for
+easy comparison. You can override this range with --y-min and --y-max.
+
 This script runs the memetic pipeline for each pair in:
 - AP count list (num_aps)
 - random seed list
@@ -43,7 +46,7 @@ import traceback
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import matplotlib
 import numpy as np
@@ -83,6 +86,14 @@ _METRIC_LABELS = {
     "priority_min_rss_dbm": "Min RSSI (Priority Region)",
     "priority_p5_rss_dbm": "P5 RSSI (Priority Region)",
 }
+
+_COMPARISON_METRIC_PAIRS = (
+    ("mean_rss_dbm", "priority_mean_rss_dbm", "Mean RSSI"),
+    ("min_rss_dbm", "priority_min_rss_dbm", "Min RSSI"),
+    ("p5_rss_dbm", "priority_p5_rss_dbm", "P5 RSSI"),
+)
+
+_DEFAULT_PLOT_Y_RANGE = (-100.0, -40.0)
 
 
 def _load_json(path: Path) -> Dict[str, Any]:
@@ -205,34 +216,62 @@ def _summarize_metric_values(values: Sequence[float]) -> Dict[str, Optional[floa
 
 def _plot_metric_with_std(
     aggregate_rows: Sequence[Mapping[str, Any]],
-    mean_field: str,
-    std_field: str,
-    metric_label: str,
+    series_specs: Sequence[Mapping[str, Any]],
     save_path: Path,
     title: str,
+    y_axis_label: str = "RSSI (dBm)",
+    y_limits: Optional[Tuple[float, float]] = None,
 ) -> bool:
-    """Plot one metric mean curve with +/- std shading across AP counts."""
-    plotted_rows = [row for row in aggregate_rows if row.get(mean_field) is not None]
-    if not plotted_rows:
+    """Plot one or more metric mean curves with +/- std shading across AP counts."""
+    if not series_specs:
         return False
 
-    x = np.asarray([int(row["num_aps"]) for row in plotted_rows], dtype=np.int64)
-    y = np.asarray([float(row[mean_field]) for row in plotted_rows], dtype=np.float64)
-    std = np.asarray([float(row.get(std_field) or 0.0) for row in plotted_rows], dtype=np.float64)
-
     fig, ax = plt.subplots(figsize=(9, 5))
-    ax.plot(x, y, marker="o", linewidth=2.2, label=f"Mean {metric_label}")
-    ax.fill_between(
-        x,
-        y - std,
-        y + std,
-        alpha=0.2,
-        label="+-1 std",
-    )
+    plotted_any = False
+
+    for series in series_specs:
+        mean_field = str(series.get("mean_field", ""))
+        std_field = str(series.get("std_field", ""))
+        label = str(series.get("label", mean_field))
+        color = series.get("color")
+        linestyle = str(series.get("linestyle", "-"))
+
+        plotted_rows = [row for row in aggregate_rows if row.get(mean_field) is not None]
+        if not plotted_rows:
+            continue
+
+        x = np.asarray([int(row["num_aps"]) for row in plotted_rows], dtype=np.int64)
+        y = np.asarray([float(row[mean_field]) for row in plotted_rows], dtype=np.float64)
+        std = np.asarray([float(row.get(std_field) or 0.0) for row in plotted_rows], dtype=np.float64)
+
+        ax.plot(
+            x,
+            y,
+            marker="o",
+            linewidth=2.2,
+            linestyle=linestyle,
+            color=color,
+            label=label,
+        )
+        ax.fill_between(
+            x,
+            y - std,
+            y + std,
+            alpha=0.16,
+            color=color,
+        )
+        plotted_any = True
+
+    if not plotted_any:
+        plt.close(fig)
+        return False
+
     ax.xaxis.set_major_locator(MaxNLocator(integer=True))
     ax.set_xlabel("Number of APs")
-    ax.set_ylabel(f"{metric_label} (dBm)")
+    ax.set_ylabel(y_axis_label)
     ax.set_title(title)
+    if y_limits is not None:
+        ax.set_ylim(float(y_limits[0]), float(y_limits[1]))
     ax.grid(True, alpha=0.3)
     ax.legend(loc="best")
     fig.tight_layout()
@@ -345,6 +384,18 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable verbose memetic pipeline logging per run.",
     )
+    parser.add_argument(
+        "--y-min",
+        type=float,
+        default=_DEFAULT_PLOT_Y_RANGE[0],
+        help="Shared y-axis lower limit for all generated plots.",
+    )
+    parser.add_argument(
+        "--y-max",
+        type=float,
+        default=_DEFAULT_PLOT_Y_RANGE[1],
+        help="Shared y-axis upper limit for all generated plots.",
+    )
     return parser.parse_args()
 
 
@@ -385,6 +436,10 @@ def main() -> int:
     if not seeds:
         raise ValueError("Seed list must not be empty")
 
+    if float(args.y_min) >= float(args.y_max):
+        raise ValueError("--y-min must be smaller than --y-max")
+    y_limits = (float(args.y_min), float(args.y_max))
+
     configured_output_root = args.output_dir or str(base_config.get("output_dir", "results/experiments"))
     output_root = Path(configured_output_root).expanduser().resolve() / (
         "num_aps_seed_sweep_" + datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -397,6 +452,7 @@ def main() -> int:
     print(f"[sweep] seeds: {seeds}")
     print(f"[sweep] metric: {args.rssi_metric}")
     print(f"[sweep] plotted metric keys: {list(_PLOT_METRIC_KEYS)}")
+    print(f"[sweep] fixed y-axis range: {y_limits}")
 
     run_rows: List[Dict[str, Any]] = []
     aggregate_rows: List[Dict[str, Any]] = []
@@ -554,36 +610,73 @@ def main() -> int:
             "output_root": str(output_root),
             "metric_key": args.rssi_metric,
             "plot_metric_keys": list(_PLOT_METRIC_KEYS),
+            "comparison_metric_pairs": [
+                {
+                    "all_metric": all_metric,
+                    "priority_metric": priority_metric,
+                    "title": title,
+                }
+                for all_metric, priority_metric, title in _COMPARISON_METRIC_PAIRS
+            ],
+            "plot_y_range": {
+                "y_min": y_limits[0],
+                "y_max": y_limits[1],
+            },
             "num_aps_values": num_aps_values,
             "seeds": seeds,
             "aggregate": aggregate_rows,
         },
     )
 
-    for metric_key in _PLOT_METRIC_KEYS:
-        metric_label = _METRIC_LABELS.get(metric_key, metric_key)
-        metric_plot_path = output_root / f"num_aps_vs_{metric_key}.png"
+    for all_metric_key, priority_metric_key, metric_title in _COMPARISON_METRIC_PAIRS:
+        comparison_plot_path = output_root / f"num_aps_vs_{all_metric_key}_all_vs_priority.png"
         if _plot_metric_with_std(
             aggregate_rows=aggregate_rows,
-            mean_field=f"{metric_key}_mean",
-            std_field=f"{metric_key}_std",
-            metric_label=metric_label,
-            save_path=metric_plot_path,
-            title=f"AP Count Sweep: {metric_label} vs Number of APs",
+            series_specs=[
+                {
+                    "mean_field": f"{all_metric_key}_mean",
+                    "std_field": f"{all_metric_key}_std",
+                    "label": _METRIC_LABELS.get(all_metric_key, all_metric_key),
+                    "color": "tab:blue",
+                    "linestyle": "-",
+                },
+                {
+                    "mean_field": f"{priority_metric_key}_mean",
+                    "std_field": f"{priority_metric_key}_std",
+                    "label": _METRIC_LABELS.get(priority_metric_key, priority_metric_key),
+                    "color": "tab:orange",
+                    "linestyle": "--",
+                },
+            ],
+            save_path=comparison_plot_path,
+            title=f"AP Count Sweep: {metric_title} (All vs Priority)",
+            y_axis_label="RSSI (dBm)",
+            y_limits=y_limits,
         ):
-            print(f"[plot] saved: {metric_plot_path}")
+            print(f"[plot] saved: {comparison_plot_path}")
         else:
-            print(f"[plot] skipped metric {metric_key}: no successful runs with metric values")
+            print(
+                "[plot] skipped comparison "
+                f"{all_metric_key} vs {priority_metric_key}: no successful runs with metric values"
+            )
 
     if args.rssi_metric not in _PLOT_METRIC_KEYS:
         extra_plot_path = output_root / f"num_aps_vs_{args.rssi_metric}.png"
         if _plot_metric_with_std(
             aggregate_rows=aggregate_rows,
-            mean_field="mean_rssi",
-            std_field="std_rssi",
-            metric_label=args.rssi_metric,
+            series_specs=[
+                {
+                    "mean_field": "mean_rssi",
+                    "std_field": "std_rssi",
+                    "label": args.rssi_metric,
+                    "color": "tab:green",
+                    "linestyle": "-",
+                }
+            ],
             save_path=extra_plot_path,
             title=f"AP Count Sweep: {args.rssi_metric} vs Number of APs",
+            y_axis_label="RSSI (dBm)",
+            y_limits=y_limits,
         ):
             print(f"[plot] saved extra metric: {extra_plot_path}")
         else:
