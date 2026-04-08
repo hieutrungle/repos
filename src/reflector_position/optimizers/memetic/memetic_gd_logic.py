@@ -36,6 +36,7 @@ _GD_NON_INIT_TASK_KEYS = {
     "scene_config",
     "initial_orientations",  # bridge alias (3D), GD expects initial_directions_xyz
     "initial_primary_loss",  # analysis metadata
+    "loss_kwargs",  # static-eval payload key, not GD optimizer init arg
     "ga_seed_index",
     "ga_seed_rank",
     "ga_seed_primary_fitness",
@@ -434,11 +435,16 @@ def run_targeted_gd_exploitation(
             f"{metrics['min_loss_reduction'] if metrics['min_loss_reduction'] is not None else 'N/A'}"
         )
         if global_best_result is not None:
+            best_primary_loss_txt = (
+                f"{float(best_primary_loss):.6f}"
+                if best_primary_loss is not None
+                else "N/A"
+            )
             print(
                 "Global best GD: "
                 f"task #{global_best_result.get('task_id')} | "
                 f"worker #{global_best_result.get('worker_id')} | "
-                f"primary_loss={float(best_primary_loss):.6f}"
+                f"primary_loss={best_primary_loss_txt}"
             )
             best_components = _extract_best_loss_components(global_best_result)
             if best_components:
