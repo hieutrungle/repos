@@ -1304,7 +1304,11 @@ def main() -> int:
 
     for num_aps in ap_values:
         for seed in seeds:
-            print(f"[run] AP={num_aps} | seed={seed}")
+            run_name = f"aps_{int(num_aps):02d}_seed_{int(seed)}"
+            print(
+                f"[run] start num_aps={int(num_aps)}, seed={int(seed)}, "
+                f"run_name={run_name}"
+            )
             trial_config = _build_trial_config(
                 base_config=base_config,
                 num_aps=num_aps,
@@ -1400,6 +1404,34 @@ def main() -> int:
                         },
                     )
                     print(f"[run] {method} failed for AP={num_aps}, seed={seed}: {error_text}")
+
+            trial_mean_rss_values: List[float] = []
+            for method in methods:
+                run_entry = store.get(method, {}).get(str(int(num_aps)), {}).get(str(int(seed)), {})
+                if not isinstance(run_entry, Mapping):
+                    continue
+                if run_entry.get("status") != "ok":
+                    continue
+
+                metrics = run_entry.get("metrics", {})
+                if not isinstance(metrics, Mapping):
+                    continue
+
+                mean_rss_dbm = _as_float(metrics.get("mean_rss_dbm"))
+                if mean_rss_dbm is not None:
+                    trial_mean_rss_values.append(float(mean_rss_dbm))
+
+            if trial_mean_rss_values:
+                trial_mean_rss_dbm = float(np.mean(trial_mean_rss_values))
+                print(
+                    f"[run] done  num_aps={int(num_aps)}, seed={int(seed)}, "
+                    f"mean_rss_dbm={trial_mean_rss_dbm:.4f}"
+                )
+            else:
+                print(
+                    f"[run] done  num_aps={int(num_aps)}, seed={int(seed)}, "
+                    "mean_rss_dbm=nan"
+                )
 
     metric_keys = {
         "primary_loss",
