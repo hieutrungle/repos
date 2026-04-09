@@ -316,6 +316,7 @@ def run_random_multi_start_gd(
     gd_params: Dict[str, Any],
     num_samples: int = 10,
     optimize_orientation: bool = True,
+    random_seed: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Run random multi-start generation followed by targeted GD exploitation.
 
@@ -328,6 +329,7 @@ def run_random_multi_start_gd(
         gd_params: Shared GD optimization parameters.
         num_samples: Number of random starts.
         optimize_orientation: Whether to include orientation vectors.
+        random_seed: Optional seed used to initialize numpy random generator.
 
     Returns:
         A formatted GA-schema-compatible baseline result dictionary.
@@ -346,7 +348,7 @@ def run_random_multi_start_gd(
 
     start_time = time.perf_counter()
 
-    rng = np.random.default_rng()
+    rng = np.random.default_rng(None if random_seed is None else int(random_seed))
     total_aps = int(num_aps)
     total_samples = int(num_samples)
 

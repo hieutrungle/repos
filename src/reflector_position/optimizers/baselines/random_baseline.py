@@ -94,6 +94,7 @@ def run_random_monte_carlo(
     y_bounds: Tuple[float, float],
     num_samples: int = 100,
     optimize_orientation: bool = True,
+    random_seed: Optional[int] = None,
     loss_kwargs: Optional[Mapping[str, Any]] = None,
     evaluation_params: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
@@ -107,6 +108,7 @@ def run_random_monte_carlo(
         y_bounds: Inclusive sampling bounds for y coordinates.
         num_samples: Number of random configurations to evaluate.
         optimize_orientation: Whether to sample and evaluate AP orientations.
+        random_seed: Optional seed used to initialize numpy random generator.
         loss_kwargs: Optional memetic objective kwargs forwarded to evaluator.
         evaluation_params: Optional evaluator runtime kwargs (samples/max depth).
 
@@ -126,7 +128,7 @@ def run_random_monte_carlo(
         raise ValueError(f"y_bounds must satisfy min < max, got {y_bounds}")
 
     start_time = time.perf_counter()
-    rng = np.random.default_rng()
+    rng = np.random.default_rng(None if random_seed is None else int(random_seed))
     total_aps = int(num_aps)
     total_samples = int(num_samples)
 

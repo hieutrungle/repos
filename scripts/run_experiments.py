@@ -994,6 +994,7 @@ def _save_method_trend_plot(method: str, trace_rows: Sequence[Mapping[str, Any]]
         yaxis_title="Primary Loss",
         template="plotly_white",
     )
+    figure.update_xaxes(tickmode="linear", tick0=1, dtick=1, tickformat="d")
 
     figure.write_html(str(plot_path), include_plotlyjs="cdn")
     return str(plot_path)
@@ -1061,6 +1062,7 @@ def _save_comparison_plot(
         yaxis_title="Running Best Primary Loss",
         template="plotly_white",
     )
+    figure.update_xaxes(tickmode="linear", tick0=1, dtick=1, tickformat="d")
     figure.write_html(str(plot_path), include_plotlyjs="cdn")
     return str(plot_path)
 

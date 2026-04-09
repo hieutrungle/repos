@@ -45,15 +45,15 @@
       [[40.0, 26.0], [46.0, 5.0]],
       [[16.0, 35.0], [36.0, 11.0]]
     ],
-    "box_weights": [5.0, 5.0, 5.0, 8.0],
+    "box_weights": [4.0, 4.0, 4.0, 6.0],
     "apply_blur": false
   },
   "objective_params": {
     "alpha": 2.0,
     "beta": 0.1,
     "softmin_temperature": 0.3,
-    "softmin_floor_dbm": -85.0,
-    "softmin_ceil_dbm": -45.0,
+    "softmin_floor_dbm": -90.0,
+    "softmin_ceil_dbm": -50.0,
     "coverage_threshold_dbm": -70.0,
     "coverage_temperature": 1.0
   },
@@ -62,7 +62,7 @@
     "n_gen": 30,
     "cxpb": 0.6,
     "mutpb": 0.4,
-    "tournsize": 50,
+    "tournsize": 60,
     "hof_size": 20
   },
   "ga_evaluation_params": {
@@ -72,7 +72,7 @@
   },
   "gd_optimization_params": {
     "num_iterations": 100,
-    "learning_rate": 0.01,
+    "learning_rate": 0.005,
     "samples_per_tx": 1000000,
     "max_depth": 13,
     "verbose": false
@@ -81,10 +81,10 @@
     "num_samples": 150
   },
   "kmeans_params": {
-    "grid_size": 300
+    "grid_size": 150
   },
   "random_gd_params": {
-    "num_samples": 10
+    "num_samples": 6
   },
   "pso_params": {
     "swarm_size": 120,

@@ -63,6 +63,7 @@ def run_kmeans_baseline(
     fixed_z: float,
     floorplan_coords: np.ndarray,
     optimize_orientation: bool = True,
+    random_seed: Optional[int] = None,
     loss_kwargs: Optional[Mapping[str, Any]] = None,
     evaluation_params: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
@@ -74,6 +75,7 @@ def run_kmeans_baseline(
         fixed_z: Shared AP height used by the evaluator.
         floorplan_coords: Valid floorplan samples as ``[N, 2]`` array.
         optimize_orientation: Whether to include AP orientation in the task.
+        random_seed: Optional seed forwarded to sklearn KMeans random_state.
         loss_kwargs: Optional memetic objective kwargs forwarded to evaluator.
         evaluation_params: Optional evaluator runtime kwargs (samples/max depth).
 
@@ -98,7 +100,10 @@ def run_kmeans_baseline(
 
     start_time = time.perf_counter()
 
-    kmeans = KMeans(n_clusters=total_aps)
+    kmeans = KMeans(
+        n_clusters=total_aps,
+        random_state=(None if random_seed is None else int(random_seed)),
+    )
     kmeans.fit(coords)
     centers = np.asarray(kmeans.cluster_centers_, dtype=np.float64)
 

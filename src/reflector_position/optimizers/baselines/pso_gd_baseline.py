@@ -371,6 +371,7 @@ def run_pso_gd_baseline(
     pso_params: Dict[str, Any],
     gd_params: Dict[str, Any],
     optimize_orientation: bool = True,
+    random_seed: Optional[int] = None,
     loss_kwargs: Optional[Mapping[str, Any]] = None,
     evaluation_params: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
@@ -398,7 +399,7 @@ def run_pso_gd_baseline(
         raise ValueError(f"num_iterations must be >= 1, got {num_iterations}")
 
     start_time = time.perf_counter()
-    rng = np.random.default_rng()
+    rng = np.random.default_rng(None if random_seed is None else int(random_seed))
 
     # Particle state: [swarm, num_aps, dim].
     positions = np.empty((swarm_size, total_aps, 2), dtype=np.float64)

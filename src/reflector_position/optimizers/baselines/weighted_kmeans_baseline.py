@@ -64,6 +64,7 @@ def run_weighted_kmeans_baseline(
     floorplan_coords: np.ndarray,
     spatial_weights: Optional[np.ndarray] = None,
     optimize_orientation: bool = True,
+    random_seed: Optional[int] = None,
     loss_kwargs: Optional[Mapping[str, Any]] = None,
     evaluation_params: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
@@ -76,6 +77,7 @@ def run_weighted_kmeans_baseline(
         floorplan_coords: Valid floorplan samples as ``[N, 2]`` array.
         spatial_weights: Optional per-sample spatial weighting vector.
         optimize_orientation: Whether to include AP orientation in the task.
+        random_seed: Optional seed forwarded to sklearn KMeans random_state.
         loss_kwargs: Optional memetic objective kwargs forwarded to evaluator.
         evaluation_params: Optional evaluator runtime kwargs (samples/max depth).
 
@@ -109,7 +111,11 @@ def run_weighted_kmeans_baseline(
 
     start_time = time.perf_counter()
 
-    kmeans = KMeans(n_clusters=total_aps, n_init=10)
+    kmeans = KMeans(
+        n_clusters=total_aps,
+        n_init=10,
+        random_state=(None if random_seed is None else int(random_seed)),
+    )
     if weights is not None:
         kmeans.fit(coords, sample_weight=weights)
     else:

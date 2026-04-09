@@ -16,8 +16,11 @@ try:  # pragma: no cover - plotting optional at runtime
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.ticker import MaxNLocator, StrMethodFormatter
 except Exception:  # pragma: no cover - plotting optional at runtime
     plt = None
+    MaxNLocator = None  # type: ignore[assignment]
+    StrMethodFormatter = None  # type: ignore[assignment]
 
 
 _PRIMARY_LOSS_KEYS: Tuple[str, ...] = (
@@ -106,11 +109,23 @@ def _extract_trace_series(
 def _expand_single_point_series(series: Sequence[float], target_len: int) -> List[float]:
     """Expand one-point series to a straight line across the target length."""
     values = [float(value) for value in series]
+    if len(values) == 1:
+        # A line-only plot with a single point appears blank in matplotlib.
+        # Duplicate the point so a short horizontal segment is visible.
+        if target_len <= 1:
+            return [values[0], values[0]]
+        return [values[0]] * int(target_len)
     if target_len <= 1:
         return values
-    if len(values) == 1:
-        return [values[0]] * int(target_len)
     return values
+
+
+def _set_integer_iteration_ticks(axis: Any) -> None:
+    """Set integer-only iteration ticks when matplotlib ticker tools are available."""
+    if MaxNLocator is None or StrMethodFormatter is None:
+        return
+    axis.xaxis.set_major_locator(MaxNLocator(integer=True))
+    axis.xaxis.set_major_formatter(StrMethodFormatter("{x:.0f}"))
 
 
 def _build_primary_loss_series(
@@ -201,6 +216,7 @@ def _plot_primary_loss_comparison(
     axis.set_title("Primary Loss Trend - All Methods (Static)")
     axis.set_xlabel("Iteration")
     axis.set_ylabel("Primary Loss")
+    _set_integer_iteration_ticks(axis)
     axis.grid(True, alpha=0.25)
     axis.legend(loc="best")
 
@@ -267,6 +283,7 @@ def _plot_per_method_rssi_triplets(
         axis.set_title(f"{method} RSSI Metric Trends (Static)")
         axis.set_xlabel("Iteration")
         axis.set_ylabel("RSSI (dBm)")
+        _set_integer_iteration_ticks(axis)
         axis.set_ylim(y_min, y_max)
         axis.grid(True, alpha=0.25)
         axis.legend(loc="best")
@@ -331,6 +348,7 @@ def _plot_cross_method_rssi_metrics(
         axis.set_title(f"{metric_label} Trend - All Methods (Static)")
         axis.set_xlabel("Iteration")
         axis.set_ylabel("RSSI (dBm)")
+        _set_integer_iteration_ticks(axis)
         axis.set_ylim(y_min, y_max)
         axis.grid(True, alpha=0.25)
         axis.legend(loc="best")
