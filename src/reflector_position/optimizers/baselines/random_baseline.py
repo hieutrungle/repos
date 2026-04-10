@@ -201,34 +201,24 @@ def run_random_monte_carlo(
             except (TypeError, ValueError):
                 task_id = iteration_idx - 1
 
-        mean_rss_dbm = (
-            _extract_physical_metric(raw_result, "mean_rss_dbm")
-            if isinstance(raw_result, Mapping)
-            else None
-        )
-        min_rss_dbm = (
-            _extract_physical_metric(raw_result, "min_rss_dbm")
-            if isinstance(raw_result, Mapping)
-            else None
-        )
-        p5_rss_dbm = (
-            _extract_physical_metric(raw_result, "p5_rss_dbm")
-            if isinstance(raw_result, Mapping)
-            else None
-        )
-
         trace_row: Dict[str, Any] = {
             "iteration": int(iteration_idx),
             "task_id": int(task_id),
             "primary_loss": float(candidate_loss),
             "running_best_primary_loss": float(running_best_loss),
         }
-        if mean_rss_dbm is not None:
-            trace_row["mean_rss_dbm"] = float(mean_rss_dbm)
-        if min_rss_dbm is not None:
-            trace_row["min_rss_dbm"] = float(min_rss_dbm)
-        if p5_rss_dbm is not None:
-            trace_row["p5_rss_dbm"] = float(p5_rss_dbm)
+        if isinstance(raw_result, Mapping):
+            for metric_key in (
+                "mean_rss_dbm",
+                "min_rss_dbm",
+                "p5_rss_dbm",
+                "priority_mean_rss_dbm",
+                "priority_min_rss_dbm",
+                "priority_p5_rss_dbm",
+            ):
+                metric_value = _extract_physical_metric(raw_result, metric_key)
+                if metric_value is not None:
+                    trace_row[metric_key] = float(metric_value)
 
         iteration_trace.append(trace_row)
 

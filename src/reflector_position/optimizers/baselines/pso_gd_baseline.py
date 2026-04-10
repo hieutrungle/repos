@@ -40,7 +40,14 @@ def _extract_selected_physical_metrics(result: Mapping[str, Any]) -> Dict[str, f
         return {}
 
     selected: Dict[str, float] = {}
-    for metric_key in ("mean_rss_dbm", "min_rss_dbm", "p5_rss_dbm"):
+    for metric_key in (
+        "mean_rss_dbm",
+        "min_rss_dbm",
+        "p5_rss_dbm",
+        "priority_mean_rss_dbm",
+        "priority_min_rss_dbm",
+        "priority_p5_rss_dbm",
+    ):
         raw_value = physical_metrics.get(metric_key)
         if raw_value is None:
             continue
@@ -237,6 +244,28 @@ def _extract_best_physical_metrics(global_best: Mapping[str, Any]) -> Dict[str, 
     return {}
 
 
+def _extract_spatial_weights(global_best: Mapping[str, Any]) -> Optional[List[List[float]]]:
+    """Extract 2-D spatial weights for priority-map plotting when available."""
+    raw_weights: Any = global_best.get("spatial_weights")
+    if raw_weights is None:
+        result_summary = global_best.get("results")
+        if isinstance(result_summary, Mapping):
+            raw_weights = result_summary.get("spatial_weights")
+
+    if raw_weights is None:
+        return None
+
+    try:
+        array = np.asarray(raw_weights, dtype=np.float64)
+    except Exception:
+        return None
+
+    if array.ndim != 2 or array.size == 0:
+        return None
+
+    return array.tolist()
+
+
 def _extract_best_positions(global_best: Mapping[str, Any]) -> Optional[List[Tuple[float, float]]]:
     """Extract best/final AP positions from GD outputs with robust fallbacks."""
     for key in ("final_positions", "best_positions", "positions"):
@@ -343,6 +372,13 @@ def _extract_gd_iteration_trace(global_best: Mapping[str, Any]) -> List[Dict[str
     if not isinstance(primary_series, Sequence):
         return []
 
+    physical_series = history.get("physical_metrics", [])
+    physical_rows: List[Any]
+    if isinstance(physical_series, Sequence):
+        physical_rows = list(physical_series)
+    else:
+        physical_rows = []
+
     trace: List[Dict[str, Any]] = []
     running_best = float("inf")
     for iteration_idx, raw_value in enumerate(primary_series, start=1):
@@ -352,14 +388,58 @@ def _extract_gd_iteration_trace(global_best: Mapping[str, Any]) -> List[Dict[str
             continue
 
         running_best = min(running_best, loss_value)
-        trace.append(
-            {
-                "iteration": int(iteration_idx),
-                "primary_loss": float(loss_value),
-                "running_best_primary_loss": float(running_best),
-            }
-        )
+        row: Dict[str, Any] = {
+            "iteration": int(iteration_idx),
+            "primary_loss": float(loss_value),
+            "running_best_primary_loss": float(running_best),
+        }
+
+        raw_metric_row: Optional[Mapping[str, Any]] = None
+        if (iteration_idx - 1) < len(physical_rows):
+            candidate = physical_rows[iteration_idx - 1]
+            if isinstance(candidate, Mapping):
+                raw_metric_row = candidate
+
+        if raw_metric_row is not None:
+            for metric_key in (
+                "mean_rss_dbm",
+                "min_rss_dbm",
+                "p5_rss_dbm",
+                "priority_mean_rss_dbm",
+                "priority_min_rss_dbm",
+                "priority_p5_rss_dbm",
+            ):
+                raw_metric_value = raw_metric_row.get(metric_key)
+                if raw_metric_value is None:
+                    continue
+                try:
+                    row[metric_key] = float(raw_metric_value)
+                except (TypeError, ValueError):
+                    continue
+
+        trace.append(row)
     return trace
+
+
+def _extract_loss_candidate(row: Mapping[str, Any]) -> Optional[float]:
+    """Extract one representative loss value from a PSO/GD trace row."""
+    for key in (
+        "running_best_primary_loss",
+        "global_best_primary_loss",
+        "swarm_best_primary_loss",
+        "min_primary_loss",
+        "primary_loss",
+        "swarm_mean_primary_loss",
+        "mean_primary_loss",
+    ):
+        raw_value = row.get(key)
+        if raw_value is None:
+            continue
+        try:
+            return float(raw_value)
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 def run_pso_gd_baseline(
@@ -590,26 +670,53 @@ def run_pso_gd_baseline(
         time_elapsed=float(elapsed),
     )
     gd_iteration_trace = _extract_gd_iteration_trace(global_best)
+    requested_gd_iterations = max(1, int(gd_params.get("num_iterations", 50)))
+    gd_iteration_trace = gd_iteration_trace[:requested_gd_iterations]
+
     combined_trace: List[Dict[str, Any]] = []
-    for row in pso_iteration_trace:
-        combined_trace.append(
-            {
-                "phase": "pso",
-                **row,
-            }
-        )
-    for row in gd_iteration_trace:
-        combined_trace.append(
-            {
-                "phase": "gd",
-                **row,
-            }
-        )
+    running_best = float("inf")
+
+    for iteration_idx, row in enumerate(pso_iteration_trace, start=1):
+        normalized = {
+            "phase": "pso",
+            **dict(row),
+            "iteration": int(iteration_idx),
+        }
+        candidate = _extract_loss_candidate(normalized)
+        if candidate is not None:
+            running_best = min(running_best, float(candidate))
+            normalized["running_best_primary_loss"] = float(running_best)
+        combined_trace.append(normalized)
+
+    gd_start_idx = len(combined_trace)
+    for offset, row in enumerate(gd_iteration_trace, start=1):
+        normalized = {
+            "phase": "gd",
+            **dict(row),
+            "iteration": int(gd_start_idx + offset),
+        }
+        candidate = _extract_loss_candidate(normalized)
+        if candidate is not None:
+            running_best = min(running_best, float(candidate))
+            normalized["running_best_primary_loss"] = float(running_best)
+        combined_trace.append(normalized)
 
     formatted["pso_iteration_trace"] = pso_iteration_trace
     formatted["gd_iteration_trace"] = gd_iteration_trace
     formatted["iteration_trace"] = combined_trace
     formatted["num_iterations"] = len(combined_trace)
+    formatted["num_gd_iterations"] = len(gd_iteration_trace)
+    formatted["position_bounds"] = {
+        "x_min": float(x_min),
+        "x_max": float(x_max),
+        "y_min": float(y_min),
+        "y_max": float(y_max),
+    }
+
+    spatial_weights = _extract_spatial_weights(global_best)
+    if spatial_weights is not None:
+        formatted["spatial_weights"] = spatial_weights
+
     if isinstance(gd_output, Mapping):
         formatted["gd_metrics"] = dict(gd_output.get("metrics", {}))
     return formatted

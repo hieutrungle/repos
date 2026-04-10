@@ -31,8 +31,8 @@
   "fixed_z": 3.8,
   "num_pool_workers": 1,
   "gpu_fraction": 1.0,
-  "random_seed": 43,
-  "num_aps": 3,
+  "random_seed": 101,
+  "num_aps": 2,
   "min_ap_separation": 2.0,
   "optimize_orientation": true,
   "reflector_enabled": false,
@@ -58,37 +58,37 @@
     "coverage_temperature": 1.0
   },
   "ga_params": {
-    "pop_size": 120,
-    "n_gen": 50,
+    "pop_size": 10,
+    "n_gen": 2,
     "cxpb": 0.6,
     "mutpb": 0.4,
-    "tournsize": 60,
-    "hof_size": 20
+    "tournsize": 5,
+    "hof_size": 6
   },
   "ga_evaluation_params": {
-    "samples_per_tx": 1000000,
-    "max_depth": 13,
+    "samples_per_tx": 4000,
+    "max_depth": 3,
     "verbose": false
   },
   "gd_optimization_params": {
-    "num_iterations": 50,
-    "learning_rate": 0.005,
-    "samples_per_tx": 1000000,
-    "max_depth": 13,
+    "num_iterations": 4,
+    "learning_rate": 0.01,
+    "samples_per_tx": 4000,
+    "max_depth": 3,
     "verbose": false
   },
   "random_params": {
-    "num_samples": 130
+    "num_samples": 8
   },
   "kmeans_params": {
-    "grid_size": 150
+    "grid_size": 30
   },
   "random_gd_params": {
     "num_samples": 2
   },
   "pso_params": {
-    "swarm_size": 120,
-    "num_iterations": 50,
+    "swarm_size": 8,
+    "num_iterations": 3,
     "w": 0.6,
     "c1": 1.6,
     "c2": 1.6
@@ -100,16 +100,15 @@
     "look_at": [25.0, 25.1, 1.5]
   },
   "coverage_plot_settings": {
-    "samples_per_tx": 1000000,
-    "max_depth": 13,
-    "resolution": [1200, 900],
+    "samples_per_tx": 4000,
+    "max_depth": 3,
+    "resolution": [640, 480],
     "render_ga_generation_best_coverage_maps": false,
     "render_gd_trajectory_coverage_maps": false
   },
-  "output_dir": "tmp_comparison_results/experiments",
-  "verbose": true,
+  "output_dir": "tmp_results/smoke_ap_sweep",
+  "verbose": false,
   "iteration_equalization": {
-    "enabled": true,
-    "target_iterations": 100
+    "enabled": false
   }
 }

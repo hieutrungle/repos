@@ -37,19 +37,52 @@ _RSSI_METRIC_KEYS: Tuple[str, ...] = (
     "p5_rss_dbm",
 )
 
+_PRIORITY_RSSI_METRIC_KEYS: Tuple[str, ...] = (
+    "priority_mean_rss_dbm",
+    "priority_min_rss_dbm",
+    "priority_p5_rss_dbm",
+)
+
 _RSSI_METRIC_LABELS: Dict[str, str] = {
     "mean_rss_dbm": "Mean RSSI (dBm)",
     "min_rss_dbm": "Minimum RSSI (dBm)",
     "p5_rss_dbm": "5th Percentile RSSI (dBm)",
+    "priority_mean_rss_dbm": "Priority Mean RSSI (dBm)",
+    "priority_min_rss_dbm": "Priority Minimum RSSI (dBm)",
+    "priority_p5_rss_dbm": "Priority 5th Percentile RSSI (dBm)",
+}
+
+_METHOD_DISPLAY_NAMES: Dict[str, str] = {
+    "memetic": "GA + GD",
+    "pso_gd": "PSO + GD",
+    "random_gd": "random + GD",
 }
 
 
 def _as_float(value: Any) -> Optional[float]:
     """Convert arbitrary value to float when possible."""
     try:
-        return float(value)
+        numeric = float(value)
     except (TypeError, ValueError):
         return None
+    if not np.isfinite(numeric):
+        return None
+    return numeric
+
+
+def _priority_fallback_metric_key(metric_key: str) -> Optional[str]:
+    """Map a priority metric key to its all-region counterpart when available."""
+    if not str(metric_key).startswith("priority_"):
+        return None
+    candidate = str(metric_key)[len("priority_") :]
+    if candidate in _RSSI_METRIC_KEYS:
+        return candidate
+    return None
+
+
+def _display_method_name(method: str) -> str:
+    """Return one user-facing method label for legends and titles."""
+    return _METHOD_DISPLAY_NAMES.get(method, str(method).replace("_", " "))
 
 
 def _extract_best_physical_metric(
@@ -162,20 +195,43 @@ def _build_rssi_metric_series(
     fallback_length: int,
 ) -> List[float]:
     """Build one RSSI metric series from traces with best-metric fallback."""
+    resolved_length = max(1, int(fallback_length))
+
+    def _normalize_length(values: Sequence[float]) -> List[float]:
+        normalized = [float(value) for value in values]
+        if len(normalized) < resolved_length:
+            return list(normalized) + [float(normalized[-1])] * (resolved_length - len(normalized))
+        return list(normalized)
+
     series = _extract_trace_series(trace_rows, [metric_key])
     if series:
-        return series
+        # Some phase traces may omit RSSI rows (for example, partial GD telemetry).
+        # Extend with last known value so the full optimization horizon is visible.
+        return _normalize_length(series)
 
     best_metric = _extract_best_physical_metric(
         method=method,
         result_payload=result_payload,
         metric_key=metric_key,
     )
-    if best_metric is None:
-        return []
+    if best_metric is not None:
+        return [float(best_metric)] * resolved_length
 
-    length = max(1, int(fallback_length))
-    return [float(best_metric)] * length
+    fallback_metric_key = _priority_fallback_metric_key(metric_key)
+    if fallback_metric_key is not None:
+        fallback_series = _extract_trace_series(trace_rows, [fallback_metric_key])
+        if fallback_series:
+            return _normalize_length(fallback_series)
+
+        fallback_best_metric = _extract_best_physical_metric(
+            method=method,
+            result_payload=result_payload,
+            metric_key=fallback_metric_key,
+        )
+        if fallback_best_metric is not None:
+            return [float(fallback_best_metric)] * resolved_length
+
+    return []
 
 
 def _plot_primary_loss_comparison(
@@ -207,7 +263,7 @@ def _plot_primary_loss_comparison(
             continue
 
         x_values = np.arange(1, len(series) + 1, dtype=np.int64)
-        axis.plot(x_values, series, linewidth=2.0, label=method)
+        axis.plot(x_values, series, linewidth=2.0, label=_display_method_name(method))
 
     if not axis.lines:
         plt.close(figure)
@@ -233,6 +289,9 @@ def _plot_per_method_rssi_triplets(
     method_trace_rows: Mapping[str, Sequence[Mapping[str, Any]]],
     plots_dir: Path,
     y_limits: Tuple[float, float],
+    metric_keys: Sequence[str] = _RSSI_METRIC_KEYS,
+    output_suffix: str = "rssi_triplet_static.png",
+    title_suffix: str = "RSSI Metric Trends (Static)",
 ) -> Dict[str, Optional[str]]:
     """Save one per-method static plot containing mean/min/p5 RSSI trends."""
     output_paths: Dict[str, Optional[str]] = {}
@@ -247,7 +306,7 @@ def _plot_per_method_rssi_triplets(
         fallback_len = max(1, len(trace_rows))
 
         metric_series_map: Dict[str, List[float]] = {}
-        for metric_key in _RSSI_METRIC_KEYS:
+        for metric_key in metric_keys:
             metric_series_map[metric_key] = _build_rssi_metric_series(
                 method=method,
                 trace_rows=trace_rows,
@@ -262,7 +321,7 @@ def _plot_per_method_rssi_triplets(
             continue
 
         figure, axis = plt.subplots(figsize=(12.0, 6.0))
-        for metric_key in _RSSI_METRIC_KEYS:
+        for metric_key in metric_keys:
             series = _expand_single_point_series(metric_series_map.get(metric_key, []), target_len=target_len)
             if not series:
                 continue
@@ -280,7 +339,7 @@ def _plot_per_method_rssi_triplets(
             output_paths[method] = None
             continue
 
-        axis.set_title(f"{method} RSSI Metric Trends (Static)")
+        axis.set_title(f"{_display_method_name(method)} {title_suffix}")
         axis.set_xlabel("Iteration")
         axis.set_ylabel("RSSI (dBm)")
         _set_integer_iteration_ticks(axis)
@@ -288,7 +347,7 @@ def _plot_per_method_rssi_triplets(
         axis.grid(True, alpha=0.25)
         axis.legend(loc="best")
 
-        output_path = plots_dir / f"{method}_rssi_triplet_static.png"
+        output_path = plots_dir / f"{method}_{output_suffix}"
         figure.tight_layout()
         figure.savefig(output_path, dpi=160)
         plt.close(figure)
@@ -303,16 +362,17 @@ def _plot_cross_method_rssi_metrics(
     method_trace_rows: Mapping[str, Sequence[Mapping[str, Any]]],
     plots_dir: Path,
     y_limits: Tuple[float, float],
+    metric_keys: Sequence[str] = _RSSI_METRIC_KEYS,
 ) -> Dict[str, Optional[str]]:
     """Save static cross-method RSSI metric plots (mean/min/p5 separately)."""
     output_paths: Dict[str, Optional[str]] = {}
     if plt is None:
-        for metric_key in _RSSI_METRIC_KEYS:
+        for metric_key in metric_keys:
             output_paths[metric_key] = None
         return output_paths
 
     y_min, y_max = float(y_limits[0]), float(y_limits[1])
-    for metric_key in _RSSI_METRIC_KEYS:
+    for metric_key in metric_keys:
         raw_series_by_method: Dict[str, List[float]] = {}
         for method in methods:
             trace_rows = method_trace_rows.get(method, [])
@@ -337,7 +397,7 @@ def _plot_cross_method_rssi_metrics(
                 continue
 
             x_values = np.arange(1, len(series) + 1, dtype=np.int64)
-            axis.plot(x_values, series, linewidth=2.0, label=method)
+            axis.plot(x_values, series, linewidth=2.0, label=_display_method_name(method))
 
         if not axis.lines:
             plt.close(figure)
@@ -387,6 +447,9 @@ def save_static_comparison_plots(
         method_trace_rows=method_trace_rows,
         plots_dir=plots_dir,
         y_limits=rssi_y_limits,
+        metric_keys=_RSSI_METRIC_KEYS,
+        output_suffix="rssi_triplet_static.png",
+        title_suffix="RSSI Metric Trends (Static)",
     )
     all_methods_rssi = _plot_cross_method_rssi_metrics(
         methods=methods,
@@ -394,12 +457,34 @@ def save_static_comparison_plots(
         method_trace_rows=method_trace_rows,
         plots_dir=plots_dir,
         y_limits=rssi_y_limits,
+        metric_keys=_RSSI_METRIC_KEYS,
+    )
+
+    per_method_priority_rssi = _plot_per_method_rssi_triplets(
+        methods=methods,
+        method_results=method_results,
+        method_trace_rows=method_trace_rows,
+        plots_dir=plots_dir,
+        y_limits=rssi_y_limits,
+        metric_keys=_PRIORITY_RSSI_METRIC_KEYS,
+        output_suffix="priority_rssi_triplet_static.png",
+        title_suffix="Priority RSSI Metric Trends (Static)",
+    )
+    all_methods_priority_rssi = _plot_cross_method_rssi_metrics(
+        methods=methods,
+        method_results=method_results,
+        method_trace_rows=method_trace_rows,
+        plots_dir=plots_dir,
+        y_limits=rssi_y_limits,
+        metric_keys=_PRIORITY_RSSI_METRIC_KEYS,
     )
 
     return {
         "all_methods_primary_loss_static_png": primary_loss_plot,
         "per_method_rssi_triplet_static_png": per_method_rssi,
         "all_methods_rssi_metric_static_png": all_methods_rssi,
+        "per_method_priority_rssi_triplet_static_png": per_method_priority_rssi,
+        "all_methods_priority_rssi_metric_static_png": all_methods_priority_rssi,
     }
 
 

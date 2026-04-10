@@ -11,6 +11,9 @@ Instructions
    - `<run_dir>/artifacts/*.json|*.csv`
    - `<run_dir>/plots/*.html`
 5. Per-method iteration traces are exported to CSV and plotted as trend charts.
+6. Optional iteration equalization for non-KMeans methods:
+    - `--equalize_iterations`
+    - `--target_iterations N`
 
 python scripts/run_experiments.py --method all \
     --config configs/run_experiments_cuda_hrbb.json \
@@ -23,6 +26,7 @@ import argparse
 import csv
 import json
 import time
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -37,6 +41,9 @@ from reflector_position.optimizers.baselines import (
     run_random_monte_carlo,
     run_random_multi_start_gd,
     run_weighted_kmeans_baseline,
+)
+from reflector_position.optimizers.baselines.pso_gd_plotting import (
+    save_pso_gd_plots,
 )
 from reflector_position.optimizers.baselines.static_comparison_plotting import (
     save_static_comparison_plots,
@@ -87,6 +94,21 @@ _DEMAND_CONFIG_DEFAULTS: Dict[str, Any] = {
     "apply_blur": False,
 }
 
+_RSSI_METRIC_KEYS: Tuple[str, ...] = (
+    "mean_rss_dbm",
+    "min_rss_dbm",
+    "p5_rss_dbm",
+    "priority_mean_rss_dbm",
+    "priority_min_rss_dbm",
+    "priority_p5_rss_dbm",
+)
+
+_METHOD_DISPLAY_NAMES: Dict[str, str] = {
+    "memetic": "GA + GD",
+    "pso_gd": "PSO + GD",
+    "random_gd": "random + GD",
+}
+
 
 def _parse_args() -> argparse.Namespace:
     """Parse CLI arguments for unified experiments execution."""
@@ -119,6 +141,23 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         type=str,
         help="Optional run folder name.",
+    )
+    parser.add_argument(
+        "--equalize_iterations",
+        action="store_true",
+        help=(
+            "Equalize total iteration budgets for non-KMeans methods by "
+            "adjusting GD steps and random samples where needed."
+        ),
+    )
+    parser.add_argument(
+        "--target_iterations",
+        default=None,
+        type=int,
+        help=(
+            "Optional target total iterations for non-KMeans methods when "
+            "equalization is enabled."
+        ),
     )
     return parser.parse_args()
 
@@ -371,11 +410,10 @@ def _resolve_demand_config_for_method(
     if method != "kmeans":
         return _resolve_demand_config(config)
 
-    demand_config = dict(_DEMAND_CONFIG_DEFAULTS)
-    if isinstance(config.get("position_bounds"), Mapping):
-        demand_config["position_bounds"] = dict(config["position_bounds"])
-    demand_config["_report_priority_stats"] = False
-    demand_config["_report_weighted_stats"] = False
+    # Keep geometric KMeans unweighted, but preserve demand-region metadata so
+    # evaluators can still report priority-only metrics for plotting.
+    demand_config = _resolve_demand_config(config)
+    demand_config["enabled"] = False
     return demand_config
 
 
@@ -744,6 +782,173 @@ def _resolve_method_sequence(method: str) -> List[str]:
     return [method]
 
 
+def _resolve_requested_ga_generations(config: Mapping[str, Any]) -> int:
+    """Resolve configured GA generations for memetic phase accounting."""
+    ga_params = _get_optional_mapping(config, "ga_params")
+    return max(1, int(ga_params.get("n_gen", 20)))
+
+
+def _resolve_requested_gd_iterations(config: Mapping[str, Any]) -> int:
+    """Resolve configured GD iterations using the same schema adapters as runtime."""
+    objective_params = _resolve_objective_params(config)
+    gd_params = _resolve_gd_params(config, objective_params=objective_params)
+    return max(1, int(gd_params.get("num_iterations", 50)))
+
+
+def _resolve_random_samples(config: Mapping[str, Any]) -> int:
+    """Resolve random-monte-carlo sample count used as iteration budget."""
+    random_params = _get_optional_mapping(config, "random_params")
+    return max(1, int(random_params.get("num_samples", config.get("num_samples", 100))))
+
+
+def _resolve_random_gd_starts(config: Mapping[str, Any]) -> int:
+    """Resolve random multi-start count for random+GD baseline."""
+    random_gd_params = _get_optional_mapping(config, "random_gd_params")
+    return max(1, int(random_gd_params.get("num_samples", 10)))
+
+
+def _resolve_pso_iterations(config: Mapping[str, Any]) -> int:
+    """Resolve PSO phase iteration count for PSO+GD baseline."""
+    pso_params = _resolve_pso_params(config)
+    return max(1, int(pso_params.get("num_iterations", 20)))
+
+
+def _estimate_iteration_budget(method: str, config: Mapping[str, Any]) -> int:
+    """Estimate comparable total optimization steps for one method."""
+    if method in ("kmeans", "weighted_kmeans"):
+        return 1
+    if method == "random":
+        return _resolve_random_samples(config)
+    if method == "memetic":
+        return _resolve_requested_ga_generations(config) + _resolve_requested_gd_iterations(config)
+    if method == "random_gd":
+        return _resolve_random_gd_starts(config) + _resolve_requested_gd_iterations(config)
+    if method == "pso_gd":
+        return _resolve_pso_iterations(config) + _resolve_requested_gd_iterations(config)
+    raise ValueError(f"Unsupported method for iteration budgeting: {method!r}")
+
+
+def _set_requested_gd_iterations(config: Dict[str, Any], num_iterations: int) -> None:
+    """Set GD iterations across all supported schema variants in config."""
+    resolved_iterations = max(1, int(num_iterations))
+    updated_any = False
+    for key in ("gd_params", "gd_optimization_params", "gd_hyperparams"):
+        value = config.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, Mapping):
+            raise ValueError(f"'{key}' must be a mapping/object when provided.")
+        section = dict(value)
+        section["num_iterations"] = int(resolved_iterations)
+        config[key] = section
+        updated_any = True
+
+    if not updated_any:
+        config["gd_optimization_params"] = {"num_iterations": int(resolved_iterations)}
+
+
+def _set_random_samples(config: Dict[str, Any], num_samples: int) -> None:
+    """Set random baseline sample count across supported config fields."""
+    resolved_samples = max(1, int(num_samples))
+    random_params = _get_optional_mapping(config, "random_params")
+    updated_random_params = dict(random_params)
+    updated_random_params["num_samples"] = int(resolved_samples)
+    config["random_params"] = updated_random_params
+    config["num_samples"] = int(resolved_samples)
+
+
+def _resolve_iteration_equalization(
+    methods: Sequence[str],
+    base_config: Mapping[str, Any],
+    enabled: bool,
+    target_iterations: Optional[int],
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
+    """Build per-method configs with optional iteration-budget equalization."""
+    method_configs: Dict[str, Dict[str, Any]] = {
+        method: deepcopy(dict(base_config))
+        for method in methods
+    }
+
+    initial_budgets = {
+        method: _estimate_iteration_budget(method, method_configs[method])
+        for method in methods
+    }
+
+    plan: Dict[str, Any] = {
+        "enabled": bool(enabled),
+        "target_iterations": None,
+        "initial_budgets": dict(initial_budgets),
+        "final_budgets": dict(initial_budgets),
+        "gd_adjustments": {},
+        "sample_adjustments": {},
+    }
+
+    if not enabled:
+        return method_configs, plan
+
+    non_kmeans_methods = [
+        method
+        for method in methods
+        if method not in ("kmeans", "weighted_kmeans")
+    ]
+    if not non_kmeans_methods:
+        return method_configs, plan
+
+    if target_iterations is None:
+        resolved_target = max(int(initial_budgets[method]) for method in non_kmeans_methods)
+    else:
+        resolved_target = max(1, int(target_iterations))
+
+    plan["target_iterations"] = int(resolved_target)
+
+    for method in non_kmeans_methods:
+        if method == "random":
+            method_config = method_configs[method]
+            requested_samples = _resolve_random_samples(method_config)
+            adjusted_samples = int(max(1, int(resolved_target)))
+            if adjusted_samples != requested_samples:
+                _set_random_samples(method_config, adjusted_samples)
+
+            plan["sample_adjustments"][method] = {
+                "requested_samples": int(requested_samples),
+                "adjusted_samples": int(adjusted_samples),
+                "target_total_iterations": int(resolved_target),
+            }
+            continue
+
+        if method not in ("memetic", "random_gd", "pso_gd"):
+            continue
+
+        method_config = method_configs[method]
+        current_gd_iterations = _resolve_requested_gd_iterations(method_config)
+
+        if method == "memetic":
+            non_gd_iterations = _resolve_requested_ga_generations(method_config)
+        elif method == "random_gd":
+            non_gd_iterations = _resolve_random_gd_starts(method_config)
+        else:
+            non_gd_iterations = _resolve_pso_iterations(method_config)
+
+        min_required_gd_iterations = max(1, int(resolved_target) - int(non_gd_iterations))
+        adjusted_gd_iterations = max(int(current_gd_iterations), int(min_required_gd_iterations))
+
+        if adjusted_gd_iterations != current_gd_iterations:
+            _set_requested_gd_iterations(method_config, adjusted_gd_iterations)
+
+        plan["gd_adjustments"][method] = {
+            "non_gd_iterations": int(non_gd_iterations),
+            "requested_gd_iterations": int(current_gd_iterations),
+            "adjusted_gd_iterations": int(adjusted_gd_iterations),
+            "target_total_iterations": int(resolved_target),
+        }
+
+    plan["final_budgets"] = {
+        method: _estimate_iteration_budget(method, method_configs[method])
+        for method in methods
+    }
+    return method_configs, plan
+
+
 def _resolve_run_directory(output_dir: Path, run_name: Optional[str]) -> Path:
     """Resolve run root directory for all artifacts and plots."""
     if run_name:
@@ -835,13 +1040,23 @@ def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
             writer.writerow(row)
 
 
-def _aggregate_gd_iteration_trace(gd_results: Mapping[str, Any]) -> List[Dict[str, Any]]:
+def _aggregate_gd_iteration_trace(
+    gd_results: Mapping[str, Any],
+    max_iterations: Optional[int] = None,
+) -> List[Dict[str, Any]]:
     """Build aggregate GD trend from all fine-tuned worker histories."""
     all_results = gd_results.get("all_fine_tuned_results", [])
     if not isinstance(all_results, list):
         return []
 
-    all_series: List[List[float]] = []
+    requested_iterations: Optional[int]
+    if max_iterations is None:
+        requested_iterations = None
+    else:
+        requested_iterations = max(1, int(max_iterations))
+
+    all_series: List[List[Optional[float]]] = []
+    all_physical_rows: List[List[Any]] = []
     for raw_result in all_results:
         if not isinstance(raw_result, Mapping):
             continue
@@ -852,14 +1067,27 @@ def _aggregate_gd_iteration_trace(gd_results: Mapping[str, Any]) -> List[Dict[st
         if not isinstance(primary_series, Sequence):
             continue
 
-        series: List[float] = []
+        if requested_iterations is not None:
+            primary_series = list(primary_series)[:requested_iterations]
+
+        physical_series = history.get("physical_metrics", [])
+        if isinstance(physical_series, Sequence):
+            physical_rows = list(physical_series)
+            if requested_iterations is not None:
+                physical_rows = physical_rows[:requested_iterations]
+        else:
+            physical_rows = []
+
+        series: List[Optional[float]] = []
         for raw_value in primary_series:
             try:
                 series.append(float(raw_value))
             except (TypeError, ValueError):
-                continue
-        if series:
+                series.append(None)
+
+        if any(value is not None for value in series):
             all_series.append(series)
+            all_physical_rows.append(physical_rows)
 
     if not all_series:
         return []
@@ -867,8 +1095,18 @@ def _aggregate_gd_iteration_trace(gd_results: Mapping[str, Any]) -> List[Dict[st
     trace: List[Dict[str, Any]] = []
     running_best = float("inf")
     max_len = max(len(series) for series in all_series)
+    if requested_iterations is not None:
+        max_len = min(max_len, requested_iterations)
+
     for iteration_idx in range(max_len):
-        bucket = [series[iteration_idx] for series in all_series if iteration_idx < len(series)]
+        bucket: List[float] = []
+        for series in all_series:
+            if iteration_idx >= len(series):
+                continue
+            value = series[iteration_idx]
+            if value is None:
+                continue
+            bucket.append(float(value))
         if not bucket:
             continue
 
@@ -876,22 +1114,169 @@ def _aggregate_gd_iteration_trace(gd_results: Mapping[str, Any]) -> List[Dict[st
         mean_loss = float(np.mean(bucket))
         max_loss = float(max(bucket))
         running_best = min(running_best, min_loss)
-        trace.append(
-            {
-                "iteration": int(iteration_idx + 1),
-                "min_primary_loss": min_loss,
-                "mean_primary_loss": mean_loss,
-                "max_primary_loss": max_loss,
-                "running_best_primary_loss": float(running_best),
-            }
-        )
+        row: Dict[str, Any] = {
+            "iteration": int(iteration_idx + 1),
+            "min_primary_loss": min_loss,
+            "mean_primary_loss": mean_loss,
+            "max_primary_loss": max_loss,
+            "running_best_primary_loss": float(running_best),
+        }
+
+        for metric_key in _RSSI_METRIC_KEYS:
+            metric_bucket: List[float] = []
+            for physical_rows in all_physical_rows:
+                if iteration_idx >= len(physical_rows):
+                    continue
+                raw_metric_row = physical_rows[iteration_idx]
+                if not isinstance(raw_metric_row, Mapping):
+                    continue
+                metric_value = _as_float(raw_metric_row.get(metric_key))
+                if metric_value is not None:
+                    metric_bucket.append(float(metric_value))
+            if metric_bucket:
+                row[metric_key] = float(np.mean(metric_bucket))
+
+        trace.append(row)
 
     return trace
+
+
+def _extract_trace_loss_candidate(row: Mapping[str, Any]) -> Optional[float]:
+    """Extract one representative loss value from an iteration row."""
+    for key in (
+        "running_best_primary_loss",
+        "global_best_primary_loss",
+        "min_primary_loss",
+        "primary_loss",
+        "swarm_best_primary_loss",
+        "mean_primary_loss",
+        "max_primary_loss",
+    ):
+        raw_value = row.get(key)
+        if raw_value is None:
+            continue
+        try:
+            return float(raw_value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _extract_memetic_ga_iteration_trace(
+    result_payload: Mapping[str, Any],
+    max_iterations: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Extract GA generation-level trace rows for memetic reporting."""
+    ga_results = result_payload.get("ga_results", {})
+    if not isinstance(ga_results, Mapping):
+        return []
+
+    generation_details = ga_results.get("generation_details", [])
+    if not isinstance(generation_details, Sequence):
+        return []
+
+    requested_iterations: Optional[int]
+    if max_iterations is None:
+        requested_iterations = None
+    else:
+        requested_iterations = max(1, int(max_iterations))
+
+    trace_rows: List[Dict[str, Any]] = []
+    running_best = float("inf")
+
+    for fallback_gen, raw_row in enumerate(generation_details):
+        if not isinstance(raw_row, Mapping):
+            continue
+
+        raw_gen = raw_row.get("gen", fallback_gen)
+        try:
+            generation_index = int(raw_gen)
+        except (TypeError, ValueError):
+            generation_index = int(fallback_gen)
+
+        # Exclude generation-0 bootstrap so GA iterations match configured n_gen.
+        if generation_index <= 0:
+            continue
+
+        best_primary_fitness = _as_float(raw_row.get("best_primary_fitness"))
+        if best_primary_fitness is None:
+            top_individuals = raw_row.get("top_individuals")
+            if (
+                isinstance(top_individuals, Sequence)
+                and len(top_individuals) > 0
+                and isinstance(top_individuals[0], Mapping)
+            ):
+                best_primary_fitness = _as_float(top_individuals[0].get("primary_fitness"))
+
+        if best_primary_fitness is None:
+            continue
+
+        best_primary_loss = float(-best_primary_fitness)
+        running_best = min(running_best, best_primary_loss)
+
+        row: Dict[str, Any] = {
+            "iteration": int(len(trace_rows) + 1),
+            "phase": "ga",
+            "ga_generation": int(generation_index),
+            "primary_loss": float(best_primary_loss),
+            "running_best_primary_loss": float(running_best),
+        }
+
+        best_metrics = raw_row.get("best_physical_metrics")
+        if not isinstance(best_metrics, Mapping):
+            top_individuals = raw_row.get("top_individuals")
+            if (
+                isinstance(top_individuals, Sequence)
+                and len(top_individuals) > 0
+                and isinstance(top_individuals[0], Mapping)
+            ):
+                ranked_metrics = top_individuals[0].get("physical_metrics")
+                if isinstance(ranked_metrics, Mapping):
+                    best_metrics = ranked_metrics
+
+        if isinstance(best_metrics, Mapping):
+            for metric_key in _RSSI_METRIC_KEYS:
+                metric_value = _as_float(best_metrics.get(metric_key))
+                if metric_value is not None:
+                    row[metric_key] = float(metric_value)
+
+        trace_rows.append(row)
+        if requested_iterations is not None and len(trace_rows) >= requested_iterations:
+            break
+
+    return trace_rows
+
+
+def _stitch_phase_iteration_traces(
+    phase_traces: Sequence[Tuple[str, Sequence[Mapping[str, Any]]]],
+) -> List[Dict[str, Any]]:
+    """Stitch phase traces into one sequential trace with global running-best."""
+    combined: List[Dict[str, Any]] = []
+    running_best = float("inf")
+
+    for phase_name, rows in phase_traces:
+        for raw_row in rows:
+            if not isinstance(raw_row, Mapping):
+                continue
+
+            normalized = {str(key): _to_jsonable(value) for key, value in dict(raw_row).items()}
+            normalized["phase"] = str(normalized.get("phase", phase_name))
+            normalized["iteration"] = int(len(combined) + 1)
+
+            candidate_loss = _extract_trace_loss_candidate(normalized)
+            if candidate_loss is not None:
+                running_best = min(running_best, float(candidate_loss))
+                normalized["running_best_primary_loss"] = float(running_best)
+
+            combined.append(normalized)
+
+    return combined
 
 
 def _extract_method_iteration_trace(
     method: str,
     result_payload: Mapping[str, Any],
+    method_config: Optional[Mapping[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Extract normalized per-iteration trace rows for one method result."""
     raw_trace = result_payload.get("iteration_trace")
@@ -907,9 +1292,37 @@ def _extract_method_iteration_trace(
             return trace_rows
 
     if method == "memetic":
+        ga_iterations = (
+            _resolve_requested_ga_generations(method_config)
+            if method_config is not None
+            else None
+        )
+        gd_iterations = (
+            _resolve_requested_gd_iterations(method_config)
+            if method_config is not None
+            else None
+        )
+
+        ga_trace = _extract_memetic_ga_iteration_trace(
+            result_payload=result_payload,
+            max_iterations=ga_iterations,
+        )
+
         gd_results = result_payload.get("gd_results", {})
         if isinstance(gd_results, Mapping):
-            return _aggregate_gd_iteration_trace(gd_results)
+            gd_trace = _aggregate_gd_iteration_trace(
+                gd_results,
+                max_iterations=gd_iterations,
+            )
+            stitched = _stitch_phase_iteration_traces(
+                (
+                    ("ga", ga_trace),
+                    ("gd", gd_trace),
+                )
+            )
+            if stitched:
+                return stitched
+            return gd_trace
 
     return []
 
@@ -943,6 +1356,11 @@ def _as_float(value: Any) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _display_method_name(method: str) -> str:
+    """Return one user-facing method name for plot legends/titles."""
+    return _METHOD_DISPLAY_NAMES.get(method, str(method).replace("_", " "))
 
 
 def _save_method_trend_plot(method: str, trace_rows: Sequence[Mapping[str, Any]], plot_path: Path) -> Optional[str]:
@@ -989,7 +1407,7 @@ def _save_method_trend_plot(method: str, trace_rows: Sequence[Mapping[str, Any]]
         return None
 
     figure.update_layout(
-        title=f"{method} Trend",
+        title=f"{_display_method_name(method)} Trend",
         xaxis_title="Iteration",
         yaxis_title="Primary Loss",
         template="plotly_white",
@@ -1049,7 +1467,7 @@ def _save_comparison_plot(
                 x=x_values,
                 y=running_best,
                 mode="lines+markers",
-                name=method,
+                name=_display_method_name(method),
             )
         )
 
@@ -1277,6 +1695,7 @@ def _build_final_analysis_report(
 def _save_method_artifacts(
     method: str,
     result_payload: Mapping[str, Any],
+    method_config: Optional[Mapping[str, Any]],
     artifacts_dir: Path,
     plots_dir: Path,
 ) -> Dict[str, Optional[str]]:
@@ -1287,7 +1706,11 @@ def _save_method_artifacts(
     _write_json(result_json_path, result_payload)
     method_artifacts["result_json"] = str(result_json_path)
 
-    trace_rows = _extract_method_iteration_trace(method, result_payload)
+    trace_rows = _extract_method_iteration_trace(
+        method,
+        result_payload,
+        method_config=method_config,
+    )
     if trace_rows:
         trace_json_path = artifacts_dir / f"{method}_iteration_trace.json"
         trace_csv_path = artifacts_dir / f"{method}_iteration_trace.csv"
@@ -1307,12 +1730,25 @@ def _save_method_artifacts(
         method_artifacts["trace_csv"] = None
         method_artifacts["trend_plot_html"] = None
 
+    if method == "pso_gd":
+        pso_plot_artifacts = save_pso_gd_plots(
+            result_payload=result_payload,
+            plots_dir=plots_dir,
+        )
+        pso_plot_artifacts_path = artifacts_dir / f"{method}_plot_artifacts.json"
+        _write_json(pso_plot_artifacts_path, pso_plot_artifacts)
+        method_artifacts["plot_artifacts_json"] = str(pso_plot_artifacts_path)
+        method_artifacts["trajectory_plot_png"] = pso_plot_artifacts.get("pso_gd_trajectory_plot_png")
+
     return method_artifacts
 
 
 def main() -> None:
     """CLI entry point for running and saving experiment methods."""
     args = _parse_args()
+
+    if args.target_iterations is not None and int(args.target_iterations) <= 0:
+        raise ValueError("--target_iterations must be > 0 when provided")
 
     config_path = Path(args.config)
     output_dir = Path(args.output_dir)
@@ -1328,16 +1764,77 @@ def main() -> None:
 
     methods = _resolve_method_sequence(str(args.method))
 
+    equalization_config = _get_optional_mapping(config, "iteration_equalization")
+    config_equalization_enabled = bool(equalization_config.get("enabled", False))
+    config_target_iterations: Optional[int] = None
+    if "target_iterations" in equalization_config:
+        raw_target_iterations = equalization_config.get("target_iterations")
+        if raw_target_iterations is not None:
+            try:
+                config_target_iterations = int(raw_target_iterations)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("iteration_equalization.target_iterations must be an integer") from exc
+
+    equalization_enabled = bool(
+        args.equalize_iterations
+        or args.target_iterations is not None
+        or config_equalization_enabled
+    )
+    target_iterations = (
+        int(args.target_iterations)
+        if args.target_iterations is not None
+        else config_target_iterations
+    )
+    if target_iterations is not None and int(target_iterations) <= 0:
+        raise ValueError("Target iterations must be > 0")
+
+    method_run_configs, iteration_equalization_plan = _resolve_iteration_equalization(
+        methods=methods,
+        base_config=config,
+        enabled=equalization_enabled,
+        target_iterations=target_iterations,
+    )
+
+    if iteration_equalization_plan.get("enabled"):
+        print("[iterations] equalization enabled")
+        print(f"[iterations] target={iteration_equalization_plan.get('target_iterations')}")
+
+        sample_adjustments = iteration_equalization_plan.get("sample_adjustments", {})
+        if isinstance(sample_adjustments, Mapping):
+            for method_name in methods:
+                adjustment = sample_adjustments.get(method_name)
+                if not isinstance(adjustment, Mapping):
+                    continue
+                print(
+                    "[iterations] "
+                    f"{method_name}: samples={adjustment.get('requested_samples')}"
+                    f"->{adjustment.get('adjusted_samples')}"
+                )
+
+        adjustments = iteration_equalization_plan.get("gd_adjustments", {})
+        if isinstance(adjustments, Mapping):
+            for method_name in methods:
+                adjustment = adjustments.get(method_name)
+                if not isinstance(adjustment, Mapping):
+                    continue
+                print(
+                    "[iterations] "
+                    f"{method_name}: non_gd={adjustment.get('non_gd_iterations')} "
+                    f"gd={adjustment.get('requested_gd_iterations')}"
+                    f"->{adjustment.get('adjusted_gd_iterations')}"
+                )
+
     method_results: Dict[str, Dict[str, Any]] = {}
     method_artifacts: Dict[str, Dict[str, Optional[str]]] = {}
     method_trace_rows: Dict[str, List[Dict[str, Any]]] = {}
     method_summary_rows: List[Dict[str, Any]] = []
 
     for method in methods:
+        method_config = method_run_configs.get(method, deepcopy(dict(config)))
         method_start = time.perf_counter()
         result_payload = _run_single_method(
             method=method,
-            config=dict(config),
+            config=deepcopy(method_config),
             run_dir=run_dir,
             run_name=args.run_name,
         )
@@ -1354,25 +1851,41 @@ def main() -> None:
             orchestrator_metadata["config_path"] = str(config_path)
             orchestrator_metadata["elapsed_sec"] = method_elapsed
             orchestrator_metadata["run_dir"] = str(run_dir)
+            final_budgets = iteration_equalization_plan.get("final_budgets", {})
+            if isinstance(final_budgets, Mapping) and method in final_budgets:
+                orchestrator_metadata["planned_iterations"] = int(final_budgets[method])
+
+            gd_adjustments = iteration_equalization_plan.get("gd_adjustments", {})
+            if isinstance(gd_adjustments, Mapping) and isinstance(gd_adjustments.get(method), Mapping):
+                orchestrator_metadata["gd_iteration_adjustment"] = dict(gd_adjustments[method])
+
             payload["orchestrator"] = orchestrator_metadata
 
         method_results[method] = payload
         method_artifacts[method] = _save_method_artifacts(
             method=method,
             result_payload=payload,
+            method_config=method_config,
             artifacts_dir=artifacts_dir,
             plots_dir=plots_dir,
         )
 
-        trace_rows = _extract_method_iteration_trace(method, payload)
+        trace_rows = _extract_method_iteration_trace(
+            method,
+            payload,
+            method_config=method_config,
+        )
         method_trace_rows[method] = trace_rows
+
+        raw_num_iterations = _as_float(payload.get("num_iterations"))
+        reported_num_iterations = int(raw_num_iterations) if raw_num_iterations is not None else len(trace_rows)
 
         method_summary_rows.append(
             {
                 "method": method,
                 "elapsed_sec": method_elapsed,
                 "best_primary_loss": _extract_best_primary_loss(method, payload),
-                "num_iterations": len(trace_rows),
+                "num_iterations": int(reported_num_iterations),
                 "result_json": method_artifacts[method].get("result_json"),
                 "trace_csv": method_artifacts[method].get("trace_csv"),
                 "trend_plot_html": method_artifacts[method].get("trend_plot_html"),
@@ -1393,6 +1906,7 @@ def main() -> None:
         "run_dir": str(run_dir),
         "config_path": str(config_path),
         "methods": methods,
+        "iteration_equalization": iteration_equalization_plan,
         "method_summary": method_summary_rows,
         "method_artifacts": method_artifacts,
         "analysis": {

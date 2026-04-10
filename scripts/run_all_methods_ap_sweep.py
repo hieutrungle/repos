@@ -4,15 +4,22 @@
 Instructions
 ------------
 1. Run one command over AP count and seed ranges, for one or many methods.
-2. Each (AP, seed) trial now saves run_experiments-style plots under:
-    <run_root>/plots/per_trial/aps_XX_seed_YYYY/
-    - <method>_trend.html
-    - method_comparison_trend.html (when >= 2 successful methods)
-    - all_methods_primary_loss_static.png
-    - <method>_rssi_triplet_static.png
-    - all_methods_mean_rss_dbm_static.png
-    - all_methods_min_rss_dbm_static.png
-    - all_methods_p5_rss_dbm_static.png
+2. Each (AP, seed) trial now saves full run_experiments-style artifacts under:
+    <run_root>/per_trial_runs/aps_XX_seed_YYYY/
+    - artifacts/experiment_summary.json
+    - artifacts/method_summary.csv
+    - artifacts/final_analysis.txt
+    - artifacts/<method>_results.json
+    - artifacts/<method>_iteration_trace.json
+    - artifacts/<method>_iteration_trace.csv
+    - artifacts/launcher_summary.json
+    - plots/<method>_trend.html
+    - plots/method_comparison_trend.html (when >= 2 successful methods)
+    - plots/all_methods_primary_loss_static.png
+    - plots/<method>_rssi_triplet_static.png
+    - plots/all_methods_mean_rss_dbm_static.png
+    - plots/all_methods_min_rss_dbm_static.png
+    - plots/all_methods_p5_rss_dbm_static.png
 3. Sweep-level artifacts are still saved in one run folder:
     - artifacts/sweep_results.json
     - artifacts/plot_artifacts.json
@@ -69,9 +76,11 @@ from reflector_position.optimizers.memetic.run_memetic_pipeline import (
 )
 from run_experiments import (
     _bind_shared_actor_pool as _runner_bind_shared_actor_pool,
+    _build_final_analysis_report as _runner_build_final_analysis_report,
     _build_weighted_kmeans_sample_weights as _runner_build_weighted_kmeans_sample_weights,
     _enforce_baseline_cuda as _runner_enforce_baseline_cuda,
     _extract_floorplan_coords as _runner_extract_floorplan_coords,
+    _extract_method_iteration_trace as _runner_extract_method_iteration_trace,
     _extract_xy_bounds as _runner_extract_xy_bounds,
     _get_optional_mapping as _runner_get_optional_mapping,
     _resolve_demand_config as _runner_resolve_demand_config,
@@ -81,7 +90,8 @@ from run_experiments import (
     _resolve_objective_params as _runner_resolve_objective_params,
     _resolve_pso_params as _runner_resolve_pso_params,
     _save_comparison_plot as _runner_save_comparison_plot,
-    _save_method_trend_plot as _runner_save_method_trend_plot,
+    _save_method_artifacts as _runner_save_method_artifacts,
+    _write_csv as _runner_write_csv,
     _warmup_actor_pool as _runner_warmup_actor_pool,
 )
 
@@ -115,12 +125,6 @@ _PRIMARY_TRACE_KEYS: Tuple[str, ...] = (
     "swarm_best_primary_loss",
 )
 
-_RSSI_KEYS: Tuple[str, ...] = (
-    "min_rss_dbm",
-    "mean_rss_dbm",
-    "p5_rss_dbm",
-)
-
 _ELBOW_METRICS: Tuple[Tuple[str, str, str], ...] = (
     ("primary_loss", "AP Count vs Primary Loss", "Primary Loss"),
     ("mean_rss_dbm", "AP Count vs Mean RSSI", "RSSI (dBm)"),
@@ -142,6 +146,12 @@ _METHOD_STYLES: Dict[str, Dict[str, str]] = {
     "weighted_kmeans": {"color": "tab:purple", "marker": "D"},
     "random_gd": {"color": "tab:brown", "marker": "v"},
     "pso_gd": {"color": "tab:green", "marker": "^"},
+}
+
+_METHOD_DISPLAY_NAMES: Dict[str, str] = {
+    "memetic": "GA + GD",
+    "pso_gd": "PSO + GD",
+    "random_gd": "random + GD",
 }
 
 _PER_TRIAL_RSSI_Y_LIMITS: Tuple[float, float] = (-100.0, -40.0)
@@ -303,14 +313,14 @@ def _as_float(value: Any) -> Optional[float]:
         return None
 
 
-def _is_non_string_sequence(value: Any) -> bool:
-    """Return True when value is a sequence and not text/bytes."""
-    return isinstance(value, Sequence) and not isinstance(value, (str, bytes))
-
-
 def _method_style(method: str) -> Dict[str, str]:
     """Return stable color/marker style for one method."""
     return _METHOD_STYLES.get(method, {"color": "tab:gray", "marker": "o"})
+
+
+def _display_method_name(method: str) -> str:
+    """Return one user-facing method name for plot legends."""
+    return _METHOD_DISPLAY_NAMES.get(method, str(method).replace("_", " "))
 
 
 def _expand_single_point_series(series: Sequence[float], target_len: int) -> List[float]:
@@ -404,144 +414,26 @@ def _extract_best_physical_metrics(
     return {}
 
 
-def _extract_memetic_iteration_trace(result_payload: Mapping[str, Any]) -> TraceRows:
-    """Extract memetic iteration trace with primary and RSSI metrics when possible."""
-    gd_results = result_payload.get("gd_results", {})
-    if not isinstance(gd_results, Mapping):
-        return []
+def _extract_method_iteration_trace(
+    method: str,
+    result_payload: Mapping[str, Any],
+    method_config: Optional[Mapping[str, Any]] = None,
+) -> TraceRows:
+    """Normalize one method payload into iteration trace rows.
 
-    global_best = gd_results.get("global_best_result", {})
-    if isinstance(global_best, Mapping):
-        history = global_best.get("history", {})
-        if isinstance(history, Mapping):
-            primary_series = history.get("primary_loss", [])
-            physical_series = history.get("physical_metrics", [])
-            if _is_non_string_sequence(primary_series):
-                trace_rows: TraceRows = []
-                running_best = float("inf")
-                for idx, raw_loss in enumerate(primary_series, start=1):
-                    loss_value = _as_float(raw_loss)
-                    if loss_value is None:
-                        continue
-
-                    running_best = min(running_best, loss_value)
-                    row: Dict[str, Any] = {
-                        "iteration": int(idx),
-                        "primary_loss": float(loss_value),
-                        "running_best_primary_loss": float(running_best),
-                    }
-
-                    if _is_non_string_sequence(physical_series) and (idx - 1) < len(physical_series):
-                        metric_row = physical_series[idx - 1]
-                        if isinstance(metric_row, Mapping):
-                            for metric_key in _RSSI_KEYS:
-                                metric_value = _as_float(metric_row.get(metric_key))
-                                if metric_value is not None:
-                                    row[metric_key] = float(metric_value)
-
-                    trace_rows.append(row)
-
-                if trace_rows:
-                    return trace_rows
-
-    all_results = gd_results.get("all_fine_tuned_results", [])
-    if not isinstance(all_results, list):
-        return []
-
-    primary_series_by_seed: List[List[float]] = []
-    rssi_series_by_seed: Dict[str, List[List[float]]] = {metric: [] for metric in _RSSI_KEYS}
-
-    for raw_result in all_results:
-        if not isinstance(raw_result, Mapping):
-            continue
-
-        history = raw_result.get("history", {})
-        if not isinstance(history, Mapping):
-            continue
-
-        raw_primary_series = history.get("primary_loss", [])
-        if not _is_non_string_sequence(raw_primary_series):
-            continue
-
-        primary_values: List[float] = []
-        for raw_value in raw_primary_series:
-            parsed = _as_float(raw_value)
-            if parsed is not None:
-                primary_values.append(float(parsed))
-
-        if not primary_values:
-            continue
-
-        primary_series_by_seed.append(primary_values)
-
-        raw_physical_series = history.get("physical_metrics", [])
-        if _is_non_string_sequence(raw_physical_series):
-            for metric_key in _RSSI_KEYS:
-                metric_values: List[float] = []
-                for raw_metric_row in raw_physical_series:
-                    if not isinstance(raw_metric_row, Mapping):
-                        continue
-                    metric_value = _as_float(raw_metric_row.get(metric_key))
-                    if metric_value is not None:
-                        metric_values.append(float(metric_value))
-                if metric_values:
-                    rssi_series_by_seed[metric_key].append(metric_values)
-
-    if not primary_series_by_seed:
-        return []
-
-    max_len = max(len(series) for series in primary_series_by_seed)
-    running_best = float("inf")
-    aggregated_rows: TraceRows = []
-
-    for idx in range(max_len):
-        primary_bucket = [series[idx] for series in primary_series_by_seed if idx < len(series)]
-        if not primary_bucket:
-            continue
-
-        min_primary = float(min(primary_bucket))
-        mean_primary = float(np.mean(primary_bucket))
-        max_primary = float(max(primary_bucket))
-        running_best = min(running_best, min_primary)
-
-        row: Dict[str, Any] = {
-            "iteration": int(idx + 1),
-            "min_primary_loss": min_primary,
-            "mean_primary_loss": mean_primary,
-            "max_primary_loss": max_primary,
-            "running_best_primary_loss": float(running_best),
-            "primary_loss": min_primary,
-        }
-
-        for metric_key in _RSSI_KEYS:
-            metric_bucket = [series[idx] for series in rssi_series_by_seed[metric_key] if idx < len(series)]
-            if metric_bucket:
-                row[metric_key] = float(np.mean(metric_bucket))
-
-        aggregated_rows.append(row)
-
-    return aggregated_rows
-
-
-def _extract_method_iteration_trace(method: str, result_payload: Mapping[str, Any]) -> TraceRows:
-    """Normalize one method payload into iteration trace rows."""
-    if method == "memetic":
-        memetic_trace = _extract_memetic_iteration_trace(result_payload)
-        if memetic_trace:
-            return memetic_trace
-
-    raw_trace = result_payload.get("iteration_trace")
-    if not isinstance(raw_trace, list):
-        return []
-
-    trace_rows: TraceRows = []
-    for index, row in enumerate(raw_trace, start=1):
-        if not isinstance(row, Mapping):
-            continue
-        normalized = dict(row)
-        normalized.setdefault("iteration", int(index))
-        trace_rows.append({str(key): _to_jsonable(value) for key, value in normalized.items()})
-    return trace_rows
+    Delegates to the shared run_experiments extractor so AP sweep and
+    run_experiments report identical per-method iteration counting.
+    """
+    trace_rows = _runner_extract_method_iteration_trace(
+        method=method,
+        result_payload=result_payload,
+        method_config=method_config,
+    )
+    return [
+        {str(key): _to_jsonable(value) for key, value in dict(row).items()}
+        for row in trace_rows
+        if isinstance(row, Mapping)
+    ]
 
 
 def _extract_scalar_metrics(method: str, result_payload: Mapping[str, Any]) -> Dict[str, Optional[float]]:
@@ -926,122 +818,171 @@ def _compute_aggregate_stats(
     return aggregates
 
 
-def _build_per_trial_plot_inputs(
-    store: SweepStore,
-    methods: Sequence[str],
-    num_aps: int,
-    seed: int,
-) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, TraceRows]]:
-    """Build method payload and trace maps for one trial from sweep storage."""
-    method_results: Dict[str, Dict[str, Any]] = {}
-    method_trace_rows: Dict[str, TraceRows] = {}
-
-    for method in methods:
-        run_entry = store.get(method, {}).get(str(int(num_aps)), {}).get(str(int(seed)), {})
-        if not isinstance(run_entry, Mapping):
-            continue
-        if run_entry.get("status") != "ok":
-            continue
-
-        metrics = run_entry.get("metrics", {})
-        if not isinstance(metrics, Mapping):
-            metrics = {}
-
-        best_physical_metrics: Dict[str, float] = {}
-        for key in (
-            "min_rss_dbm",
-            "mean_rss_dbm",
-            "p5_rss_dbm",
-            "coverage_pct",
-            "priority_min_rss_dbm",
-            "priority_mean_rss_dbm",
-            "priority_p5_rss_dbm",
-        ):
-            metric_value = _as_float(metrics.get(key))
-            if metric_value is not None:
-                best_physical_metrics[key] = float(metric_value)
-
-        method_results[method] = {
-            "best_primary_loss": _as_float(metrics.get("primary_loss")),
-            "best_physical_metrics": best_physical_metrics,
-        }
-
-        iteration_trace = run_entry.get("iteration_trace")
-        if isinstance(iteration_trace, list):
-            method_trace_rows[method] = [
-                dict(row)
-                for row in iteration_trace
-                if isinstance(row, Mapping)
-            ]
-        else:
-            method_trace_rows[method] = []
-
-    return method_results, method_trace_rows
-
-
-def _save_per_trial_plots(
+def _save_per_trial_experiment_outputs(
     methods: Sequence[str],
     method_results: Mapping[str, Mapping[str, Any]],
-    method_trace_rows: Mapping[str, Sequence[Mapping[str, Any]]],
+    method_elapsed_sec: Mapping[str, Optional[float]],
+    trial_config: Mapping[str, Any],
     num_aps: int,
     seed: int,
-    plots_dir: Path,
+    run_root: Path,
 ) -> Dict[str, Any]:
-    """Save run_experiments-style plots for one (AP, seed) trial."""
-    successful_methods = [method for method in methods if method in method_results]
+    """Save full run_experiments-style outputs for one (AP, seed) trial."""
     trial_key = f"aps_{int(num_aps):02d}_seed_{int(seed):04d}"
-    trial_dir = plots_dir / "per_trial" / trial_key
-    trial_dir.mkdir(parents=True, exist_ok=True)
+    trial_run_dir = run_root / "per_trial_runs" / trial_key
+    trial_artifacts_dir = trial_run_dir / "artifacts"
+    trial_plots_dir = trial_run_dir / "plots"
+    trial_artifacts_dir.mkdir(parents=True, exist_ok=True)
+    trial_plots_dir.mkdir(parents=True, exist_ok=True)
+
+    successful_methods = [
+        method
+        for method in methods
+        if isinstance(method_results.get(method), Mapping)
+    ]
+    failed_methods = [
+        method
+        for method in methods
+        if method not in successful_methods
+    ]
 
     if not successful_methods:
         return {
-            "plot_dir": str(trial_dir),
+            "run_dir": str(trial_run_dir),
+            "artifacts_dir": str(trial_artifacts_dir),
+            "plots_dir": str(trial_plots_dir),
             "methods_plotted": [],
-            "method_trend_html": {},
-            "comparison_plot_html": None,
-            "static_plot_artifacts": {},
+            "failed_methods": list(failed_methods),
+            "method_artifacts": {},
+            "summary_json": None,
+            "summary_csv": None,
+            "final_analysis_txt": None,
+            "launcher_summary_json": None,
             "warning": "No successful method payloads for this trial",
         }
 
-    method_trend_html: Dict[str, Optional[str]] = {}
+    normalized_method_results: Dict[str, Dict[str, Any]] = {
+        method: dict(method_results[method])
+        for method in successful_methods
+    }
+
+    method_artifacts: Dict[str, Dict[str, Optional[str]]] = {}
+    method_trace_rows: Dict[str, TraceRows] = {}
+    method_summary_rows: List[Dict[str, Any]] = []
+
     for method in successful_methods:
-        trend_path = trial_dir / f"{method}_trend.html"
-        method_trend_html[method] = _runner_save_method_trend_plot(
+        payload = normalized_method_results[method]
+        method_artifacts[method] = _runner_save_method_artifacts(
             method=method,
-            trace_rows=method_trace_rows.get(method, []),
-            plot_path=trend_path,
+            result_payload=payload,
+            method_config=trial_config,
+            artifacts_dir=trial_artifacts_dir,
+            plots_dir=trial_plots_dir,
+        )
+
+        trace_rows = _extract_method_iteration_trace(
+            method=method,
+            result_payload=payload,
+            method_config=trial_config,
+        )
+        method_trace_rows[method] = trace_rows
+
+        raw_num_iterations = _as_float(payload.get("num_iterations"))
+        reported_num_iterations = (
+            int(raw_num_iterations)
+            if raw_num_iterations is not None
+            else len(trace_rows)
+        )
+
+        method_summary_rows.append(
+            {
+                "method": method,
+                "elapsed_sec": _as_float(method_elapsed_sec.get(method)),
+                "best_primary_loss": _extract_best_primary_loss(method, payload),
+                "num_iterations": int(reported_num_iterations),
+                "result_json": method_artifacts[method].get("result_json"),
+                "trace_csv": method_artifacts[method].get("trace_csv"),
+                "trend_plot_html": method_artifacts[method].get("trend_plot_html"),
+            }
         )
 
     comparison_plot_html: Optional[str] = None
     if len(successful_methods) > 1:
         comparison_plot_html = _runner_save_comparison_plot(
             method_traces={
-                method: method_trace_rows.get(method, [])
+                method: method_trace_rows[method]
                 for method in successful_methods
             },
-            plot_path=trial_dir / "method_comparison_trend.html",
+            plot_path=trial_plots_dir / "method_comparison_trend.html",
         )
 
     static_plot_artifacts = save_static_comparison_plots(
         methods=successful_methods,
         method_results={
-            method: method_results[method]
+            method: normalized_method_results[method]
             for method in successful_methods
         },
         method_trace_rows={
-            method: method_trace_rows.get(method, [])
+            method: method_trace_rows[method]
             for method in successful_methods
         },
-        plots_dir=trial_dir,
+        plots_dir=trial_plots_dir,
         rssi_y_limits=_PER_TRIAL_RSSI_Y_LIMITS,
     )
 
+    final_analysis_text, ranked_analysis_rows = _runner_build_final_analysis_report(
+        run_dir=trial_run_dir,
+        methods=successful_methods,
+        method_summary_rows=method_summary_rows,
+        method_trace_rows=method_trace_rows,
+        method_results=normalized_method_results,
+    )
+
+    final_analysis_txt_path = trial_artifacts_dir / "final_analysis.txt"
+    final_analysis_txt_path.write_text(final_analysis_text, encoding="utf-8")
+
+    summary_payload: Dict[str, Any] = {
+        "run_dir": str(trial_run_dir),
+        "methods": list(successful_methods),
+        "failed_methods": list(failed_methods),
+        "method_summary": method_summary_rows,
+        "method_artifacts": method_artifacts,
+        "analysis": {
+            "final_analysis_txt": str(final_analysis_txt_path),
+            "ranked_methods": ranked_analysis_rows,
+            "static_plot_artifacts": static_plot_artifacts,
+        },
+    }
+
+    summary_json_path = trial_artifacts_dir / "experiment_summary.json"
+    summary_csv_path = trial_artifacts_dir / "method_summary.csv"
+    _write_json(summary_json_path, summary_payload)
+    _runner_write_csv(summary_csv_path, method_summary_rows)
+
+    launcher_summary_path = trial_artifacts_dir / "launcher_summary.json"
+    launcher_payload = {
+        "run_dir": str(trial_run_dir),
+        "summary_json": str(summary_json_path),
+        "summary_csv": str(summary_csv_path),
+        "comparison_plot_html": comparison_plot_html,
+        "final_analysis_txt": str(final_analysis_txt_path),
+        "static_plot_artifacts": static_plot_artifacts,
+    }
+    _write_json(launcher_summary_path, launcher_payload)
+
     return {
-        "plot_dir": str(trial_dir),
-        "methods_plotted": successful_methods,
-        "method_trend_html": method_trend_html,
+        "run_dir": str(trial_run_dir),
+        "artifacts_dir": str(trial_artifacts_dir),
+        "plots_dir": str(trial_plots_dir),
+        "methods_plotted": list(successful_methods),
+        "failed_methods": list(failed_methods),
+        "method_artifacts": method_artifacts,
         "comparison_plot_html": comparison_plot_html,
         "static_plot_artifacts": static_plot_artifacts,
+        "summary_json": str(summary_json_path),
+        "summary_csv": str(summary_csv_path),
+        "final_analysis_txt": str(final_analysis_txt_path),
+        "launcher_summary_json": str(launcher_summary_path),
     }
 
 
@@ -1106,7 +1047,7 @@ def plot_iteration_traces(
                     marker=style["marker"],
                     linewidth=1.8,
                     markersize=3.8,
-                    label=method,
+                    label=_display_method_name(method),
                 )
 
             axis.set_title(title)
@@ -1207,7 +1148,7 @@ def plot_elbow_curves(
                 marker=style["marker"],
                 linewidth=2.2,
                 markersize=5.0,
-                label=method,
+                label=_display_method_name(method),
             )
             axis.fill_between(
                 x_array,
@@ -1301,10 +1242,12 @@ def main() -> int:
         print(f"[sweep] elbow y-range: fixed {fixed_y_limits}")
 
     store: SweepStore = {}
+    per_trial_plot_artifacts: Dict[str, Any] = {}
 
     for num_aps in ap_values:
         for seed in seeds:
             run_name = f"aps_{int(num_aps):02d}_seed_{int(seed)}"
+            trial_key = f"aps_{int(num_aps):02d}_seed_{int(seed):04d}"
             print(
                 f"[run] start num_aps={int(num_aps)}, seed={int(seed)}, "
                 f"run_name={run_name}"
@@ -1315,6 +1258,8 @@ def main() -> int:
                 seed=seed,
                 verbose_override=bool(args.verbose),
             )
+            trial_method_results: Dict[str, Dict[str, Any]] = {}
+            trial_method_elapsed_sec: Dict[str, Optional[float]] = {}
 
             if "memetic" in methods:
                 memetic_start = time.perf_counter()
@@ -1327,7 +1272,11 @@ def main() -> int:
                     )
                     memetic_elapsed = float(time.perf_counter() - memetic_start)
                     memetic_metrics = _extract_scalar_metrics("memetic", memetic_payload)
-                    memetic_trace = _extract_method_iteration_trace("memetic", memetic_payload)
+                    memetic_trace = _extract_method_iteration_trace(
+                        "memetic",
+                        memetic_payload,
+                        method_config=trial_config,
+                    )
 
                     _set_run_entry(
                         store=store,
@@ -1342,6 +1291,8 @@ def main() -> int:
                             "saved_artifacts": memetic_payload.get("saved_artifacts", {}),
                         },
                     )
+                    trial_method_results["memetic"] = dict(memetic_payload)
+                    trial_method_elapsed_sec["memetic"] = float(memetic_elapsed)
                 except Exception as exc:
                     _set_run_entry(
                         store=store,
@@ -1357,6 +1308,7 @@ def main() -> int:
                             "traceback": traceback.format_exc(),
                         },
                     )
+                    trial_method_elapsed_sec["memetic"] = None
                     print(f"[run] memetic failed for AP={num_aps}, seed={seed}: {type(exc).__name__}: {exc}")
 
             baseline_methods = [method for method in methods if method in _BASELINE_METHODS]
@@ -1374,7 +1326,11 @@ def main() -> int:
                         elapsed_sec = _as_float(method_result.get("elapsed_sec"))
                         if isinstance(payload, Mapping):
                             metrics = _extract_scalar_metrics(method, payload)
-                            trace_rows = _extract_method_iteration_trace(method, payload)
+                            trace_rows = _extract_method_iteration_trace(
+                                method,
+                                payload,
+                                method_config=trial_config,
+                            )
                             _set_run_entry(
                                 store=store,
                                 method=method,
@@ -1387,6 +1343,8 @@ def main() -> int:
                                     "iteration_trace": trace_rows,
                                 },
                             )
+                            trial_method_results[method] = dict(payload)
+                            trial_method_elapsed_sec[method] = elapsed_sec
                             continue
 
                     error_text = baseline_errors.get(method, "Unknown baseline execution error")
@@ -1403,7 +1361,38 @@ def main() -> int:
                             "error": error_text,
                         },
                     )
+                    trial_method_elapsed_sec[method] = None
                     print(f"[run] {method} failed for AP={num_aps}, seed={seed}: {error_text}")
+
+            try:
+                per_trial_plot_artifacts[trial_key] = _save_per_trial_experiment_outputs(
+                    methods=methods,
+                    method_results=trial_method_results,
+                    method_elapsed_sec=trial_method_elapsed_sec,
+                    trial_config=trial_config,
+                    num_aps=num_aps,
+                    seed=seed,
+                    run_root=run_root,
+                )
+
+                warning = per_trial_plot_artifacts[trial_key].get("warning")
+                if warning is None:
+                    print(
+                        "[save] per-trial artifacts saved: "
+                        f"AP={int(num_aps)} seed={int(seed)} -> "
+                        f"{per_trial_plot_artifacts[trial_key].get('run_dir')}"
+                    )
+                else:
+                    print(
+                        "[save] per-trial artifacts skipped: "
+                        f"AP={int(num_aps)} seed={int(seed)} ({warning})"
+                    )
+            except Exception as exc:
+                per_trial_plot_artifacts[trial_key] = {
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "traceback": traceback.format_exc(),
+                }
+                print(f"[save] per-trial artifact save failed for AP={num_aps}, seed={seed}: {type(exc).__name__}: {exc}")
 
             trial_mean_rss_values: List[float] = []
             for method in methods:
@@ -1470,45 +1459,6 @@ def main() -> int:
     }
     _write_json(sweep_results_path, sweep_payload)
     print(f"[save] sweep results: {sweep_results_path}")
-
-    per_trial_plot_artifacts: Dict[str, Any] = {}
-    for num_aps in ap_values:
-        for seed in seeds:
-            trial_key = f"aps_{int(num_aps):02d}_seed_{int(seed):04d}"
-            try:
-                trial_method_results, trial_method_traces = _build_per_trial_plot_inputs(
-                    store=store,
-                    methods=methods,
-                    num_aps=num_aps,
-                    seed=seed,
-                )
-                per_trial_plot_artifacts[trial_key] = _save_per_trial_plots(
-                    methods=methods,
-                    method_results=trial_method_results,
-                    method_trace_rows=trial_method_traces,
-                    num_aps=num_aps,
-                    seed=seed,
-                    plots_dir=plots_dir,
-                )
-
-                warning = per_trial_plot_artifacts[trial_key].get("warning")
-                if warning is None:
-                    print(
-                        "[plot] per-trial plots saved: "
-                        f"AP={int(num_aps)} seed={int(seed)} -> "
-                        f"{per_trial_plot_artifacts[trial_key].get('plot_dir')}"
-                    )
-                else:
-                    print(
-                        "[plot] per-trial plots skipped: "
-                        f"AP={int(num_aps)} seed={int(seed)} ({warning})"
-                    )
-            except Exception as exc:
-                per_trial_plot_artifacts[trial_key] = {
-                    "error": f"{type(exc).__name__}: {exc}",
-                    "traceback": traceback.format_exc(),
-                }
-                print(f"[plot] per-trial plotting failed for AP={num_aps}, seed={seed}: {type(exc).__name__}: {exc}")
 
     plot_artifacts: Dict[str, Any] = {
         "per_trial_plots": per_trial_plot_artifacts,

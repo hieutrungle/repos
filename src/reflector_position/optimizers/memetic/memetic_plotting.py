@@ -2238,6 +2238,13 @@ def _resolve_render_scene_config(
     if visualization_scene_path is not None:
         render_scene_config["scene_path"] = str(visualization_scene_path)
 
+    # Preserve top-level placement controls used by scene setup when they are
+    # not embedded inside scene_config.
+    if "num_aps" in config_args and "num_aps" not in render_scene_config:
+        render_scene_config["num_aps"] = config_args.get("num_aps")
+    if "position_bounds" in config_args and "position_bounds" not in render_scene_config:
+        render_scene_config["position_bounds"] = config_args.get("position_bounds")
+
     return render_scene_config
 
 
@@ -2352,10 +2359,18 @@ def _render_coverage_snapshot(
 
     from reflector_position.scene_setup import create_camera, setup_building_floor_scene
 
+    effective_num_aps = scene_config.get("num_aps")
+    if effective_num_aps is None:
+        snapshot_positions = snapshot.get("positions")
+        if isinstance(snapshot_positions, Sequence) and not isinstance(snapshot_positions, (str, bytes)):
+            effective_num_aps = int(len(snapshot_positions))
+
     loaded = setup_building_floor_scene(
         scene_path=str(scene_config["scene_path"]),
         frequency=scene_config.get("frequency", 6e9),
         tx_positions=scene_config.get("tx_positions", None),
+        num_aps=effective_num_aps,
+        position_bounds=scene_config.get("position_bounds", None),
         tx_power_dbm=scene_config.get("tx_power_dbm", 5.0),
         rx_position=scene_config.get("rx_position", (16.0, 16.5, 1.5)),
         reflector_enabled=scene_config.get("reflector_enabled", False),

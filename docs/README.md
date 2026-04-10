@@ -11,6 +11,7 @@ User-focused guides for installation, usage, and quick reference:
 - **[USAGE.md](guides/USAGE.md)** - Detailed usage guide with examples
 - **[QUICKREF.md](guides/QUICKREF.md)** - Quick reference for common tasks
 - **[RAY_EXPERIMENT_RUNNER.md](guides/RAY_EXPERIMENT_RUNNER.md)** - Comprehensive guide: config schema, all trial parameters (GD/GS/GA), reflector geometry, sweep groups, output format, and workflow recipes
+- **[RUN_EXPERIMENTS_CONFIG_REFERENCE.md](guides/RUN_EXPERIMENTS_CONFIG_REFERENCE.md)** - Field-by-field reference and tuning guide for configs/run_experiments_cuda_hrbb.json
 
 ### 🏗️ Architecture (Project Structure)
 Technical documentation about the codebase:
@@ -50,6 +51,7 @@ Comprehensive testing documentation and guides:
 - **Run an optimization** → [guides/USAGE.md](guides/USAGE.md)
 - **Use parallel optimization (Ray)** → [methodology/RAY_PARALLEL_GUIDE.md](methodology/RAY_PARALLEL_GUIDE.md)
 - **Run unified Ray hyperparameter tuning** → [guides/RAY_EXPERIMENT_RUNNER.md](guides/RAY_EXPERIMENT_RUNNER.md)
+- **Tune run_experiments config quickly** → [guides/RUN_EXPERIMENTS_CONFIG_REFERENCE.md](guides/RUN_EXPERIMENTS_CONFIG_REFERENCE.md)
 - **Run genetic algorithm (DEAP)** → [methodology/GA_DEAP_IMPLEMENTATION.md](methodology/GA_DEAP_IMPLEMENTATION.md)
 - **Test the code** → [tests/README.md](tests/README.md)
 - **Understand the code structure** → [architecture/PROJECT_STRUCTURE.md](architecture/PROJECT_STRUCTURE.md)

@@ -187,7 +187,14 @@ def run_weighted_kmeans_baseline(
         "primary_loss": float(best_primary_loss),
         "running_best_primary_loss": float(best_primary_loss),
     }
-    for metric_key in ("mean_rss_dbm", "min_rss_dbm", "p5_rss_dbm"):
+    for metric_key in (
+        "mean_rss_dbm",
+        "min_rss_dbm",
+        "p5_rss_dbm",
+        "priority_mean_rss_dbm",
+        "priority_min_rss_dbm",
+        "priority_p5_rss_dbm",
+    ):
         if metric_key in physical_metrics:
             iteration_row[metric_key] = float(physical_metrics[metric_key])
 
