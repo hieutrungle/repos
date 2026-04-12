@@ -24,7 +24,20 @@ Instructions
     - artifacts/sweep_results.json
     - artifacts/plot_artifacts.json
     - plots/iteration_traces/*.png
-    - plots/elbow/*.png
+    - plots/elbow/elbow_primary_loss.png
+    - plots/elbow/elbow_mean_rss_dbm.png
+    - plots/elbow/elbow_min_rss_dbm.png
+    - plots/elbow/elbow_p5_rss_dbm.png
+    - plots/elbow/elbow_priority_mean_rss_dbm.png
+    - plots/elbow/elbow_priority_min_rss_dbm.png
+    - plots/elbow/elbow_priority_p5_rss_dbm.png
+
+Equalization config
+-------------------
+- Configure equalization under iteration_equalization in the JSON config:
+    - enabled: true|false
+    - target_iterations: optional integer target
+- This sweep runner reads equalization settings only from config.
 
 Example
 -------
@@ -34,6 +47,13 @@ python scripts/run_all_methods_ap_sweep.py \
      --ap_min 1 --ap_max 8 \
      --seeds 41 42 43 \
      --output_dir results/ap_sweep
+
+python scripts/run_all_methods_ap_sweep.py \
+         --methods all \
+         --config configs/run_experiments_cuda_hrbb.smoke_ap_sweep.json \
+         --ap_min 2 --ap_max 3 \
+         --seeds 301 \
+         --output_dir tmp_results/smoke_alignment
 """
 
 from __future__ import annotations
@@ -86,6 +106,8 @@ from run_experiments import (
     _resolve_demand_config as _runner_resolve_demand_config,
     _resolve_ga_evaluation_params as _runner_resolve_ga_evaluation_params,
     _resolve_gd_params as _runner_resolve_gd_params,
+    _resolve_iteration_equalization as _runner_resolve_iteration_equalization,
+    _resolve_method_sequence as _runner_resolve_method_sequence,
     _resolve_num_workers as _runner_resolve_num_workers,
     _resolve_objective_params as _runner_resolve_objective_params,
     _resolve_pso_params as _runner_resolve_pso_params,
@@ -130,6 +152,9 @@ _ELBOW_METRICS: Tuple[Tuple[str, str, str], ...] = (
     ("mean_rss_dbm", "AP Count vs Mean RSSI", "RSSI (dBm)"),
     ("min_rss_dbm", "AP Count vs Minimum RSSI", "RSSI (dBm)"),
     ("p5_rss_dbm", "AP Count vs 5th Percentile RSSI", "RSSI (dBm)"),
+    ("priority_mean_rss_dbm", "AP Count vs Priority Mean RSSI", "RSSI (dBm)"),
+    ("priority_min_rss_dbm", "AP Count vs Priority Minimum RSSI", "RSSI (dBm)"),
+    ("priority_p5_rss_dbm", "AP Count vs Priority 5th Percentile RSSI", "RSSI (dBm)"),
 )
 
 _ITERATION_METRICS: Tuple[Tuple[str, str, str], ...] = (
@@ -233,15 +258,14 @@ def _normalize_methods(raw_methods: Sequence[str]) -> List[str]:
 
     expanded: List[str] = []
     for token in cleaned:
-        if token == "all":
-            expanded.extend(_SINGLE_METHODS)
-            continue
-        if token == "all_baselines":
-            expanded.extend(_BASELINE_METHODS)
-            continue
-        if token not in _SINGLE_METHODS:
+        resolved_sequence = _runner_resolve_method_sequence(token)
+        if not resolved_sequence:
             raise ValueError(f"Unsupported method token: {token!r}")
-        expanded.append(token)
+
+        for method in resolved_sequence:
+            if method not in _SINGLE_METHODS:
+                raise ValueError(f"Unsupported method token: {token!r}")
+            expanded.append(method)
 
     ordered_unique: List[str] = []
     seen = set()
@@ -511,53 +535,47 @@ def _run_memetic_for_trial(
 
 
 def _run_requested_baselines_for_trial(
-    trial_config: Mapping[str, Any],
+    method_configs: Mapping[str, Mapping[str, Any]],
     baseline_methods: Sequence[str],
     seed: int,
 ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, str]]:
     """Run requested baselines under one shared baseline Ray lifecycle."""
-    scene_config_value = trial_config.get("scene_config")
+    if not baseline_methods:
+        return {}, {}
+
+    reference_method = str(baseline_methods[0])
+    reference_config = method_configs.get(reference_method)
+    if not isinstance(reference_config, Mapping):
+        raise ValueError(
+            "method_configs must provide one mapping config for each requested baseline method"
+        )
+
+    scene_config_value = reference_config.get("scene_config")
     if not isinstance(scene_config_value, Mapping):
         raise ValueError("Config must contain scene_config mapping for baseline execution")
 
     scene_config = dict(scene_config_value)
-    demand_config = _runner_resolve_demand_config(trial_config)
+    demand_config = _runner_resolve_demand_config(reference_config)
 
-    num_workers = _runner_resolve_num_workers(trial_config)
-    configured_gpu_fraction = float(trial_config.get("gpu_fraction", 0.0))
+    num_workers = _runner_resolve_num_workers(reference_config)
+    configured_gpu_fraction = float(reference_config.get("gpu_fraction", 0.0))
     gpu_fraction = _runner_enforce_baseline_cuda(
         scene_config=scene_config,
         num_workers=num_workers,
         configured_gpu_fraction=configured_gpu_fraction,
     )
 
-    num_aps = int(trial_config.get("num_aps", 2))
-    fixed_z = float(trial_config.get("fixed_z", 3.8))
-    optimize_orientation = bool(trial_config.get("optimize_orientation", True))
+    num_aps = int(reference_config.get("num_aps", 2))
+    fixed_z = float(reference_config.get("fixed_z", 3.8))
+    optimize_orientation = bool(reference_config.get("optimize_orientation", True))
 
-    x_bounds, y_bounds = _runner_extract_xy_bounds(trial_config)
+    x_bounds, y_bounds = _runner_extract_xy_bounds(reference_config)
     scene_config["num_aps"] = int(num_aps)
     scene_config["position_bounds"] = {
         "x_min": float(x_bounds[0]),
         "x_max": float(x_bounds[1]),
         "y_min": float(y_bounds[0]),
         "y_max": float(y_bounds[1]),
-    }
-
-    random_params = _runner_get_optional_mapping(trial_config, "random_params")
-    random_num_samples = int(random_params.get("num_samples", trial_config.get("num_samples", 100)))
-
-    random_gd_params = _runner_get_optional_mapping(trial_config, "random_gd_params")
-    random_gd_num_samples = int(random_gd_params.get("num_samples", 10))
-
-    objective_params = _runner_resolve_objective_params(trial_config)
-    ga_evaluation_params = _runner_resolve_ga_evaluation_params(trial_config)
-    gd_params = _runner_resolve_gd_params(trial_config, objective_params=objective_params)
-    pso_params = _runner_resolve_pso_params(trial_config)
-
-    warmup_eval_params = {
-        "samples_per_tx": int(min(int(ga_evaluation_params.get("samples_per_tx", 10_000)), 10_000)),
-        "max_depth": int(min(int(ga_evaluation_params.get("max_depth", 3)), 3)),
     }
 
     results_by_method: Dict[str, Dict[str, Any]] = {}
@@ -573,7 +591,7 @@ def _run_requested_baselines_for_trial(
             demand_config=demand_config,
             num_workers=num_workers,
             gpu_fraction=gpu_fraction,
-            verbose=bool(trial_config.get("verbose", True)),
+            verbose=bool(reference_config.get("verbose", True)),
         )
 
         ray_optimizer = RawRayParallelOptimizer(
@@ -587,6 +605,27 @@ def _run_requested_baselines_for_trial(
         for method in baseline_methods:
             random.seed(int(seed))
             np.random.seed(int(seed))
+
+            method_config = method_configs.get(method, reference_config)
+            if not isinstance(method_config, Mapping):
+                method_config = reference_config
+
+            random_params = _runner_get_optional_mapping(method_config, "random_params")
+            random_num_samples = int(
+                random_params.get("num_samples", method_config.get("num_samples", 100))
+            )
+            random_gd_params = _runner_get_optional_mapping(method_config, "random_gd_params")
+            random_gd_num_samples = int(random_gd_params.get("num_samples", 10))
+
+            objective_params = _runner_resolve_objective_params(method_config)
+            ga_evaluation_params = _runner_resolve_ga_evaluation_params(method_config)
+            gd_params = _runner_resolve_gd_params(method_config, objective_params=objective_params)
+            pso_params = _runner_resolve_pso_params(method_config)
+
+            warmup_eval_params = {
+                "samples_per_tx": int(min(int(ga_evaluation_params.get("samples_per_tx", 10_000)), 10_000)),
+                "max_depth": int(min(int(ga_evaluation_params.get("max_depth", 3)), 3)),
+            }
 
             started_at = time.perf_counter()
             try:
@@ -605,7 +644,7 @@ def _run_requested_baselines_for_trial(
                     )
                 elif method == "kmeans":
                     floorplan_coords = _runner_extract_floorplan_coords(
-                        config=trial_config,
+                        config=method_config,
                         x_bounds=x_bounds,
                         y_bounds=y_bounds,
                     )
@@ -621,7 +660,7 @@ def _run_requested_baselines_for_trial(
                     )
                 elif method == "weighted_kmeans":
                     floorplan_coords = _runner_extract_floorplan_coords(
-                        config=trial_config,
+                        config=method_config,
                         x_bounds=x_bounds,
                         y_bounds=y_bounds,
                     )
@@ -822,7 +861,7 @@ def _save_per_trial_experiment_outputs(
     methods: Sequence[str],
     method_results: Mapping[str, Mapping[str, Any]],
     method_elapsed_sec: Mapping[str, Optional[float]],
-    trial_config: Mapping[str, Any],
+    method_configs: Mapping[str, Mapping[str, Any]],
     num_aps: int,
     seed: int,
     run_root: Path,
@@ -872,10 +911,11 @@ def _save_per_trial_experiment_outputs(
 
     for method in successful_methods:
         payload = normalized_method_results[method]
+        method_config = method_configs.get(method)
         method_artifacts[method] = _runner_save_method_artifacts(
             method=method,
             result_payload=payload,
-            method_config=trial_config,
+            method_config=method_config,
             artifacts_dir=trial_artifacts_dir,
             plots_dir=trial_plots_dir,
         )
@@ -883,7 +923,7 @@ def _save_per_trial_experiment_outputs(
         trace_rows = _extract_method_iteration_trace(
             method=method,
             result_payload=payload,
-            method_config=trial_config,
+            method_config=method_config,
         )
         method_trace_rows[method] = trace_rows
 
@@ -1241,8 +1281,29 @@ def main() -> int:
     else:
         print(f"[sweep] elbow y-range: fixed {fixed_y_limits}")
 
+    equalization_config = _runner_get_optional_mapping(base_config, "iteration_equalization")
+    config_equalization_enabled = bool(equalization_config.get("enabled", False))
+    config_target_iterations: Optional[int] = None
+    if "target_iterations" in equalization_config:
+        raw_target_iterations = equalization_config.get("target_iterations")
+        if raw_target_iterations is not None:
+            try:
+                config_target_iterations = int(raw_target_iterations)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("iteration_equalization.target_iterations must be an integer") from exc
+
+    equalization_enabled = bool(config_equalization_enabled)
+    target_iterations = config_target_iterations
+    if target_iterations is not None and int(target_iterations) <= 0:
+        raise ValueError("Target iterations must be > 0")
+
+    if equalization_enabled:
+        print("[iterations] equalization enabled")
+        print(f"[iterations] target={target_iterations if target_iterations is not None else 'auto'}")
+
     store: SweepStore = {}
     per_trial_plot_artifacts: Dict[str, Any] = {}
+    per_trial_iteration_plans: Dict[str, Dict[str, Any]] = {}
 
     for num_aps in ap_values:
         for seed in seeds:
@@ -1258,14 +1319,23 @@ def main() -> int:
                 seed=seed,
                 verbose_override=bool(args.verbose),
             )
+            method_trial_configs, trial_iteration_plan = _runner_resolve_iteration_equalization(
+                methods=methods,
+                base_config=trial_config,
+                enabled=equalization_enabled,
+                target_iterations=target_iterations,
+            )
+            per_trial_iteration_plans[trial_key] = dict(trial_iteration_plan)
+
             trial_method_results: Dict[str, Dict[str, Any]] = {}
             trial_method_elapsed_sec: Dict[str, Optional[float]] = {}
 
             if "memetic" in methods:
                 memetic_start = time.perf_counter()
                 try:
+                    memetic_config = method_trial_configs.get("memetic", trial_config)
                     memetic_payload = _run_memetic_for_trial(
-                        trial_config=trial_config,
+                        trial_config=memetic_config,
                         run_root=run_root,
                         num_aps=num_aps,
                         seed=seed,
@@ -1275,7 +1345,7 @@ def main() -> int:
                     memetic_trace = _extract_method_iteration_trace(
                         "memetic",
                         memetic_payload,
-                        method_config=trial_config,
+                        method_config=memetic_config,
                     )
 
                     _set_run_entry(
@@ -1314,7 +1384,7 @@ def main() -> int:
             baseline_methods = [method for method in methods if method in _BASELINE_METHODS]
             if baseline_methods:
                 baseline_results, baseline_errors = _run_requested_baselines_for_trial(
-                    trial_config=trial_config,
+                    method_configs=method_trial_configs,
                     baseline_methods=baseline_methods,
                     seed=seed,
                 )
@@ -1326,10 +1396,11 @@ def main() -> int:
                         elapsed_sec = _as_float(method_result.get("elapsed_sec"))
                         if isinstance(payload, Mapping):
                             metrics = _extract_scalar_metrics(method, payload)
+                            method_config = method_trial_configs.get(method, trial_config)
                             trace_rows = _extract_method_iteration_trace(
                                 method,
                                 payload,
-                                method_config=trial_config,
+                                method_config=method_config,
                             )
                             _set_run_entry(
                                 store=store,
@@ -1369,7 +1440,7 @@ def main() -> int:
                     methods=methods,
                     method_results=trial_method_results,
                     method_elapsed_sec=trial_method_elapsed_sec,
-                    trial_config=trial_config,
+                    method_configs=method_trial_configs,
                     num_aps=num_aps,
                     seed=seed,
                     run_root=run_root,
@@ -1448,6 +1519,17 @@ def main() -> int:
         "methods": methods,
         "ap_values": ap_values,
         "seeds": seeds,
+        "iteration_equalization": {
+            "enabled": bool(equalization_enabled),
+            "target_iterations": int(target_iterations) if target_iterations is not None else None,
+            "config_enabled": bool(config_equalization_enabled),
+            "config_target_iterations": (
+                int(config_target_iterations)
+                if config_target_iterations is not None
+                else None
+            ),
+            "per_trial_plans": per_trial_iteration_plans,
+        },
         "fixed_elbow_y_limits": {
             "y_min": fixed_y_limits[0],
             "y_max": fixed_y_limits[1],

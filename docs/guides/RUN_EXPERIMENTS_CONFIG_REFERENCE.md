@@ -233,10 +233,28 @@ Tuning guidance:
 - iteration_equalization.enabled: Enables equal total iteration budgets for non-kmeans methods.
 - iteration_equalization.target_iterations: Optional fixed target. If omitted and enabled, runner derives target from configured methods.
 
+AP sweep behavior (scripts/run_all_methods_ap_sweep.py):
+
+- Equalization is config-driven for AP sweeps.
+- Set iteration_equalization.enabled in config to turn equalization on or off.
+- Set iteration_equalization.target_iterations in config for an explicit target.
+- The AP sweep runner does not expose equalization CLI flags.
+
 Tuning guidance:
 
 - Enable this for fair method-comparison reports.
 - Use explicit target_iterations for reproducible benchmarking protocols.
+
+Example sweep command (equalization comes from config):
+
+```bash
+python scripts/run_all_methods_ap_sweep.py \
+  --methods all \
+  --config configs/run_experiments_cuda_hrbb.smoke_ap_sweep.json \
+  --ap_min 2 --ap_max 3 \
+  --seeds 301 \
+  --output_dir tmp_results/smoke_alignment
+```
 
 ## Suggested presets
 

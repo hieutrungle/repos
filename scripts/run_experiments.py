@@ -11,9 +11,9 @@ Instructions
    - `<run_dir>/artifacts/*.json|*.csv`
    - `<run_dir>/plots/*.html`
 5. Per-method iteration traces are exported to CSV and plotted as trend charts.
-6. Optional iteration equalization for non-KMeans methods:
-    - `--equalize_iterations`
-    - `--target_iterations N`
+6. Optional iteration equalization for non-KMeans methods is config-driven:
+    - `iteration_equalization.enabled`
+    - `iteration_equalization.target_iterations`
 
 python scripts/run_experiments.py --method all \
     --config configs/run_experiments_cuda_hrbb.json \
@@ -141,23 +141,6 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         type=str,
         help="Optional run folder name.",
-    )
-    parser.add_argument(
-        "--equalize_iterations",
-        action="store_true",
-        help=(
-            "Equalize total iteration budgets for non-KMeans methods by "
-            "adjusting GD steps and random samples where needed."
-        ),
-    )
-    parser.add_argument(
-        "--target_iterations",
-        default=None,
-        type=int,
-        help=(
-            "Optional target total iterations for non-KMeans methods when "
-            "equalization is enabled."
-        ),
     )
     return parser.parse_args()
 
@@ -1747,9 +1730,6 @@ def main() -> None:
     """CLI entry point for running and saving experiment methods."""
     args = _parse_args()
 
-    if args.target_iterations is not None and int(args.target_iterations) <= 0:
-        raise ValueError("--target_iterations must be > 0 when provided")
-
     config_path = Path(args.config)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1775,16 +1755,8 @@ def main() -> None:
             except (TypeError, ValueError) as exc:
                 raise ValueError("iteration_equalization.target_iterations must be an integer") from exc
 
-    equalization_enabled = bool(
-        args.equalize_iterations
-        or args.target_iterations is not None
-        or config_equalization_enabled
-    )
-    target_iterations = (
-        int(args.target_iterations)
-        if args.target_iterations is not None
-        else config_target_iterations
-    )
+    equalization_enabled = bool(config_equalization_enabled)
+    target_iterations = config_target_iterations
     if target_iterations is not None and int(target_iterations) <= 0:
         raise ValueError("Target iterations must be > 0")
 

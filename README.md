@@ -64,6 +64,32 @@ Run AP-count by seed sweeps:
 python scripts/run_num_aps_seed_sweep.py --help
 ```
 
+Run all-method AP sweeps with per-trial artifacts and elbow plots:
+
+```bash
+python scripts/run_all_methods_ap_sweep.py \
+  --methods all \
+  --config configs/run_experiments_cuda_hrbb.smoke_ap_sweep.json \
+  --ap_min 2 --ap_max 3 \
+  --seeds 301 \
+  --output_dir tmp_results/smoke_alignment
+```
+
+Equalization notes for AP sweeps (config-driven):
+
+- Configure `iteration_equalization.enabled` and `iteration_equalization.target_iterations` in your JSON config.
+- The AP sweep runner reads equalization settings from config only.
+
+Sweep-level elbow outputs include both standard and priority-only curves:
+
+- `plots/elbow/elbow_primary_loss.png`
+- `plots/elbow/elbow_mean_rss_dbm.png`
+- `plots/elbow/elbow_min_rss_dbm.png`
+- `plots/elbow/elbow_p5_rss_dbm.png`
+- `plots/elbow/elbow_priority_mean_rss_dbm.png`
+- `plots/elbow/elbow_priority_min_rss_dbm.png`
+- `plots/elbow/elbow_priority_p5_rss_dbm.png`
+
 ## Unified Experiments Runner (Memetic + Baselines)
 
 Use the unified runner to execute one method or compare multiple methods with
