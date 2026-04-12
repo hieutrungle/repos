@@ -857,6 +857,273 @@ def _compute_aggregate_stats(
     return aggregates
 
 
+def _build_running_best_series(trace_rows: Sequence[Mapping[str, Any]]) -> List[float]:
+    """Build running-best primary-loss series from one method trace."""
+    values: List[float] = []
+    running_best = float("inf")
+
+    for row in trace_rows:
+        selected: Optional[float] = None
+        for key in _PRIMARY_TRACE_KEYS:
+            if key not in row:
+                continue
+            selected = _as_float(row.get(key))
+            if selected is not None:
+                break
+
+        if selected is None:
+            continue
+
+        running_best = min(running_best, float(selected))
+        values.append(float(running_best))
+
+    return values
+
+
+def _metric_key_with_priority_fallback(metric_key: str) -> Optional[str]:
+    """Map priority metric keys to corresponding all-region metric keys."""
+    if not str(metric_key).startswith("priority_"):
+        return None
+    fallback = str(metric_key)[len("priority_") :]
+    if fallback in ("mean_rss_dbm", "min_rss_dbm", "p5_rss_dbm"):
+        return fallback
+    return None
+
+
+def _build_primary_loss_series_for_static(
+    method: str,
+    trace_rows: Sequence[Mapping[str, Any]],
+    result_payload: Mapping[str, Any],
+) -> List[float]:
+    """Build one primary-loss series for static-plot data export."""
+    series = _extract_trace_metric_series(trace_rows, "primary_loss")
+    if series:
+        return [float(value) for value in series]
+
+    best_primary = _extract_best_primary_loss(method=method, result_payload=result_payload)
+    if best_primary is not None:
+        return [float(best_primary)]
+
+    return []
+
+
+def _build_rssi_series_for_static(
+    method: str,
+    trace_rows: Sequence[Mapping[str, Any]],
+    result_payload: Mapping[str, Any],
+    metric_key: str,
+    fallback_length: int,
+) -> List[float]:
+    """Build one RSSI series for static-plot data export."""
+    resolved_length = max(1, int(fallback_length))
+    series = _extract_trace_metric_series(trace_rows, metric_key)
+    if series:
+        return [float(value) for value in series]
+
+    best_metrics = _extract_best_physical_metrics(method=method, result_payload=result_payload)
+    metric_value = _as_float(best_metrics.get(metric_key))
+    if metric_value is not None:
+        return [float(metric_value)] * int(resolved_length)
+
+    fallback_metric = _metric_key_with_priority_fallback(metric_key)
+    if fallback_metric is not None:
+        fallback_series = _extract_trace_metric_series(trace_rows, fallback_metric)
+        if fallback_series:
+            return [float(value) for value in fallback_series]
+
+        fallback_value = _as_float(best_metrics.get(fallback_metric))
+        if fallback_value is not None:
+            return [float(fallback_value)] * int(resolved_length)
+
+    return []
+
+
+def _build_per_trial_plot_data(
+    methods: Sequence[str],
+    method_results: Mapping[str, Mapping[str, Any]],
+    method_trace_rows: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> Dict[str, Any]:
+    """Build raw x/y series payload for all per-trial generated plots."""
+    trend_keys: Tuple[str, ...] = (
+        "running_best_primary_loss",
+        "global_best_primary_loss",
+        "min_primary_loss",
+        "mean_primary_loss",
+        "max_primary_loss",
+        "primary_loss",
+        "swarm_best_primary_loss",
+        "swarm_mean_primary_loss",
+    )
+    all_region_metrics: Tuple[str, ...] = ("mean_rss_dbm", "min_rss_dbm", "p5_rss_dbm")
+    priority_metrics: Tuple[str, ...] = (
+        "priority_mean_rss_dbm",
+        "priority_min_rss_dbm",
+        "priority_p5_rss_dbm",
+    )
+
+    method_trends: Dict[str, Any] = {}
+    comparison_running_best: Dict[str, Any] = {}
+
+    for method in methods:
+        trace_rows = list(method_trace_rows.get(method, []))
+        if not trace_rows:
+            continue
+
+        x_values = list(range(1, len(trace_rows) + 1))
+        phases = [str(row.get("phase", "")) for row in trace_rows]
+        series_payload: Dict[str, List[Optional[float]]] = {}
+        for key in trend_keys:
+            series_payload[key] = [_as_float(row.get(key)) for row in trace_rows]
+
+        method_trends[method] = {
+            "x": x_values,
+            "phase": phases,
+            "series": series_payload,
+        }
+
+        running_best = _build_running_best_series(trace_rows)
+        if running_best:
+            comparison_running_best[method] = {
+                "x": list(range(1, len(running_best) + 1)),
+                "y": [float(value) for value in running_best],
+            }
+
+    static_primary_raw: Dict[str, List[float]] = {}
+    for method in methods:
+        static_primary_raw[method] = _build_primary_loss_series_for_static(
+            method=method,
+            trace_rows=method_trace_rows.get(method, []),
+            result_payload=method_results.get(method, {}),
+        )
+    primary_target_len = max((len(series) for series in static_primary_raw.values()), default=0)
+    static_primary: Dict[str, Any] = {}
+    for method in methods:
+        expanded = _expand_single_point_series(
+            static_primary_raw.get(method, []),
+            target_len=primary_target_len,
+        )
+        if not expanded:
+            continue
+        static_primary[method] = {
+            "x": list(range(1, len(expanded) + 1)),
+            "y": [float(value) for value in expanded],
+        }
+
+    def _build_per_method_triplet_payload(metric_keys: Sequence[str]) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {}
+        for method in methods:
+            trace_rows = method_trace_rows.get(method, [])
+            fallback_len = max(1, len(trace_rows))
+            raw_by_metric: Dict[str, List[float]] = {}
+            for metric_key in metric_keys:
+                raw_by_metric[metric_key] = _build_rssi_series_for_static(
+                    method=method,
+                    trace_rows=trace_rows,
+                    result_payload=method_results.get(method, {}),
+                    metric_key=metric_key,
+                    fallback_length=fallback_len,
+                )
+
+            target_len = max((len(series) for series in raw_by_metric.values()), default=0)
+            if target_len < 1:
+                continue
+
+            metric_payload: Dict[str, Any] = {}
+            for metric_key in metric_keys:
+                expanded = _expand_single_point_series(raw_by_metric.get(metric_key, []), target_len=target_len)
+                if not expanded:
+                    continue
+                metric_payload[str(metric_key)] = {
+                    "x": list(range(1, len(expanded) + 1)),
+                    "y": [float(value) for value in expanded],
+                }
+
+            if metric_payload:
+                payload[method] = metric_payload
+
+        return payload
+
+    def _build_cross_method_metric_payload(metric_keys: Sequence[str]) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {}
+        for metric_key in metric_keys:
+            raw_by_method: Dict[str, List[float]] = {}
+            for method in methods:
+                trace_rows = method_trace_rows.get(method, [])
+                fallback_len = max(1, len(trace_rows))
+                raw_by_method[method] = _build_rssi_series_for_static(
+                    method=method,
+                    trace_rows=trace_rows,
+                    result_payload=method_results.get(method, {}),
+                    metric_key=metric_key,
+                    fallback_length=fallback_len,
+                )
+
+            target_len = max((len(series) for series in raw_by_method.values()), default=0)
+            if target_len < 1:
+                continue
+
+            per_method_payload: Dict[str, Any] = {}
+            for method in methods:
+                expanded = _expand_single_point_series(raw_by_method.get(method, []), target_len=target_len)
+                if not expanded:
+                    continue
+                per_method_payload[method] = {
+                    "x": list(range(1, len(expanded) + 1)),
+                    "y": [float(value) for value in expanded],
+                }
+
+            if per_method_payload:
+                payload[str(metric_key)] = {
+                    "per_method": per_method_payload,
+                }
+
+        return payload
+
+    pso_payload = method_results.get("pso_gd", {})
+    pso_trace_rows = list(method_trace_rows.get("pso_gd", []))
+    pso_trajectory_data: Optional[Dict[str, Any]] = None
+    if isinstance(pso_payload, Mapping) and pso_trace_rows:
+        pso_steps = list(range(1, len(pso_trace_rows) + 1))
+        pso_trajectory_data = {
+            "x": pso_steps,
+            "series": {
+                "primary_loss": _extract_trace_metric_series(pso_trace_rows, "primary_loss"),
+                "running_best_primary_loss": [
+                    _as_float(row.get("running_best_primary_loss"))
+                    for row in pso_trace_rows
+                ],
+                "mean_rss_dbm": [_as_float(row.get("mean_rss_dbm")) for row in pso_trace_rows],
+                "min_rss_dbm": [_as_float(row.get("min_rss_dbm")) for row in pso_trace_rows],
+                "p5_rss_dbm": [_as_float(row.get("p5_rss_dbm")) for row in pso_trace_rows],
+                "priority_mean_rss_dbm": [
+                    _as_float(row.get("priority_mean_rss_dbm"))
+                    for row in pso_trace_rows
+                ],
+                "priority_min_rss_dbm": [
+                    _as_float(row.get("priority_min_rss_dbm"))
+                    for row in pso_trace_rows
+                ],
+                "priority_p5_rss_dbm": [
+                    _as_float(row.get("priority_p5_rss_dbm"))
+                    for row in pso_trace_rows
+                ],
+            },
+            "position_bounds": _to_jsonable(pso_payload.get("position_bounds")),
+            "spatial_weights": _to_jsonable(pso_payload.get("spatial_weights")),
+        }
+
+    return {
+        "method_trends": method_trends,
+        "method_comparison_running_best": comparison_running_best,
+        "static_primary_loss": static_primary,
+        "static_per_method_rssi_triplets": _build_per_method_triplet_payload(all_region_metrics),
+        "static_cross_method_rssi": _build_cross_method_metric_payload(all_region_metrics),
+        "static_per_method_priority_rssi_triplets": _build_per_method_triplet_payload(priority_metrics),
+        "static_cross_method_priority_rssi": _build_cross_method_metric_payload(priority_metrics),
+        "pso_gd_trajectory": pso_trajectory_data,
+    }
+
+
 def _save_per_trial_experiment_outputs(
     methods: Sequence[str],
     method_results: Mapping[str, Mapping[str, Any]],
@@ -970,6 +1237,14 @@ def _save_per_trial_experiment_outputs(
         rssi_y_limits=_PER_TRIAL_RSSI_Y_LIMITS,
     )
 
+    per_trial_plot_data = _build_per_trial_plot_data(
+        methods=successful_methods,
+        method_results=normalized_method_results,
+        method_trace_rows=method_trace_rows,
+    )
+    per_trial_plot_data_path = trial_artifacts_dir / "plot_data.json"
+    _write_json(per_trial_plot_data_path, per_trial_plot_data)
+
     final_analysis_text, ranked_analysis_rows = _runner_build_final_analysis_report(
         run_dir=trial_run_dir,
         methods=successful_methods,
@@ -991,6 +1266,7 @@ def _save_per_trial_experiment_outputs(
             "final_analysis_txt": str(final_analysis_txt_path),
             "ranked_methods": ranked_analysis_rows,
             "static_plot_artifacts": static_plot_artifacts,
+            "plot_data_json": str(per_trial_plot_data_path),
         },
     }
 
@@ -1007,6 +1283,7 @@ def _save_per_trial_experiment_outputs(
         "comparison_plot_html": comparison_plot_html,
         "final_analysis_txt": str(final_analysis_txt_path),
         "static_plot_artifacts": static_plot_artifacts,
+        "plot_data_json": str(per_trial_plot_data_path),
     }
     _write_json(launcher_summary_path, launcher_payload)
 
@@ -1019,11 +1296,166 @@ def _save_per_trial_experiment_outputs(
         "method_artifacts": method_artifacts,
         "comparison_plot_html": comparison_plot_html,
         "static_plot_artifacts": static_plot_artifacts,
+        "plot_data_json": str(per_trial_plot_data_path),
         "summary_json": str(summary_json_path),
         "summary_csv": str(summary_csv_path),
         "final_analysis_txt": str(final_analysis_txt_path),
         "launcher_summary_json": str(launcher_summary_path),
     }
+
+
+def _build_iteration_trace_plot_data(
+    store: SweepStore,
+    methods: Sequence[str],
+    ap_values: Sequence[int],
+    representative_seed: int,
+) -> Dict[str, Any]:
+    """Build raw x/y payload for sweep-level iteration-trace plots."""
+    payload: Dict[str, Any] = {}
+
+    for num_aps in ap_values:
+        traces_by_method: Dict[str, TraceRows] = {}
+        for method in methods:
+            run_entry = store.get(method, {}).get(str(int(num_aps)), {}).get(str(int(representative_seed)), {})
+            if not isinstance(run_entry, Mapping):
+                continue
+            if run_entry.get("status") != "ok":
+                continue
+
+            iteration_trace = run_entry.get("iteration_trace")
+            if not isinstance(iteration_trace, list) or not iteration_trace:
+                continue
+
+            trace_rows = [
+                dict(row)
+                for row in iteration_trace
+                if isinstance(row, Mapping)
+            ]
+            if trace_rows:
+                traces_by_method[method] = trace_rows
+
+        if not traces_by_method:
+            continue
+
+        metric_payload: Dict[str, Any] = {}
+        for metric_key, title, ylabel in _ITERATION_METRICS:
+            series_map: Dict[str, List[float]] = {
+                method: _extract_trace_metric_series(trace_rows, metric_key)
+                for method, trace_rows in traces_by_method.items()
+            }
+            max_len = max((len(series) for series in series_map.values()), default=0)
+
+            per_method_payload: Dict[str, Any] = {}
+            for method in methods:
+                series = series_map.get(method, [])
+                if not series:
+                    continue
+                expanded = _expand_single_point_series(series, target_len=max_len)
+                per_method_payload[method] = {
+                    "x": list(range(1, len(expanded) + 1)),
+                    "y": [float(value) for value in expanded],
+                }
+
+            if per_method_payload:
+                metric_payload[str(metric_key)] = {
+                    "title": str(title),
+                    "ylabel": str(ylabel),
+                    "per_method": per_method_payload,
+                }
+
+        if metric_payload:
+            payload[str(int(num_aps))] = {
+                "representative_seed": int(representative_seed),
+                "metrics": metric_payload,
+            }
+
+    return payload
+
+
+def _build_elbow_plot_data(
+    aggregates: AggregateStats,
+    methods: Sequence[str],
+    ap_values: Sequence[int],
+    fixed_y_limits: Optional[Tuple[float, float]],
+) -> Dict[str, Any]:
+    """Build raw x/y payload for sweep-level elbow plots."""
+    payload: Dict[str, Any] = {}
+
+    for metric_key, title, y_label in _ELBOW_METRICS:
+        metric_payload: Dict[str, Any] = {
+            "title": str(title),
+            "y_label": str(y_label),
+            "per_method": {},
+            "y_limits": None,
+        }
+
+        lower_envelope: List[float] = []
+        upper_envelope: List[float] = []
+
+        for method in methods:
+            x_points: List[int] = []
+            y_mean: List[float] = []
+            y_std: List[float] = []
+
+            method_aggregate = aggregates.get(method, {})
+            for num_aps in ap_values:
+                ap_stats = method_aggregate.get(str(int(num_aps)), {})
+                if not isinstance(ap_stats, Mapping):
+                    continue
+
+                metric_stats = ap_stats.get(metric_key, {})
+                if not isinstance(metric_stats, Mapping):
+                    continue
+
+                mean_value = _as_float(metric_stats.get("mean"))
+                if mean_value is None:
+                    continue
+
+                std_value = _as_float(metric_stats.get("std"))
+                std_numeric = float(std_value) if std_value is not None else 0.0
+
+                x_points.append(int(num_aps))
+                y_mean.append(float(mean_value))
+                y_std.append(float(std_numeric))
+
+            if not x_points:
+                continue
+
+            lower_values = [float(mean - std) for mean, std in zip(y_mean, y_std)]
+            upper_values = [float(mean + std) for mean, std in zip(y_mean, y_std)]
+            lower_envelope.extend(lower_values)
+            upper_envelope.extend(upper_values)
+
+            metric_payload["per_method"][method] = {
+                "x": [int(value) for value in x_points],
+                "mean": [float(value) for value in y_mean],
+                "std": [float(value) for value in y_std],
+                "lower": lower_values,
+                "upper": upper_values,
+            }
+
+        if not metric_payload["per_method"]:
+            continue
+
+        if fixed_y_limits is not None:
+            metric_payload["y_limits"] = {
+                "y_min": float(fixed_y_limits[0]),
+                "y_max": float(fixed_y_limits[1]),
+            }
+        else:
+            auto_limits = _resolve_auto_y_limits(
+                lower_values=lower_envelope,
+                upper_values=upper_envelope,
+            )
+            if auto_limits is not None:
+                metric_payload["y_limits"] = {
+                    "y_min": float(auto_limits[0]),
+                    "y_max": float(auto_limits[1]),
+                }
+
+        payload[str(metric_key)] = metric_payload
+
+    return payload
 
 
 def plot_iteration_traces(
@@ -1542,13 +1974,33 @@ def main() -> int:
     _write_json(sweep_results_path, sweep_payload)
     print(f"[save] sweep results: {sweep_results_path}")
 
+    representative_seed = int(seeds[0])
+    iteration_trace_plot_data = _build_iteration_trace_plot_data(
+        store=store,
+        methods=methods,
+        ap_values=ap_values,
+        representative_seed=representative_seed,
+    )
+    elbow_plot_data = _build_elbow_plot_data(
+        aggregates=aggregates,
+        methods=methods,
+        ap_values=ap_values,
+        fixed_y_limits=fixed_y_limits,
+    )
+
+    iteration_trace_plot_data_path = artifacts_dir / "iteration_trace_plot_data.json"
+    elbow_plot_data_path = artifacts_dir / "elbow_plot_data.json"
+    _write_json(iteration_trace_plot_data_path, iteration_trace_plot_data)
+    _write_json(elbow_plot_data_path, elbow_plot_data)
+
     plot_artifacts: Dict[str, Any] = {
         "per_trial_plots": per_trial_plot_artifacts,
         "iteration_trace_plots": {},
         "elbow_plots": {},
+        "iteration_trace_plot_data_json": str(iteration_trace_plot_data_path),
+        "elbow_plot_data_json": str(elbow_plot_data_path),
     }
     try:
-        representative_seed = int(seeds[0])
         plot_artifacts["iteration_trace_plots"] = plot_iteration_traces(
             store=store,
             methods=methods,
