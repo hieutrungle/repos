@@ -20,6 +20,8 @@ Instructions
     - plots/all_methods_mean_rss_dbm_static.png
     - plots/all_methods_min_rss_dbm_static.png
     - plots/all_methods_p5_rss_dbm_static.png
+    - plots/pso_gd_step_coverage/*.png (optional; config-controlled)
+    - artifacts/pso_gd_plot_artifacts.json (when PSO+GD runs)
 3. Sweep-level artifacts are still saved in one run folder:
     - artifacts/sweep_results.json
     - artifacts/plot_artifacts.json

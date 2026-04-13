@@ -1,8 +1,8 @@
 """PSO+GD specific plotting helpers.
 
 This module renders baseline-specific trajectory plots for PSO followed by
-gradient-descent refinement. The plotting contract intentionally mirrors the
-style used by memetic plotting while remaining decoupled from memetic code.
+gradient-descent refinement. It can also render optional per-step coverage maps
+when enabled via ``coverage_plot_settings`` in the run config.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ try:
     from matplotlib.ticker import MaxNLocator
 except Exception:  # pragma: no cover - plotting optional at runtime
     plt = None
+    MaxNLocator = None  # type: ignore[assignment]
 
 
 _PRIORITY_METRIC_KEYS: Tuple[str, ...] = (
@@ -42,6 +43,10 @@ _PRIMARY_LOSS_KEYS: Tuple[str, ...] = (
     "running_best_primary_loss",
 )
 
+_DEFAULT_CAMERA_POSITION: Tuple[float, float, float] = (20.0, 20.0, 70.0)
+_DEFAULT_CAMERA_LOOK_AT: Tuple[float, float, float] = (20.0, 20.1, 1.5)
+_DEFAULT_COVERAGE_RESOLUTION: Tuple[int, int] = (1200, 900)
+
 
 def _as_float(value: Any) -> float:
     """Convert one value to float, returning NaN on invalid inputs."""
@@ -51,8 +56,31 @@ def _as_float(value: Any) -> float:
         return float("nan")
 
 
+def _as_optional_int(value: Any, default: int) -> int:
+    """Convert one value to int with a safe default fallback."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _as_optional_positive_int(value: Any) -> Optional[int]:
+    """Convert one optional value to positive int when possible."""
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed <= 0:
+        return None
+    return parsed
+
+
 def _set_integer_x_ticks(axis: Any) -> None:
     """Force integer ticks for optimization-step axes."""
+    if MaxNLocator is None:
+        return
     axis.xaxis.set_major_locator(MaxNLocator(integer=True))
 
 
@@ -140,6 +168,422 @@ def _extract_position_extent(result_payload: Mapping[str, Any]) -> Optional[Tupl
         return None
 
     return float(x_min), float(x_max), float(y_min), float(y_max)
+
+
+def _coerce_xyz_triplet(
+    raw_value: Any,
+    default_value: Tuple[float, float, float],
+) -> Tuple[float, float, float]:
+    """Coerce an XYZ triplet to floats with fallback to default."""
+    if (
+        not isinstance(raw_value, Sequence)
+        or isinstance(raw_value, (str, bytes))
+        or len(raw_value) < 3
+    ):
+        return default_value
+
+    try:
+        return (float(raw_value[0]), float(raw_value[1]), float(raw_value[2]))
+    except (TypeError, ValueError):
+        return default_value
+
+
+def _resolve_render_scene_config(
+    config_args: Mapping[str, Any],
+    result_payload: Mapping[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Resolve scene config used for optional PSO+GD coverage rendering."""
+    raw_scene = config_args.get("scene_config")
+    if not isinstance(raw_scene, Mapping):
+        return None
+
+    scene_config = dict(raw_scene)
+    visualization_scene = config_args.get("visualization_scene_config")
+    if isinstance(visualization_scene, Mapping):
+        scene_path = visualization_scene.get("scene_path")
+        if isinstance(scene_path, str) and scene_path:
+            scene_config["scene_path"] = scene_path
+
+    visualization_scene_path = config_args.get("visualization_scene_path")
+    if isinstance(visualization_scene_path, str) and visualization_scene_path:
+        scene_config["scene_path"] = visualization_scene_path
+
+    if not isinstance(scene_config.get("scene_path"), str) or not str(scene_config.get("scene_path")).strip():
+        return None
+
+    if "num_aps" not in scene_config:
+        num_aps = _as_optional_int(result_payload.get("num_aps"), default=0)
+        if num_aps > 0:
+            scene_config["num_aps"] = int(num_aps)
+
+    position_bounds = result_payload.get("position_bounds")
+    if isinstance(position_bounds, Mapping) and "position_bounds" not in scene_config:
+        scene_config["position_bounds"] = dict(position_bounds)
+
+    return scene_config
+
+
+def _resolve_render_camera(
+    config_args: Mapping[str, Any],
+    render_settings: Mapping[str, Any],
+) -> Tuple[Tuple[float, float, float], Tuple[float, float, float]]:
+    """Resolve camera position and look-at for coverage rendering."""
+    merged_camera: Dict[str, Any] = {}
+
+    raw_camera = config_args.get("camera")
+    if isinstance(raw_camera, Mapping):
+        merged_camera.update(dict(raw_camera))
+
+    if "camera_position" in config_args:
+        merged_camera["position"] = config_args.get("camera_position")
+    if "camera_look_at" in config_args:
+        merged_camera["look_at"] = config_args.get("camera_look_at")
+    if "camera_position" in render_settings:
+        merged_camera["position"] = render_settings.get("camera_position")
+    if "camera_look_at" in render_settings:
+        merged_camera["look_at"] = render_settings.get("camera_look_at")
+
+    camera_position = _coerce_xyz_triplet(
+        merged_camera.get("position"),
+        _DEFAULT_CAMERA_POSITION,
+    )
+    camera_look_at = _coerce_xyz_triplet(
+        merged_camera.get("look_at"),
+        _DEFAULT_CAMERA_LOOK_AT,
+    )
+    return camera_position, camera_look_at
+
+
+def _coerce_snapshot_positions(
+    raw_positions: Any,
+    fallback_z: float,
+) -> Optional[List[List[float]]]:
+    """Coerce snapshot positions into ``[[x, y, z], ...]`` form."""
+    if (
+        not isinstance(raw_positions, Sequence)
+        or isinstance(raw_positions, (str, bytes))
+        or len(raw_positions) == 0
+    ):
+        return None
+
+    positions: List[List[float]] = []
+    for raw_position in raw_positions:
+        if (
+            not isinstance(raw_position, Sequence)
+            or isinstance(raw_position, (str, bytes))
+            or len(raw_position) < 2
+        ):
+            return None
+
+        try:
+            x_coord = float(raw_position[0])
+            y_coord = float(raw_position[1])
+            z_coord = float(raw_position[2]) if len(raw_position) >= 3 else float(fallback_z)
+        except (TypeError, ValueError):
+            return None
+
+        positions.append([x_coord, y_coord, z_coord])
+
+    return positions
+
+
+def _coerce_snapshot_directions(raw_directions: Any) -> Optional[List[List[float]]]:
+    """Coerce snapshot directions into ``[[dx, dy, dz], ...]`` form."""
+    if (
+        not isinstance(raw_directions, Sequence)
+        or isinstance(raw_directions, (str, bytes))
+        or len(raw_directions) == 0
+    ):
+        return None
+
+    directions: List[List[float]] = []
+    for raw_direction in raw_directions:
+        if (
+            not isinstance(raw_direction, Sequence)
+            or isinstance(raw_direction, (str, bytes))
+            or len(raw_direction) < 3
+        ):
+            return None
+
+        try:
+            dx = float(raw_direction[0])
+            dy = float(raw_direction[1])
+            dz = float(raw_direction[2])
+        except (TypeError, ValueError):
+            return None
+
+        directions.append([dx, dy, dz])
+
+    return directions
+
+
+def _extract_coverage_snapshots(
+    result_payload: Mapping[str, Any],
+    fallback_z: float,
+) -> List[Dict[str, Any]]:
+    """Extract normalized PSO+GD per-step snapshots from result payload."""
+    raw_snapshots = result_payload.get("coverage_snapshots")
+    if not isinstance(raw_snapshots, Sequence):
+        return []
+
+    snapshots: List[Dict[str, Any]] = []
+    for index, raw_snapshot in enumerate(raw_snapshots, start=1):
+        if not isinstance(raw_snapshot, Mapping):
+            continue
+
+        positions = _coerce_snapshot_positions(
+            raw_snapshot.get("positions"),
+            fallback_z=float(fallback_z),
+        )
+        if positions is None:
+            continue
+
+        snapshot: Dict[str, Any] = {
+            "iteration": int(_as_optional_int(raw_snapshot.get("iteration"), default=index)),
+            "phase": str(raw_snapshot.get("phase", "step")),
+            "phase_iteration": int(_as_optional_int(raw_snapshot.get("phase_iteration"), default=index)),
+            "positions": positions,
+        }
+
+        directions = _coerce_snapshot_directions(raw_snapshot.get("directions"))
+        if directions is not None:
+            snapshot["directions"] = directions
+
+        snapshots.append(snapshot)
+
+    return snapshots
+
+
+def _sanitize_phase_token(raw_phase: str) -> str:
+    """Convert arbitrary phase text into a filesystem-safe token."""
+    token = "".join(
+        char if (char.isalnum() or char in ("_", "-")) else "_"
+        for char in str(raw_phase).strip().lower()
+    )
+    return token or "step"
+
+
+def _render_coverage_snapshot(
+    scene_config: Mapping[str, Any],
+    snapshot: Mapping[str, Any],
+    save_path: Path,
+    samples_per_tx: int,
+    max_depth: int,
+    resolution: Tuple[int, int],
+    camera_position: Tuple[float, float, float],
+    camera_look_at: Tuple[float, float, float],
+) -> Optional[str]:
+    """Render one PSO+GD snapshot coverage map to disk."""
+    from sionna.rt import RadioMapSolver
+
+    from reflector_position.scene_setup import create_camera, setup_building_floor_scene
+
+    snapshot_positions = snapshot.get("positions")
+    if (
+        not isinstance(snapshot_positions, Sequence)
+        or isinstance(snapshot_positions, (str, bytes))
+        or len(snapshot_positions) == 0
+    ):
+        return None
+
+    effective_num_aps = scene_config.get("num_aps")
+    if effective_num_aps is None:
+        effective_num_aps = int(len(snapshot_positions))
+
+    loaded = setup_building_floor_scene(
+        scene_path=str(scene_config["scene_path"]),
+        frequency=scene_config.get("frequency", 6e9),
+        tx_positions=scene_config.get("tx_positions", None),
+        num_aps=effective_num_aps,
+        position_bounds=scene_config.get("position_bounds", None),
+        tx_power_dbm=scene_config.get("tx_power_dbm", 5.0),
+        rx_position=scene_config.get("rx_position", (16.0, 16.5, 1.5)),
+        reflector_enabled=scene_config.get("reflector_enabled", False),
+        reflector_size=tuple(scene_config.get("reflector_size", (2.0, 2.0))),
+        wall_top_left=scene_config.get("wall_top_left", None),
+        wall_bottom_right=scene_config.get("wall_bottom_right", None),
+        focal_point=scene_config.get("focal_point", None),
+        device=scene_config.get("device", "cuda"),
+    )
+    if isinstance(loaded, tuple) and len(loaded) == 2:
+        scene = loaded[0]
+    else:
+        scene = loaded
+
+    snapshot_directions = snapshot.get("directions")
+    transmitters = list(scene.transmitters.values())
+    for tx_index, raw_position in enumerate(snapshot_positions[: len(transmitters)]):
+        if not isinstance(raw_position, Sequence) or len(raw_position) < 3:
+            continue
+
+        position = [
+            float(raw_position[0]),
+            float(raw_position[1]),
+            float(raw_position[2]),
+        ]
+        transmitters[tx_index].position = position
+
+        if (
+            isinstance(snapshot_directions, Sequence)
+            and tx_index < len(snapshot_directions)
+            and isinstance(snapshot_directions[tx_index], Sequence)
+            and len(snapshot_directions[tx_index]) >= 3
+        ):
+            direction = snapshot_directions[tx_index]
+            target = [
+                position[0] + float(direction[0]),
+                position[1] + float(direction[1]),
+                position[2] + float(direction[2]),
+            ]
+            transmitters[tx_index].look_at(target)
+
+    solver = RadioMapSolver()
+    radio_map = solver(
+        scene,
+        cell_size=(1.0, 1.0),
+        samples_per_tx=int(samples_per_tx),
+        max_depth=int(max_depth),
+        refraction=True,
+        diffraction=True,
+    )
+
+    camera = create_camera(
+        position=camera_position,
+        look_at=camera_look_at,
+    )
+
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    scene.render_to_file(
+        camera=camera,
+        filename=str(save_path),
+        radio_map=radio_map,
+        rm_metric="rss",
+        rm_db_scale=True,
+        rm_vmin=-80,
+        rm_vmax=-40,
+        resolution=resolution,
+        show_devices=True,
+        show_orientations=False,
+    )
+    return str(save_path)
+
+
+def _save_pso_gd_step_coverage_maps(
+    result_payload: Mapping[str, Any],
+    plots_dir: Path,
+    config_args: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Render optional PSO+GD per-step coverage maps based on config flags."""
+    render_settings = config_args.get("coverage_plot_settings")
+    if not isinstance(render_settings, Mapping):
+        render_settings = {}
+
+    if not bool(render_settings.get("render_pso_gd_step_coverage_maps", False)):
+        return {}
+
+    scene_config = _resolve_render_scene_config(
+        config_args=config_args,
+        result_payload=result_payload,
+    )
+    if scene_config is None:
+        return {
+            "pso_gd_step_coverage_error": (
+                "coverage_plot_settings.render_pso_gd_step_coverage_maps is true "
+                "but scene_config/visualization scene path is missing"
+            )
+        }
+
+    samples_per_tx = _as_optional_int(render_settings.get("samples_per_tx"), default=1_000_000)
+    max_depth = _as_optional_int(render_settings.get("max_depth"), default=13)
+
+    raw_resolution = render_settings.get("resolution", _DEFAULT_COVERAGE_RESOLUTION)
+    if isinstance(raw_resolution, Sequence) and not isinstance(raw_resolution, (str, bytes)) and len(raw_resolution) >= 2:
+        resolution = (
+            max(1, int(raw_resolution[0])),
+            max(1, int(raw_resolution[1])),
+        )
+    else:
+        resolution = _DEFAULT_COVERAGE_RESOLUTION
+
+    frame_stride = max(
+        1,
+        _as_optional_int(
+            render_settings.get("pso_gd_step_coverage_frame_stride"),
+            default=1,
+        ),
+    )
+    max_frames = _as_optional_positive_int(
+        render_settings.get("pso_gd_step_coverage_max_frames")
+    )
+
+    camera_position, camera_look_at = _resolve_render_camera(
+        config_args=config_args,
+        render_settings=render_settings,
+    )
+
+    fallback_z = float(config_args.get("fixed_z", 3.8))
+    snapshots = _extract_coverage_snapshots(
+        result_payload=result_payload,
+        fallback_z=fallback_z,
+    )
+    if not snapshots:
+        return {
+            "pso_gd_step_coverage_error": (
+                "No per-step coverage snapshots found in PSO+GD result payload"
+            )
+        }
+
+    selected_snapshots = [
+        snapshot
+        for index, snapshot in enumerate(snapshots)
+        if index % frame_stride == 0
+    ]
+    if max_frames is not None:
+        selected_snapshots = selected_snapshots[:max_frames]
+
+    base_dir = plots_dir / "pso_gd_step_coverage"
+    frames: List[Dict[str, Any]] = []
+    errors: Dict[str, str] = {}
+
+    for frame_index, snapshot in enumerate(selected_snapshots, start=1):
+        iteration = _as_optional_int(snapshot.get("iteration"), default=frame_index)
+        phase = str(snapshot.get("phase", "step"))
+        phase_iteration = _as_optional_int(snapshot.get("phase_iteration"), default=frame_index)
+        phase_token = _sanitize_phase_token(phase)
+
+        image_path = base_dir / f"step_{iteration:04d}_{phase_token}_{phase_iteration:04d}.png"
+        try:
+            rendered = _render_coverage_snapshot(
+                scene_config=scene_config,
+                snapshot=snapshot,
+                save_path=image_path,
+                samples_per_tx=samples_per_tx,
+                max_depth=max_depth,
+                resolution=resolution,
+                camera_position=camera_position,
+                camera_look_at=camera_look_at,
+            )
+            if rendered is not None:
+                frames.append(
+                    {
+                        "iteration": int(iteration),
+                        "phase": phase,
+                        "phase_iteration": int(phase_iteration),
+                        "image_png": rendered,
+                    }
+                )
+        except Exception as exc:
+            errors[str(image_path.name)] = f"{type(exc).__name__}: {exc}"
+
+    artifacts: Dict[str, Any] = {
+        "pso_gd_step_coverage_dir": str(base_dir),
+        "pso_gd_step_coverage_image_count": int(len(frames)),
+        "pso_gd_step_coverage_frames": frames,
+        "pso_gd_step_coverage_enabled": True,
+    }
+    if errors:
+        artifacts["pso_gd_step_coverage_errors"] = errors
+    return artifacts
 
 
 def _plot_metrics_panel(
@@ -291,15 +735,26 @@ def save_pso_gd_trajectory_plot(
 def save_pso_gd_plots(
     result_payload: Mapping[str, Any],
     plots_dir: Path,
-) -> Dict[str, str]:
+    config_args: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
     """Save all PSO+GD-specific plots and return artifact-path mapping."""
-    artifacts: Dict[str, str] = {}
+    artifacts: Dict[str, Any] = {}
+
     trajectory_path = save_pso_gd_trajectory_plot(
         result_payload=result_payload,
         save_path=plots_dir / "pso_gd_trajectory.png",
     )
     if trajectory_path is not None:
         artifacts["pso_gd_trajectory_plot_png"] = trajectory_path
+
+    if isinstance(config_args, Mapping):
+        coverage_artifacts = _save_pso_gd_step_coverage_maps(
+            result_payload=result_payload,
+            plots_dir=plots_dir,
+            config_args=config_args,
+        )
+        artifacts.update(coverage_artifacts)
+
     return artifacts
 
 

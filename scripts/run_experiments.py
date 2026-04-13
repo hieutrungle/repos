@@ -14,6 +14,8 @@ Instructions
 6. Optional iteration equalization for non-KMeans methods is config-driven:
     - `iteration_equalization.enabled`
     - `iteration_equalization.target_iterations`
+7. Optional PSO+GD step coverage maps are config-driven:
+    - `coverage_plot_settings.render_pso_gd_step_coverage_maps`
 
 python scripts/run_experiments.py --method all \
     --config configs/run_experiments_cuda_hrbb.json \
@@ -1717,11 +1719,14 @@ def _save_method_artifacts(
         pso_plot_artifacts = save_pso_gd_plots(
             result_payload=result_payload,
             plots_dir=plots_dir,
+            config_args=method_config,
         )
         pso_plot_artifacts_path = artifacts_dir / f"{method}_plot_artifacts.json"
         _write_json(pso_plot_artifacts_path, pso_plot_artifacts)
         method_artifacts["plot_artifacts_json"] = str(pso_plot_artifacts_path)
         method_artifacts["trajectory_plot_png"] = pso_plot_artifacts.get("pso_gd_trajectory_plot_png")
+        method_artifacts["step_coverage_dir"] = pso_plot_artifacts.get("pso_gd_step_coverage_dir")
+        method_artifacts["step_coverage_count"] = pso_plot_artifacts.get("pso_gd_step_coverage_image_count")
 
     return method_artifacts
 

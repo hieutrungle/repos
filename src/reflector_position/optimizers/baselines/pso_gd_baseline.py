@@ -421,6 +421,90 @@ def _extract_gd_iteration_trace(global_best: Mapping[str, Any]) -> List[Dict[str
     return trace
 
 
+def _build_snapshot_positions(
+    positions_xy: Sequence[Tuple[float, float]],
+    fixed_z: float,
+) -> List[List[float]]:
+    """Convert 2-D AP positions into 3-D snapshot positions."""
+    return [
+        [float(x_coord), float(y_coord), float(fixed_z)]
+        for x_coord, y_coord in positions_xy
+    ]
+
+
+def _build_snapshot_directions(
+    directions_xyz: Optional[Sequence[Tuple[float, float, float]]],
+) -> Optional[List[List[float]]]:
+    """Convert AP look directions into JSON-friendly 3-D vectors."""
+    if directions_xyz is None:
+        return None
+    return [
+        [float(dx), float(dy), float(dz)]
+        for dx, dy, dz in directions_xyz
+    ]
+
+
+def _extract_gd_step_snapshots(
+    global_best: Mapping[str, Any],
+    fixed_z: float,
+    max_steps: int,
+) -> List[Dict[str, Any]]:
+    """Extract per-step GD snapshots for optional coverage-map rendering."""
+    resolved_max_steps = max(0, int(max_steps))
+    if resolved_max_steps < 1:
+        return []
+
+    history = global_best.get("history")
+    history_map = history if isinstance(history, Mapping) else {}
+    raw_positions_series = history_map.get("positions", [])
+    raw_directions_series = history_map.get("directions", [])
+
+    snapshots: List[Dict[str, Any]] = []
+    if isinstance(raw_positions_series, Sequence):
+        for history_index, raw_positions in enumerate(raw_positions_series):
+            if len(snapshots) >= resolved_max_steps:
+                break
+
+            positions_xy = _to_positions_xy(raw_positions)
+            if positions_xy is None:
+                continue
+
+            snapshot: Dict[str, Any] = {
+                "phase": "gd",
+                "phase_iteration": int(len(snapshots) + 1),
+                "positions": _build_snapshot_positions(positions_xy, fixed_z=float(fixed_z)),
+            }
+
+            if (
+                isinstance(raw_directions_series, Sequence)
+                and history_index < len(raw_directions_series)
+            ):
+                directions_xyz = _to_directions_xyz(raw_directions_series[history_index])
+                snapshot_directions = _build_snapshot_directions(directions_xyz)
+                if snapshot_directions is not None:
+                    snapshot["directions"] = snapshot_directions
+
+            snapshots.append(snapshot)
+
+    if snapshots:
+        return snapshots
+
+    fallback_positions = _extract_best_positions(global_best)
+    if fallback_positions is None:
+        return []
+
+    fallback_snapshot: Dict[str, Any] = {
+        "phase": "gd",
+        "phase_iteration": 1,
+        "positions": _build_snapshot_positions(fallback_positions, fixed_z=float(fixed_z)),
+    }
+    fallback_directions = _extract_best_directions(global_best)
+    fallback_snapshot_directions = _build_snapshot_directions(fallback_directions)
+    if fallback_snapshot_directions is not None:
+        fallback_snapshot["directions"] = fallback_snapshot_directions
+    return [fallback_snapshot]
+
+
 def _extract_loss_candidate(row: Mapping[str, Any]) -> Optional[float]:
     """Extract one representative loss value from a PSO/GD trace row."""
     for key in (
@@ -502,6 +586,7 @@ def run_pso_gd_baseline(
     pbest_directions = directions.copy() if directions is not None else None
     pbest_losses = np.full((swarm_size,), np.inf, dtype=np.float64)
     pso_iteration_trace: List[Dict[str, Any]] = []
+    pso_step_snapshots: List[Dict[str, Any]] = []
 
     gbest_loss = float("inf")
     gbest_positions: Optional[np.ndarray] = None
@@ -582,6 +667,30 @@ def run_pso_gd_baseline(
                 )
 
         pso_iteration_trace.append(trace_row)
+
+        snapshot_positions_xy: Optional[List[Tuple[float, float]]] = None
+        snapshot_directions_xyz: Optional[List[Tuple[float, float, float]]] = None
+
+        if gbest_positions is not None:
+            snapshot_positions_xy = _to_positions_xy(gbest_positions.tolist())
+            if gbest_directions is not None:
+                snapshot_directions_xyz = _to_directions_xyz(gbest_directions.tolist())
+        elif losses.size > 0:
+            best_particle_idx = int(np.argmin(losses))
+            snapshot_positions_xy = _to_positions_xy(positions[best_particle_idx].tolist())
+            if directions is not None:
+                snapshot_directions_xyz = _to_directions_xyz(directions[best_particle_idx].tolist())
+
+        if snapshot_positions_xy is not None:
+            snapshot: Dict[str, Any] = {
+                "phase": "pso",
+                "phase_iteration": int(iteration_idx + 1),
+                "positions": _build_snapshot_positions(snapshot_positions_xy, fixed_z=float(fixed_z)),
+            }
+            snapshot_directions = _build_snapshot_directions(snapshot_directions_xyz)
+            if snapshot_directions is not None:
+                snapshot["directions"] = snapshot_directions
+            pso_step_snapshots.append(snapshot)
 
         if gbest_positions is None:
             continue
@@ -672,6 +781,11 @@ def run_pso_gd_baseline(
     gd_iteration_trace = _extract_gd_iteration_trace(global_best)
     requested_gd_iterations = max(1, int(gd_params.get("num_iterations", 50)))
     gd_iteration_trace = gd_iteration_trace[:requested_gd_iterations]
+    gd_step_snapshots = _extract_gd_step_snapshots(
+        global_best=global_best,
+        fixed_z=float(fixed_z),
+        max_steps=len(gd_iteration_trace),
+    )
 
     combined_trace: List[Dict[str, Any]] = []
     running_best = float("inf")
@@ -701,11 +815,25 @@ def run_pso_gd_baseline(
             normalized["running_best_primary_loss"] = float(running_best)
         combined_trace.append(normalized)
 
+    coverage_snapshots: List[Dict[str, Any]] = []
+    for snapshot in pso_step_snapshots:
+        normalized_snapshot = dict(snapshot)
+        normalized_snapshot["iteration"] = int(len(coverage_snapshots) + 1)
+        coverage_snapshots.append(normalized_snapshot)
+
+    for snapshot in gd_step_snapshots:
+        normalized_snapshot = dict(snapshot)
+        normalized_snapshot["iteration"] = int(len(coverage_snapshots) + 1)
+        coverage_snapshots.append(normalized_snapshot)
+
     formatted["pso_iteration_trace"] = pso_iteration_trace
     formatted["gd_iteration_trace"] = gd_iteration_trace
     formatted["iteration_trace"] = combined_trace
     formatted["num_iterations"] = len(combined_trace)
     formatted["num_gd_iterations"] = len(gd_iteration_trace)
+    if coverage_snapshots:
+        formatted["coverage_snapshots"] = coverage_snapshots
+        formatted["num_coverage_snapshots"] = len(coverage_snapshots)
     formatted["position_bounds"] = {
         "x_min": float(x_min),
         "x_max": float(x_max),

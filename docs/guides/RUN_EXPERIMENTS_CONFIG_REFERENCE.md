@@ -217,11 +217,15 @@ These fields do not change optimization results.
 - coverage_plot_settings.resolution: Output map resolution [width, height].
 - coverage_plot_settings.render_ga_generation_best_coverage_maps: Save GA trajectory maps.
 - coverage_plot_settings.render_gd_trajectory_coverage_maps: Save GD trajectory maps.
+- coverage_plot_settings.render_pso_gd_step_coverage_maps: Save per-step PSO+GD coverage maps for the pso_gd method.
+- coverage_plot_settings.pso_gd_step_coverage_frame_stride: Optional frame stride for PSO+GD step coverage rendering.
+- coverage_plot_settings.pso_gd_step_coverage_max_frames: Optional cap on total rendered PSO+GD step coverage frames.
 
 Tuning guidance:
 
 - Keep these low during experimentation.
 - Raise fidelity and resolution only for final analysis artifacts.
+- For pso_gd step maps, start with frame_stride > 1 and a low max_frames to limit runtime.
 
 ## Output and reporting controls
 
@@ -304,7 +308,8 @@ Smoke preset (fast sanity checks)
     "max_depth": 5,
     "resolution": [800, 600],
     "render_ga_generation_best_coverage_maps": false,
-    "render_gd_trajectory_coverage_maps": false
+    "render_gd_trajectory_coverage_maps": false,
+    "render_pso_gd_step_coverage_maps": false
   },
   "iteration_equalization": {
     "enabled": false
@@ -356,7 +361,8 @@ Balanced preset (day-to-day experiments)
     "max_depth": 11,
     "resolution": [1200, 900],
     "render_ga_generation_best_coverage_maps": false,
-    "render_gd_trajectory_coverage_maps": false
+    "render_gd_trajectory_coverage_maps": false,
+    "render_pso_gd_step_coverage_maps": false
   },
   "iteration_equalization": {
     "enabled": true,
@@ -409,7 +415,8 @@ Final-quality preset (reporting and publication)
     "max_depth": 13,
     "resolution": [1600, 1200],
     "render_ga_generation_best_coverage_maps": false,
-    "render_gd_trajectory_coverage_maps": false
+    "render_gd_trajectory_coverage_maps": false,
+    "render_pso_gd_step_coverage_maps": false
   },
   "iteration_equalization": {
     "enabled": true,

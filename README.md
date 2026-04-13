@@ -69,9 +69,9 @@ Run all-method AP sweeps with per-trial artifacts and elbow plots:
 ```bash
 python scripts/run_all_methods_ap_sweep.py \
   --methods all \
-  --config configs/run_experiments_cuda_hrbb.smoke_ap_sweep.json \
-  --ap_min 2 --ap_max 3 \
-  --seeds 301 \
+  --config configs/run_experiments_cuda_hrbb.json \
+  --ap_min 1 --ap_max 7 \
+  --seeds 40, 41, 42, 43, 44 \
   --output_dir tmp_results/smoke_alignment
 ```
 
@@ -207,6 +207,7 @@ Unified runner artifacts (scripts/run_experiments.py):
 - `RUN_DIR/artifacts/METHOD_iteration_trace.csv`
 - `RUN_DIR/plots/METHOD_trend.html`
 - `RUN_DIR/plots/method_comparison_trend.html` (when running multiple methods)
+- `RUN_DIR/plots/pso_gd_step_coverage/*.png` (optional; enabled by `coverage_plot_settings.render_pso_gd_step_coverage_maps`)
 
 ## Python API
 

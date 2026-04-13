@@ -103,8 +103,10 @@
     "samples_per_tx": 4000,
     "max_depth": 3,
     "resolution": [640, 480],
-    "render_ga_generation_best_coverage_maps": false,
-    "render_gd_trajectory_coverage_maps": false
+    "render_ga_generation_best_coverage_maps": true,
+    "render_gd_trajectory_coverage_maps": true,
+    "render_all_gd_trajectory_frames": true,
+    "render_pso_gd_step_coverage_maps": true
   },
   "output_dir": "tmp_results/smoke_ap_sweep",
   "verbose": false,
