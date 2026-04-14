@@ -93,6 +93,10 @@ def _extract_best_physical_metric(
     """Extract one best physical metric from method result payloads."""
     candidate_maps: List[Mapping[str, Any]] = []
 
+    reporting_metrics = result_payload.get("reporting_physical_metrics")
+    if isinstance(reporting_metrics, Mapping):
+        candidate_maps.append(reporting_metrics)
+
     top_level_metrics = result_payload.get("best_physical_metrics")
     if isinstance(top_level_metrics, Mapping):
         candidate_maps.append(top_level_metrics)
@@ -170,6 +174,10 @@ def _build_primary_loss_series(
     series = _extract_trace_series(trace_rows, _PRIMARY_LOSS_KEYS)
     if series:
         return series
+
+    reporting_primary_loss = _as_float(result_payload.get("reporting_primary_loss"))
+    if reporting_primary_loss is not None:
+        return [reporting_primary_loss]
 
     if method == "memetic":
         gd_results = result_payload.get("gd_results", {})
