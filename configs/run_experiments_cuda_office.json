@@ -71,7 +71,7 @@
     "verbose": false
   },
   "gd_optimization_params": {
-    "num_iterations": 50,
+    "num_iterations": 15,
     "learning_rate": 0.005,
     "samples_per_tx": 1000000,
     "max_depth": 13,
