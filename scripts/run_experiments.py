@@ -330,9 +330,16 @@ def _resolve_pso_params(config: Mapping[str, Any]) -> Dict[str, Any]:
     params = {
         "swarm_size": 24,
         "num_iterations": 20,
+        "tvac_enabled": True,
+        "w_start": 0.9,
+        "w_end": 0.4,
+        "c1_start": 2.5,
+        "c1_end": 0.5,
+        "c2_start": 0.5,
+        "c2_end": 2.5,
         "w": 0.6,
-        "c1": 1.5,
-        "c2": 1.5,
+        "c1": 1.6,
+        "c2": 1.6,
     }
     pso_params = config.get("pso_params")
     if pso_params is not None:
@@ -1314,6 +1321,10 @@ def _extract_method_iteration_trace(
 
 def _extract_best_primary_loss(method: str, result_payload: Mapping[str, Any]) -> Optional[float]:
     """Extract one best primary loss value for method-level summary tables."""
+    reporting_loss = _as_float(result_payload.get("reporting_primary_loss"))
+    if reporting_loss is not None:
+        return reporting_loss
+
     if method == "memetic":
         gd_results = result_payload.get("gd_results", {})
         if isinstance(gd_results, Mapping):
@@ -1476,6 +1487,10 @@ def _extract_best_physical_metrics(
 ) -> Dict[str, float]:
     """Extract normalized best physical metrics from method result payloads."""
     candidates: List[Mapping[str, Any]] = []
+
+    reporting_metrics = result_payload.get("reporting_physical_metrics")
+    if isinstance(reporting_metrics, Mapping):
+        candidates.append(reporting_metrics)
 
     top_level_metrics = result_payload.get("best_physical_metrics")
     if isinstance(top_level_metrics, Mapping):

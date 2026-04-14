@@ -1,0 +1,2 @@
+python scripts/run_all_methods_ap_sweep.py --methods all --config configs/run_experiments_cuda_hrbb.json --ap_min 1 --ap_max 3 --seeds 41 42 --output_dir "tmp_comparison_results/hrbb_experiments"
+python scripts/run_all_methods_ap_sweep.py --methods all --config configs/run_experiments_cuda_office.json --ap_min 1 --ap_max 3 --seeds 41 42 --output_dir "tmp_comparison_results/office_experiments"

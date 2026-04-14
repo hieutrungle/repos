@@ -58,6 +58,31 @@ def _extract_selected_physical_metrics(result: Mapping[str, Any]) -> Dict[str, f
     return selected
 
 
+def _as_float(value: Any) -> Optional[float]:
+    """Convert one value to float, returning ``None`` on invalid inputs."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _resolve_float_param(params: Mapping[str, Any], key: str, default: float) -> float:
+    """Resolve one numeric hyperparameter with explicit type validation."""
+    raw_value = params.get(key, default)
+    try:
+        return float(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"'{key}' must be a numeric value, got {raw_value!r}") from exc
+
+
+def _linear_schedule(start: float, end: float, step_idx: int, total_steps: int) -> float:
+    """Linearly interpolate one coefficient from ``start`` to ``end``."""
+    if int(total_steps) <= 1:
+        return float(start)
+    alpha = float(step_idx) / float(int(total_steps) - 1)
+    return float(start + alpha * (end - start))
+
+
 def _project_directions(raw_directions: np.ndarray) -> np.ndarray:
     """Project direction vectors onto unit sphere with strict downward z."""
     z = np.clip(raw_directions[..., 2], -1.0, -1e-4)
@@ -421,6 +446,78 @@ def _extract_gd_iteration_trace(global_best: Mapping[str, Any]) -> List[Dict[str
     return trace
 
 
+def _extract_scene_config_from_optimizer(ray_optimizer: Any) -> Optional[Dict[str, Any]]:
+    """Extract cached scene config from one optimizer instance when available."""
+    for attr_name in ("_scene_config", "scene_config"):
+        raw_value = getattr(ray_optimizer, attr_name, None)
+        if isinstance(raw_value, Mapping):
+            return dict(raw_value)
+    return None
+
+
+def _resolve_default_reflector_params(
+    scene_config: Optional[Mapping[str, Any]],
+    x_bounds: Tuple[float, float],
+    y_bounds: Tuple[float, float],
+) -> Optional[Dict[str, Any]]:
+    """Build baseline reflector task params when reflector mode is enabled."""
+    if not isinstance(scene_config, Mapping):
+        return None
+    if not bool(scene_config.get("reflector_enabled", False)):
+        return None
+
+    target_raw = scene_config.get("focal_point")
+    target_xyz: Tuple[float, float, float]
+    if (
+        isinstance(target_raw, Sequence)
+        and not isinstance(target_raw, (str, bytes))
+        and len(target_raw) >= 3
+    ):
+        target_xyz = (
+            float(target_raw[0]),
+            float(target_raw[1]),
+            float(target_raw[2]),
+        )
+    else:
+        target_xyz = (
+            0.5 * (float(x_bounds[0]) + float(x_bounds[1])),
+            0.5 * (float(y_bounds[0]) + float(y_bounds[1])),
+            1.5,
+        )
+
+    return {
+        "reflector_u": 0.5,
+        "reflector_v": 0.5,
+        "reflector_target": target_xyz,
+    }
+
+
+def _default_reflector_snapshot(
+    reflector_params: Optional[Mapping[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Convert baseline reflector task params into snapshot payload."""
+    if not isinstance(reflector_params, Mapping):
+        return None
+
+    target_raw = reflector_params.get("reflector_target")
+    if (
+        not isinstance(target_raw, Sequence)
+        or isinstance(target_raw, (str, bytes))
+        or len(target_raw) < 3
+    ):
+        return None
+
+    return {
+        "u": float(reflector_params.get("reflector_u", 0.5)),
+        "v": float(reflector_params.get("reflector_v", 0.5)),
+        "target": [
+            float(target_raw[0]),
+            float(target_raw[1]),
+            float(target_raw[2]),
+        ],
+    }
+
+
 def _build_snapshot_positions(
     positions_xy: Sequence[Tuple[float, float]],
     fixed_z: float,
@@ -448,6 +545,7 @@ def _extract_gd_step_snapshots(
     global_best: Mapping[str, Any],
     fixed_z: float,
     max_steps: int,
+    default_reflector_snapshot: Optional[Mapping[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Extract per-step GD snapshots for optional coverage-map rendering."""
     resolved_max_steps = max(0, int(max_steps))
@@ -458,6 +556,10 @@ def _extract_gd_step_snapshots(
     history_map = history if isinstance(history, Mapping) else {}
     raw_positions_series = history_map.get("positions", [])
     raw_directions_series = history_map.get("directions", [])
+    reflector_u_series = history_map.get("reflector_u", [])
+    reflector_v_series = history_map.get("reflector_v", [])
+    reflector_target_series = history_map.get("reflector_target", [])
+    reflector_position_series = history_map.get("reflector_position", [])
 
     snapshots: List[Dict[str, Any]] = []
     if isinstance(raw_positions_series, Sequence):
@@ -484,6 +586,70 @@ def _extract_gd_step_snapshots(
                 if snapshot_directions is not None:
                     snapshot["directions"] = snapshot_directions
 
+            reflector_target: Optional[List[float]] = None
+            if (
+                isinstance(reflector_target_series, Sequence)
+                and history_index < len(reflector_target_series)
+            ):
+                raw_target = reflector_target_series[history_index]
+                if (
+                    isinstance(raw_target, Sequence)
+                    and not isinstance(raw_target, (str, bytes))
+                    and len(raw_target) >= 3
+                ):
+                    try:
+                        reflector_target = [
+                            float(raw_target[0]),
+                            float(raw_target[1]),
+                            float(raw_target[2]),
+                        ]
+                    except (TypeError, ValueError):
+                        reflector_target = None
+
+            if reflector_target is not None:
+                reflector_payload: Dict[str, Any] = {
+                    "target": reflector_target,
+                }
+
+                if (
+                    isinstance(reflector_u_series, Sequence)
+                    and history_index < len(reflector_u_series)
+                ):
+                    u_value = _as_float(reflector_u_series[history_index])
+                    if u_value is not None:
+                        reflector_payload["u"] = float(u_value)
+
+                if (
+                    isinstance(reflector_v_series, Sequence)
+                    and history_index < len(reflector_v_series)
+                ):
+                    v_value = _as_float(reflector_v_series[history_index])
+                    if v_value is not None:
+                        reflector_payload["v"] = float(v_value)
+
+                if (
+                    isinstance(reflector_position_series, Sequence)
+                    and history_index < len(reflector_position_series)
+                ):
+                    raw_position = reflector_position_series[history_index]
+                    if (
+                        isinstance(raw_position, Sequence)
+                        and not isinstance(raw_position, (str, bytes))
+                        and len(raw_position) >= 3
+                    ):
+                        try:
+                            reflector_payload["position"] = [
+                                float(raw_position[0]),
+                                float(raw_position[1]),
+                                float(raw_position[2]),
+                            ]
+                        except (TypeError, ValueError):
+                            pass
+
+                snapshot["reflector"] = reflector_payload
+            elif isinstance(default_reflector_snapshot, Mapping):
+                snapshot["reflector"] = dict(default_reflector_snapshot)
+
             snapshots.append(snapshot)
 
     if snapshots:
@@ -498,6 +664,8 @@ def _extract_gd_step_snapshots(
         "phase_iteration": 1,
         "positions": _build_snapshot_positions(fallback_positions, fixed_z=float(fixed_z)),
     }
+    if isinstance(default_reflector_snapshot, Mapping):
+        fallback_snapshot["reflector"] = dict(default_reflector_snapshot)
     fallback_directions = _extract_best_directions(global_best)
     fallback_snapshot_directions = _build_snapshot_directions(fallback_directions)
     if fallback_snapshot_directions is not None:
@@ -553,9 +721,26 @@ def run_pso_gd_baseline(
 
     swarm_size = int(pso_params.get("swarm_size", 20))
     num_iterations = int(pso_params.get("num_iterations", 10))
-    w = float(pso_params.get("w", 0.5))
-    c1 = float(pso_params.get("c1", 1.5))
-    c2 = float(pso_params.get("c2", 1.5))
+
+    # TVAC + inertia-decay defaults: exploration early, exploitation late.
+    tvac_enabled = bool(pso_params.get("tvac_enabled", True))
+    if tvac_enabled:
+        w_start = _resolve_float_param(pso_params, "w_start", 0.9)
+        w_end = _resolve_float_param(pso_params, "w_end", 0.4)
+        c1_start = _resolve_float_param(pso_params, "c1_start", 2.5)
+        c1_end = _resolve_float_param(pso_params, "c1_end", 0.5)
+        c2_start = _resolve_float_param(pso_params, "c2_start", 0.5)
+        c2_end = _resolve_float_param(pso_params, "c2_end", 2.5)
+    else:
+        w_static = _resolve_float_param(pso_params, "w", 0.6)
+        c1_static = _resolve_float_param(pso_params, "c1", 1.6)
+        c2_static = _resolve_float_param(pso_params, "c2", 1.6)
+        w_start = w_static
+        w_end = w_static
+        c1_start = c1_static
+        c1_end = c1_static
+        c2_start = c2_static
+        c2_end = c2_static
 
     if swarm_size < 1:
         raise ValueError(f"swarm_size must be >= 1, got {swarm_size}")
@@ -582,6 +767,14 @@ def run_pso_gd_baseline(
 
         dir_vel = rng.uniform(-0.5, 0.5, size=(swarm_size, total_aps, 3)).astype(np.float64)
 
+    runtime_scene_config = _extract_scene_config_from_optimizer(ray_optimizer)
+    reflector_params = _resolve_default_reflector_params(
+        scene_config=runtime_scene_config,
+        x_bounds=(float(x_min), float(x_max)),
+        y_bounds=(float(y_min), float(y_max)),
+    )
+    default_reflector_snapshot = _default_reflector_snapshot(reflector_params)
+
     pbest_positions = positions.copy()
     pbest_directions = directions.copy() if directions is not None else None
     pbest_losses = np.full((swarm_size,), np.inf, dtype=np.float64)
@@ -593,6 +786,10 @@ def run_pso_gd_baseline(
     gbest_directions: Optional[np.ndarray] = None
 
     for iteration_idx in range(num_iterations):
+        current_w = _linear_schedule(w_start, w_end, iteration_idx, num_iterations)
+        current_c1 = _linear_schedule(c1_start, c1_end, iteration_idx, num_iterations)
+        current_c2 = _linear_schedule(c2_start, c2_end, iteration_idx, num_iterations)
+
         tasks: List[Dict[str, Any]] = []
         for particle_index in range(swarm_size):
             particle_positions = [
@@ -620,6 +817,7 @@ def run_pso_gd_baseline(
                     optimize_orientation=bool(optimize_orientation),
                     loss_kwargs=loss_kwargs,
                     evaluation_kwargs=evaluation_params,
+                    reflector_params=reflector_params,
                 )
             )
 
@@ -658,6 +856,9 @@ def run_pso_gd_baseline(
             "swarm_mean_primary_loss": float(swarm_mean),
             "global_best_primary_loss": float(global_best_for_trace),
             "running_best_primary_loss": float(global_best_for_trace),
+            "w": float(current_w),
+            "c1": float(current_c1),
+            "c2": float(current_c2),
         }
         if losses.size and eval_results:
             best_particle_idx = int(np.argmin(losses))
@@ -687,6 +888,8 @@ def run_pso_gd_baseline(
                 "phase_iteration": int(iteration_idx + 1),
                 "positions": _build_snapshot_positions(snapshot_positions_xy, fixed_z=float(fixed_z)),
             }
+            if isinstance(default_reflector_snapshot, Mapping):
+                snapshot["reflector"] = dict(default_reflector_snapshot)
             snapshot_directions = _build_snapshot_directions(snapshot_directions_xyz)
             if snapshot_directions is not None:
                 snapshot["directions"] = snapshot_directions
@@ -700,9 +903,9 @@ def run_pso_gd_baseline(
         gbest_pos_broadcast = gbest_positions[np.newaxis, ...]
 
         pos_vel = (
-            w * pos_vel
-            + c1 * r1_pos * (pbest_positions - positions)
-            + c2 * r2_pos * (gbest_pos_broadcast - positions)
+            current_w * pos_vel
+            + current_c1 * r1_pos * (pbest_positions - positions)
+            + current_c2 * r2_pos * (gbest_pos_broadcast - positions)
         )
         positions = positions + pos_vel
 
@@ -715,9 +918,9 @@ def run_pso_gd_baseline(
             gbest_dir_broadcast = gbest_directions[np.newaxis, ...]
 
             dir_vel = (
-                w * dir_vel
-                + c1 * r1_dir * (pbest_directions - directions)
-                + c2 * r2_dir * (gbest_dir_broadcast - directions)
+                current_w * dir_vel
+                + current_c1 * r1_dir * (pbest_directions - directions)
+                + current_c2 * r2_dir * (gbest_dir_broadcast - directions)
             )
             directions = _project_directions(directions + dir_vel)
 
@@ -746,6 +949,7 @@ def run_pso_gd_baseline(
         optimize_orientation=bool(optimize_orientation),
         loss_kwargs=loss_kwargs,
         evaluation_kwargs=evaluation_params,
+        reflector_params=reflector_params,
     )
 
     gd_output = _run_gd_orchestrator(
@@ -785,6 +989,7 @@ def run_pso_gd_baseline(
         global_best=global_best,
         fixed_z=float(fixed_z),
         max_steps=len(gd_iteration_trace),
+        default_reflector_snapshot=default_reflector_snapshot,
     )
 
     combined_trace: List[Dict[str, Any]] = []
@@ -831,6 +1036,16 @@ def run_pso_gd_baseline(
     formatted["iteration_trace"] = combined_trace
     formatted["num_iterations"] = len(combined_trace)
     formatted["num_gd_iterations"] = len(gd_iteration_trace)
+    formatted["pso_param_schedule"] = {
+        "tvac_enabled": bool(tvac_enabled),
+        "w_start": float(w_start),
+        "w_end": float(w_end),
+        "c1_start": float(c1_start),
+        "c1_end": float(c1_end),
+        "c2_start": float(c2_start),
+        "c2_end": float(c2_end),
+    }
+    formatted["reflector_enabled"] = bool(reflector_params is not None)
     if coverage_snapshots:
         formatted["coverage_snapshots"] = coverage_snapshots
         formatted["num_coverage_snapshots"] = len(coverage_snapshots)

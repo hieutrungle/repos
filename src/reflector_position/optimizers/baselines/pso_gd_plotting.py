@@ -8,7 +8,7 @@ when enabled via ``coverage_plot_settings`` in the run config.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, cast
 
 import numpy as np
 
@@ -317,6 +317,52 @@ def _coerce_snapshot_directions(raw_directions: Any) -> Optional[List[List[float
     return directions
 
 
+def _coerce_reflector_snapshot(raw_reflector: Any) -> Optional[Dict[str, Any]]:
+    """Coerce optional reflector snapshot payload from one frame."""
+    if not isinstance(raw_reflector, Mapping):
+        return None
+
+    reflector: Dict[str, Any] = {}
+    u_value = _as_float(raw_reflector.get("u"))
+    v_value = _as_float(raw_reflector.get("v"))
+    if np.isfinite(u_value):
+        reflector["u"] = float(u_value)
+    if np.isfinite(v_value):
+        reflector["v"] = float(v_value)
+
+    raw_target = raw_reflector.get("target")
+    if (
+        isinstance(raw_target, Sequence)
+        and not isinstance(raw_target, (str, bytes))
+        and len(raw_target) >= 3
+    ):
+        try:
+            reflector["target"] = [
+                float(raw_target[0]),
+                float(raw_target[1]),
+                float(raw_target[2]),
+            ]
+        except (TypeError, ValueError):
+            pass
+
+    raw_position = raw_reflector.get("position")
+    if (
+        isinstance(raw_position, Sequence)
+        and not isinstance(raw_position, (str, bytes))
+        and len(raw_position) >= 3
+    ):
+        try:
+            reflector["position"] = [
+                float(raw_position[0]),
+                float(raw_position[1]),
+                float(raw_position[2]),
+            ]
+        except (TypeError, ValueError):
+            pass
+
+    return reflector if reflector else None
+
+
 def _extract_coverage_snapshots(
     result_payload: Mapping[str, Any],
     fallback_z: float,
@@ -348,6 +394,10 @@ def _extract_coverage_snapshots(
         directions = _coerce_snapshot_directions(raw_snapshot.get("directions"))
         if directions is not None:
             snapshot["directions"] = directions
+
+        reflector_snapshot = _coerce_reflector_snapshot(raw_snapshot.get("reflector"))
+        if reflector_snapshot is not None:
+            snapshot["reflector"] = reflector_snapshot
 
         snapshots.append(snapshot)
 
@@ -390,6 +440,21 @@ def _render_coverage_snapshot(
     if effective_num_aps is None:
         effective_num_aps = int(len(snapshot_positions))
 
+    raw_reflector_size = scene_config.get("reflector_size", (2.0, 2.0))
+    reflector_size: Tuple[float, float] = (2.0, 2.0)
+    if (
+        isinstance(raw_reflector_size, Sequence)
+        and not isinstance(raw_reflector_size, (str, bytes))
+        and len(raw_reflector_size) >= 2
+    ):
+        try:
+            reflector_size = (
+                float(raw_reflector_size[0]),
+                float(raw_reflector_size[1]),
+            )
+        except (TypeError, ValueError):
+            reflector_size = (2.0, 2.0)
+
     loaded = setup_building_floor_scene(
         scene_path=str(scene_config["scene_path"]),
         frequency=scene_config.get("frequency", 6e9),
@@ -399,14 +464,16 @@ def _render_coverage_snapshot(
         tx_power_dbm=scene_config.get("tx_power_dbm", 5.0),
         rx_position=scene_config.get("rx_position", (16.0, 16.5, 1.5)),
         reflector_enabled=scene_config.get("reflector_enabled", False),
-        reflector_size=tuple(scene_config.get("reflector_size", (2.0, 2.0))),
+        reflector_size=reflector_size,
         wall_top_left=scene_config.get("wall_top_left", None),
         wall_bottom_right=scene_config.get("wall_bottom_right", None),
         focal_point=scene_config.get("focal_point", None),
         device=scene_config.get("device", "cuda"),
     )
+    reflector_controller = None
     if isinstance(loaded, tuple) and len(loaded) == 2:
         scene = loaded[0]
+        reflector_controller = loaded[1]
     else:
         scene = loaded
 
@@ -437,10 +504,68 @@ def _render_coverage_snapshot(
             ]
             transmitters[tx_index].look_at(target)
 
+    if reflector_controller is not None:
+        reflector_snapshot = snapshot.get("reflector")
+        if not isinstance(reflector_snapshot, Mapping):
+            reflector_snapshot = {}
+
+        target_raw = reflector_snapshot.get("target")
+        if (
+            not isinstance(target_raw, Sequence)
+            or isinstance(target_raw, (str, bytes))
+            or len(target_raw) < 3
+        ):
+            target_raw = scene_config.get("focal_point")
+
+        if (
+            isinstance(target_raw, Sequence)
+            and not isinstance(target_raw, (str, bytes))
+            and len(target_raw) >= 3
+            and len(snapshot_positions) > 0
+            and isinstance(snapshot_positions[0], Sequence)
+            and len(snapshot_positions[0]) >= 3
+        ):
+            import torch
+
+            u_value = _as_float(reflector_snapshot.get("u"))
+            v_value = _as_float(reflector_snapshot.get("v"))
+            if not np.isfinite(u_value):
+                u_value = 0.5
+            if not np.isfinite(v_value):
+                v_value = 0.5
+
+            reflector_controller.u = torch.tensor(
+                float(u_value),
+                dtype=torch.float32,
+                device=reflector_controller.device,
+            )
+            reflector_controller.v = torch.tensor(
+                float(v_value),
+                dtype=torch.float32,
+                device=reflector_controller.device,
+            )
+            reflector_controller.set_tx_position(
+                np.asarray(snapshot_positions[0], dtype=np.float32)
+            )
+            reflector_controller.set_focal_point(
+                torch.tensor(
+                    [
+                        float(target_raw[0]),
+                        float(target_raw[1]),
+                        float(target_raw[2]),
+                    ],
+                    dtype=torch.float32,
+                    device=reflector_controller.device,
+                ),
+                requires_grad=False,
+            )
+            reflector_controller.orient_to_target()
+            reflector_controller.apply_to_scene()
+
     solver = RadioMapSolver()
     radio_map = solver(
         scene,
-        cell_size=(1.0, 1.0),
+        cell_size=cast(Any, (1.0, 1.0)),
         samples_per_tx=int(samples_per_tx),
         max_depth=int(max_depth),
         refraction=True,

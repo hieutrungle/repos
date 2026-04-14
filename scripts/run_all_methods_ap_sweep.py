@@ -361,6 +361,10 @@ def _expand_single_point_series(series: Sequence[float], target_len: int) -> Lis
 
 def _extract_best_primary_loss(method: str, result_payload: Mapping[str, Any]) -> Optional[float]:
     """Extract best primary loss from method payload using robust fallbacks."""
+    reporting_loss = _as_float(result_payload.get("reporting_primary_loss"))
+    if reporting_loss is not None:
+        return reporting_loss
+
     raw_top_level = _as_float(result_payload.get("best_primary_loss"))
     if raw_top_level is not None:
         return raw_top_level
@@ -397,6 +401,10 @@ def _extract_best_physical_metrics(
 ) -> Dict[str, float]:
     """Extract best physical metrics from method payloads with memetic fallbacks."""
     candidates: List[Mapping[str, Any]] = []
+
+    reporting_metrics = result_payload.get("reporting_physical_metrics")
+    if isinstance(reporting_metrics, Mapping):
+        candidates.append(reporting_metrics)
 
     top_level_metrics = result_payload.get("best_physical_metrics")
     if isinstance(top_level_metrics, Mapping):

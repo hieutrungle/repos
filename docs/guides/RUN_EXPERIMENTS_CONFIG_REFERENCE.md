@@ -181,16 +181,25 @@ pso_params:
 
 - pso_params.swarm_size: Number of particles.
 - pso_params.num_iterations: PSO macro-iterations.
-- pso_params.w: Inertia weight.
-- pso_params.c1: Cognitive coefficient.
-- pso_params.c2: Social coefficient.
+- pso_params.tvac_enabled: Enable time-varying coefficients and inertia decay.
+- pso_params.w_start: Inertia at first PSO iteration (default 0.9).
+- pso_params.w_end: Inertia at last PSO iteration (default 0.4).
+- pso_params.c1_start: Cognitive coefficient at first PSO iteration (default 2.5).
+- pso_params.c1_end: Cognitive coefficient at last PSO iteration (default 0.5).
+- pso_params.c2_start: Social coefficient at first PSO iteration (default 0.5).
+- pso_params.c2_end: Social coefficient at last PSO iteration (default 2.5).
+- pso_params.w: Static inertia fallback when tvac_enabled is false.
+- pso_params.c1: Static cognitive fallback when tvac_enabled is false.
+- pso_params.c2: Static social fallback when tvac_enabled is false.
 
 PSO tuning guidance:
 
 - Increase swarm_size for exploration if runtime allows.
 - Increase num_iterations when PSO remains far from GD-ready candidates.
-- Raise w for exploration-heavy behavior.
-- Raise c2 when coordinated convergence is too slow.
+- Keep tvac_enabled true for robust exploration-to-exploitation transition.
+- Raise w_start or lower w_end only if particles converge too early.
+- Raise c1_start when room-wise exploration is weak.
+- Raise c2_end when final swarm convergence is too slow.
 
 ## Seed extraction and diversity
 
@@ -299,6 +308,13 @@ Smoke preset (fast sanity checks)
   "pso_params": {
     "swarm_size": 20,
     "num_iterations": 6,
+    "tvac_enabled": true,
+    "w_start": 0.9,
+    "w_end": 0.4,
+    "c1_start": 2.5,
+    "c1_end": 0.5,
+    "c2_start": 0.5,
+    "c2_end": 2.5,
     "w": 0.6,
     "c1": 1.5,
     "c2": 1.5
@@ -352,6 +368,13 @@ Balanced preset (day-to-day experiments)
   "pso_params": {
     "swarm_size": 80,
     "num_iterations": 20,
+    "tvac_enabled": true,
+    "w_start": 0.9,
+    "w_end": 0.4,
+    "c1_start": 2.5,
+    "c1_end": 0.5,
+    "c2_start": 0.5,
+    "c2_end": 2.5,
     "w": 0.6,
     "c1": 1.6,
     "c2": 1.6
@@ -406,6 +429,13 @@ Final-quality preset (reporting and publication)
   "pso_params": {
     "swarm_size": 160,
     "num_iterations": 50,
+    "tvac_enabled": true,
+    "w_start": 0.9,
+    "w_end": 0.4,
+    "c1_start": 2.5,
+    "c1_end": 0.5,
+    "c2_start": 0.5,
+    "c2_end": 2.5,
     "w": 0.6,
     "c1": 1.6,
     "c2": 1.6
