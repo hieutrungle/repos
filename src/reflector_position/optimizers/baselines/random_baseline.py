@@ -76,6 +76,41 @@ def _extract_physical_metric(result: Mapping[str, Any], metric_key: str) -> Opti
         return None
 
 
+def _as_float(value: Any) -> Optional[float]:
+    """Convert value to float when possible."""
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(numeric):
+        return None
+    return numeric
+
+
+def _aggregate_mean_metric_map(
+    results: Sequence[Mapping[str, Any]],
+    metric_key: str,
+) -> Dict[str, float]:
+    """Aggregate one metric mapping field across results using arithmetic means."""
+    buckets: Dict[str, List[float]] = {}
+    for result in results:
+        raw_metrics = result.get(metric_key)
+        if not isinstance(raw_metrics, Mapping):
+            continue
+
+        for name, raw_value in raw_metrics.items():
+            numeric = _as_float(raw_value)
+            if numeric is None:
+                continue
+            buckets.setdefault(str(name), []).append(float(numeric))
+
+    return {
+        name: float(np.mean(values))
+        for name, values in buckets.items()
+        if values
+    }
+
+
 def _to_positions_xy(array: np.ndarray) -> List[Tuple[float, float]]:
     """Convert a ``[N,2]`` array into a list of ``(x, y)`` float tuples."""
     return [(float(row[0]), float(row[1])) for row in array]
@@ -222,6 +257,31 @@ def run_random_monte_carlo(
 
         iteration_trace.append(trace_row)
 
+    valid_results: List[Mapping[str, Any]] = [
+        result
+        for result in ordered_results
+        if isinstance(result, Mapping)
+    ]
+    primary_loss_samples: List[float] = []
+    for result in valid_results:
+        primary_loss = _extract_primary_loss(result)
+        if np.isfinite(primary_loss):
+            primary_loss_samples.append(float(primary_loss))
+
+    reporting_primary_loss = (
+        float(np.mean(primary_loss_samples))
+        if primary_loss_samples
+        else None
+    )
+    reporting_loss_components = _aggregate_mean_metric_map(
+        results=valid_results,
+        metric_key="loss_components",
+    )
+    reporting_physical_metrics = _aggregate_mean_metric_map(
+        results=valid_results,
+        metric_key="physical_metrics",
+    )
+
     best_loss = float("inf")
     best_result: Optional[Mapping[str, Any]] = None
     best_task: Optional[Mapping[str, Any]] = None
@@ -295,6 +355,17 @@ def run_random_monte_carlo(
         physical_metrics=physical_metrics,
         time_elapsed=float(elapsed),
     )
+    formatted["reporting_mode"] = "mean_initializations"
+    formatted["reporting_num_initializations"] = int(total_samples)
+    formatted["reporting_num_valid_results"] = int(len(valid_results))
+    formatted["reporting_primary_loss"] = reporting_primary_loss
+    formatted["reporting_primary_fitness"] = (
+        float(-reporting_primary_loss)
+        if reporting_primary_loss is not None
+        else None
+    )
+    formatted["reporting_loss_components"] = reporting_loss_components
+    formatted["reporting_physical_metrics"] = reporting_physical_metrics
     formatted["iteration_trace"] = iteration_trace
     formatted["num_iterations"] = len(iteration_trace)
     return formatted
