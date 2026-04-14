@@ -359,6 +359,46 @@ def _expand_single_point_series(series: Sequence[float], target_len: int) -> Lis
     return values
 
 
+def _expand_series_to_target_len(series: Sequence[float], target_len: int) -> List[float]:
+    """Pad shorter series to one common length using the last available value."""
+    values = [float(value) for value in series]
+    if not values:
+        return []
+
+    resolved_target_len = int(max(target_len, 1))
+    if len(values) >= resolved_target_len:
+        return values
+
+    return values + [values[-1]] * int(resolved_target_len - len(values))
+
+
+def _summarize_iteration_alignment(traces_by_method: Mapping[str, Sequence[Mapping[str, Any]]]) -> Dict[str, Any]:
+    """Summarize raw per-method iteration lengths for one AP/seed trial."""
+    raw_lengths: Dict[str, int] = {
+        str(method): int(len(trace_rows))
+        for method, trace_rows in traces_by_method.items()
+        if trace_rows
+    }
+
+    if not raw_lengths:
+        return {
+            "raw_lengths": {},
+            "all_methods_same_iterations": True,
+            "min_iterations": 0,
+            "max_iterations": 0,
+            "unique_iteration_lengths": [],
+        }
+
+    unique_lengths = sorted({int(length) for length in raw_lengths.values()})
+    return {
+        "raw_lengths": raw_lengths,
+        "all_methods_same_iterations": len(unique_lengths) <= 1,
+        "min_iterations": int(min(unique_lengths)),
+        "max_iterations": int(max(unique_lengths)),
+        "unique_iteration_lengths": [int(value) for value in unique_lengths],
+    }
+
+
 def _extract_best_primary_loss(method: str, result_payload: Mapping[str, Any]) -> Optional[float]:
     """Extract best primary loss from method payload using robust fallbacks."""
     reporting_loss = _as_float(result_payload.get("reporting_primary_loss"))
@@ -1318,65 +1358,73 @@ def _build_iteration_trace_plot_data(
     store: SweepStore,
     methods: Sequence[str],
     ap_values: Sequence[int],
-    representative_seed: int,
+    seeds: Sequence[int],
 ) -> Dict[str, Any]:
-    """Build raw x/y payload for sweep-level iteration-trace plots."""
+    """Build raw x/y payload for sweep-level iteration-trace plots across all seeds."""
     payload: Dict[str, Any] = {}
 
     for num_aps in ap_values:
-        traces_by_method: Dict[str, TraceRows] = {}
-        for method in methods:
-            run_entry = store.get(method, {}).get(str(int(num_aps)), {}).get(str(int(representative_seed)), {})
-            if not isinstance(run_entry, Mapping):
-                continue
-            if run_entry.get("status") != "ok":
-                continue
+        seed_payload: Dict[str, Any] = {}
 
-            iteration_trace = run_entry.get("iteration_trace")
-            if not isinstance(iteration_trace, list) or not iteration_trace:
-                continue
-
-            trace_rows = [
-                dict(row)
-                for row in iteration_trace
-                if isinstance(row, Mapping)
-            ]
-            if trace_rows:
-                traces_by_method[method] = trace_rows
-
-        if not traces_by_method:
-            continue
-
-        metric_payload: Dict[str, Any] = {}
-        for metric_key, title, ylabel in _ITERATION_METRICS:
-            series_map: Dict[str, List[float]] = {
-                method: _extract_trace_metric_series(trace_rows, metric_key)
-                for method, trace_rows in traces_by_method.items()
-            }
-            max_len = max((len(series) for series in series_map.values()), default=0)
-
-            per_method_payload: Dict[str, Any] = {}
+        for seed in seeds:
+            traces_by_method: Dict[str, TraceRows] = {}
             for method in methods:
-                series = series_map.get(method, [])
-                if not series:
+                run_entry = store.get(method, {}).get(str(int(num_aps)), {}).get(str(int(seed)), {})
+                if not isinstance(run_entry, Mapping):
                     continue
-                expanded = _expand_single_point_series(series, target_len=max_len)
-                per_method_payload[method] = {
-                    "x": list(range(1, len(expanded) + 1)),
-                    "y": [float(value) for value in expanded],
+                if run_entry.get("status") != "ok":
+                    continue
+
+                iteration_trace = run_entry.get("iteration_trace")
+                if not isinstance(iteration_trace, list) or not iteration_trace:
+                    continue
+
+                trace_rows = [
+                    dict(row)
+                    for row in iteration_trace
+                    if isinstance(row, Mapping)
+                ]
+                if trace_rows:
+                    traces_by_method[method] = trace_rows
+
+            if not traces_by_method:
+                continue
+
+            metric_payload: Dict[str, Any] = {}
+            for metric_key, title, ylabel in _ITERATION_METRICS:
+                series_map: Dict[str, List[float]] = {
+                    method: _extract_trace_metric_series(trace_rows, metric_key)
+                    for method, trace_rows in traces_by_method.items()
+                }
+                max_len = max((len(series) for series in series_map.values()), default=0)
+
+                per_method_payload: Dict[str, Any] = {}
+                for method in methods:
+                    series = series_map.get(method, [])
+                    if not series:
+                        continue
+                    expanded = _expand_series_to_target_len(series, target_len=max_len)
+                    per_method_payload[method] = {
+                        "x": list(range(1, len(expanded) + 1)),
+                        "y": [float(value) for value in expanded],
+                    }
+
+                if per_method_payload:
+                    metric_payload[str(metric_key)] = {
+                        "title": str(title),
+                        "ylabel": str(ylabel),
+                        "per_method": per_method_payload,
+                    }
+
+            if metric_payload:
+                seed_payload[str(int(seed))] = {
+                    "metrics": metric_payload,
+                    "iteration_alignment": _summarize_iteration_alignment(traces_by_method),
                 }
 
-            if per_method_payload:
-                metric_payload[str(metric_key)] = {
-                    "title": str(title),
-                    "ylabel": str(ylabel),
-                    "per_method": per_method_payload,
-                }
-
-        if metric_payload:
+        if seed_payload:
             payload[str(int(num_aps))] = {
-                "representative_seed": int(representative_seed),
-                "metrics": metric_payload,
+                "seeds": seed_payload,
             }
 
     return payload
@@ -1472,85 +1520,96 @@ def plot_iteration_traces(
     store: SweepStore,
     methods: Sequence[str],
     ap_values: Sequence[int],
-    representative_seed: int,
+    seeds: Sequence[int],
     plots_dir: Path,
-) -> Dict[str, str]:
-    """Plot representative iteration convergence traces for each AP count."""
-    output_paths: Dict[str, str] = {}
+) -> Dict[str, Dict[str, str]]:
+    """Plot iteration convergence traces for every AP/seed combination."""
+    output_paths: Dict[str, Dict[str, str]] = {}
     iter_dir = plots_dir / "iteration_traces"
     iter_dir.mkdir(parents=True, exist_ok=True)
 
     for num_aps in ap_values:
-        traces_by_method: Dict[str, TraceRows] = {}
-        for method in methods:
-            run_entry = store.get(method, {}).get(str(int(num_aps)), {}).get(str(int(representative_seed)), {})
-            if not isinstance(run_entry, Mapping):
-                continue
-            if run_entry.get("status") != "ok":
-                continue
-
-            iteration_trace = run_entry.get("iteration_trace")
-            if not isinstance(iteration_trace, list) or not iteration_trace:
-                continue
-
-            trace_rows = [
-                dict(row)
-                for row in iteration_trace
-                if isinstance(row, Mapping)
-            ]
-            if trace_rows:
-                traces_by_method[method] = trace_rows
-
-        if not traces_by_method:
-            continue
-
-        figure, axes = plt.subplots(2, 2, figsize=(14.0, 10.0))
-        flattened_axes = list(axes.reshape(-1))
-
-        for axis, (metric_key, title, ylabel) in zip(flattened_axes, _ITERATION_METRICS):
-            series_map: Dict[str, List[float]] = {
-                method: _extract_trace_metric_series(trace_rows, metric_key)
-                for method, trace_rows in traces_by_method.items()
-            }
-            max_len = max((len(series) for series in series_map.values()), default=0)
-
+        for seed in seeds:
+            traces_by_method: Dict[str, TraceRows] = {}
             for method in methods:
-                series = series_map.get(method, [])
-                if not series:
+                run_entry = store.get(method, {}).get(str(int(num_aps)), {}).get(str(int(seed)), {})
+                if not isinstance(run_entry, Mapping):
+                    continue
+                if run_entry.get("status") != "ok":
                     continue
 
-                expanded = _expand_single_point_series(series, target_len=max_len)
-                x_values = np.arange(1, len(expanded) + 1, dtype=np.int64)
-                style = _method_style(method)
-                axis.plot(
-                    x_values,
-                    expanded,
-                    color=style["color"],
-                    marker=style["marker"],
-                    linewidth=1.8,
-                    markersize=3.8,
-                    label=_display_method_name(method),
+                iteration_trace = run_entry.get("iteration_trace")
+                if not isinstance(iteration_trace, list) or not iteration_trace:
+                    continue
+
+                trace_rows = [
+                    dict(row)
+                    for row in iteration_trace
+                    if isinstance(row, Mapping)
+                ]
+                if trace_rows:
+                    traces_by_method[method] = trace_rows
+
+            if not traces_by_method:
+                continue
+
+            alignment_summary = _summarize_iteration_alignment(traces_by_method)
+            if not bool(alignment_summary.get("all_methods_same_iterations", True)):
+                print(
+                    "[plot] iteration length mismatch "
+                    f"AP={int(num_aps)} seed={int(seed)} "
+                    f"raw_lengths={alignment_summary.get('raw_lengths', {})}"
                 )
 
-            axis.set_title(title)
-            axis.set_xlabel("Iteration")
-            axis.set_ylabel(ylabel)
-            axis.xaxis.set_major_locator(MaxNLocator(integer=True))
-            axis.xaxis.set_major_formatter(StrMethodFormatter("{x:.0f}"))
-            axis.grid(True, alpha=0.28)
-            axis.legend(loc="best")
+            figure, axes = plt.subplots(2, 2, figsize=(14.0, 10.0))
+            flattened_axes = list(axes.reshape(-1))
 
-        figure.suptitle(
-            f"Iteration Convergence Comparison | AP={int(num_aps)} | Seed={int(representative_seed)}",
-            fontsize=13,
-        )
-        figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
+            for axis, (metric_key, title, ylabel) in zip(flattened_axes, _ITERATION_METRICS):
+                series_map: Dict[str, List[float]] = {
+                    method: _extract_trace_metric_series(trace_rows, metric_key)
+                    for method, trace_rows in traces_by_method.items()
+                }
+                max_len = max((len(series) for series in series_map.values()), default=0)
 
-        output_path = iter_dir / f"aps_{int(num_aps):02d}_seed_{int(representative_seed):04d}_convergence.png"
-        figure.savefig(output_path, dpi=300, bbox_inches="tight")
-        plt.close(figure)
+                for method in methods:
+                    series = series_map.get(method, [])
+                    if not series:
+                        continue
 
-        output_paths[str(int(num_aps))] = str(output_path)
+                    expanded = _expand_series_to_target_len(series, target_len=max_len)
+                    x_values = np.arange(1, len(expanded) + 1, dtype=np.int64)
+                    style = _method_style(method)
+                    axis.plot(
+                        x_values,
+                        expanded,
+                        color=style["color"],
+                        marker=style["marker"],
+                        linewidth=1.8,
+                        markersize=3.8,
+                        label=_display_method_name(method),
+                    )
+
+                axis.set_title(title)
+                axis.set_xlabel("Iteration")
+                axis.set_ylabel(ylabel)
+                axis.xaxis.set_major_locator(MaxNLocator(integer=True))
+                axis.xaxis.set_major_formatter(StrMethodFormatter("{x:.0f}"))
+                axis.grid(True, alpha=0.28)
+                axis.legend(loc="best")
+
+            figure.suptitle(
+                f"Iteration Convergence Comparison | AP={int(num_aps)} | Seed={int(seed)}",
+                fontsize=13,
+            )
+            figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
+
+            output_path = iter_dir / f"aps_{int(num_aps):02d}_seed_{int(seed):04d}_convergence.png"
+            figure.savefig(output_path, dpi=300, bbox_inches="tight")
+            plt.close(figure)
+
+            ap_key = str(int(num_aps))
+            seed_key = str(int(seed))
+            output_paths.setdefault(ap_key, {})[seed_key] = str(output_path)
 
     return output_paths
 
@@ -1984,12 +2043,11 @@ def main() -> int:
     _write_json(sweep_results_path, sweep_payload)
     print(f"[save] sweep results: {sweep_results_path}")
 
-    representative_seed = int(seeds[0])
     iteration_trace_plot_data = _build_iteration_trace_plot_data(
         store=store,
         methods=methods,
         ap_values=ap_values,
-        representative_seed=representative_seed,
+        seeds=seeds,
     )
     elbow_plot_data = _build_elbow_plot_data(
         aggregates=aggregates,
@@ -2015,7 +2073,7 @@ def main() -> int:
             store=store,
             methods=methods,
             ap_values=ap_values,
-            representative_seed=representative_seed,
+            seeds=seeds,
             plots_dir=plots_dir,
         )
         plot_artifacts["elbow_plots"] = plot_elbow_curves(
