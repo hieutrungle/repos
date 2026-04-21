@@ -115,7 +115,7 @@
     "render_all_gd_trajectory_frames": true,
     "render_pso_gd_step_coverage_maps": true
   },
-  "output_dir": "tmp_comparison_results/hrbb_experiments",
+  "output_dir": "tmp_comparison_results_1/hrbb_experiments",
   "verbose": true,
   "iteration_equalization": {
     "enabled": true,

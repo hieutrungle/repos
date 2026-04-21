@@ -1,5 +1,5 @@
 {
-  "output_dir": "tmp_results1/experiments_sweep_hrbb/sweep_3ap",
+  "output_dir": "tmp_results1/experiments_2AP/sweep",
   "shared": {
     "verbose": true
   },
@@ -11,7 +11,7 @@
   ],
   "sweep_groups": [
     {
-      "name_prefix": "gd_lr_temp_alpha",
+      "name_prefix": "gd",
       "base_overrides": {
         "gd_optimization_params": {
           "num_iterations": 100,
@@ -21,8 +21,8 @@
         }
       },
       "grid": {
-        "gd_optimization_params.learning_rate": [0.01, 0.005],
-        "objective_params.softmin_temperature": [0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0, 2.0],
+        "gd_optimization_params.learning_rate": [0.005, 0.01],
+        "objective_params.softmin_temperature": [0.05, 0.1, 0.2, 0.3],
         "objective_params.alpha": [2.0],
         "random_seed": [42, 43, 44]
       }
