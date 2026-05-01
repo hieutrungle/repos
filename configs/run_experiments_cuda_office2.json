@@ -1,0 +1,124 @@
+{
+  "scene_config": {
+    "scene_path": "/home/hieule/blender/models/building_floor_ceil/building_floor_ceil.xml",
+    "frequency": 5180000000.0,
+    "tx_power_dbm": 20.0,
+    "tx_positions": [
+      [10.0, 15.0, 3.8],
+      [25.0, 30.0, 3.8],
+      [20.0, 25.0, 3.8],
+      [30.0, 10.0, 3.8],
+      [20.0, 10.0, 3.8],
+      [25.0, 15.0, 3.8],
+      [15.0, 25.0, 3.8]
+    ],
+    "reflector_enabled": true,
+    "reflector_size": [2.0, 2.0],
+    "wall_top_left": [14.5, 24.0, 3.0],
+    "wall_bottom_right": [14.5, 6.0, 1.0],
+    "focal_point": [25.0, 25.0, 1.5],
+    "device": "cuda"
+  },
+  "visualization_scene_config": {
+    "scene_path": "/home/hieule/blender/models/building_floor/building_floor.xml"
+  },
+  "position_bounds": {
+    "x_min": 5.5,
+    "x_max": 34.5,
+    "y_min": 5.5,
+    "y_max": 34.5
+  },
+  "fixed_z": 3.8,
+  "num_pool_workers": 1,
+  "gpu_fraction": 1.0,
+  "random_seed": 43,
+  "num_aps": 3,
+  "min_ap_separation": 2.0,
+  "optimize_orientation": true,
+  "reflector_enabled": true,
+  "focal_z": 1.5,
+  "demand_config": {
+    "enabled": true,
+    "bounding_boxes": [
+      [[5.5, 36.0], [10.0, 5.0]],
+      [[29.0, 25.5], [36.0, 5.0]],
+      [[15.0, 35.0], [35.0, 30.0]],
+      [[15.0, 25.0], [24.0, 5.5]]
+    ],
+    "box_weights": [8.0, 8.0, 6.0, 4.0],
+    "apply_blur": false
+  },
+  "objective_params": {
+    "alpha": 2.0,
+    "beta": 0.1,
+    "softmin_temperature": 0.3,
+    "softmin_floor_dbm": -100.0,
+    "softmin_ceil_dbm": -50.0,
+    "coverage_threshold_dbm": -70.0,
+    "coverage_temperature": 1.0
+  },
+  "ga_params": {
+    "pop_size": 50,
+    "n_gen": 50,
+    "cxpb": 0.6,
+    "mutpb": 0.4,
+    "tournsize": 15,
+    "hof_size": 20
+  },
+  "ga_evaluation_params": {
+    "samples_per_tx": 1000000,
+    "max_depth": 13,
+    "verbose": false
+  },
+  "gd_optimization_params": {
+    "num_iterations": 15,
+    "learning_rate": 0.005,
+    "samples_per_tx": 1000000,
+    "max_depth": 13,
+    "verbose": false
+  },
+  "random_params": {
+    "num_samples": 150
+  },
+  "kmeans_params": {
+    "grid_size": 250
+  },
+  "random_gd_params": {
+    "num_samples": 5
+  },
+  "pso_params": {
+    "swarm_size": 50,
+    "num_iterations": 50,
+    "tvac_enabled": true,
+    "w_start": 0.9,
+    "w_end": 0.4,
+    "c1_start": 2.5,
+    "c1_end": 0.5,
+    "c2_start": 0.5,
+    "c2_end": 2.5,
+    "w": 0.6,
+    "c1": 1.6,
+    "c2": 1.6
+  },
+  "k_seeds": 2,
+  "d_corr": 0.0,
+  "camera": {
+    "position": [20.0, 20.0, 70.0],
+    "look_at": [20.0, 20.1, 1.5]
+  },
+  "coverage_plot_settings": {
+    "samples_per_tx": 1000000,
+    "max_depth": 13,
+    "resolution": [1200, 900],
+    "render_ga_generation_best_coverage_maps": false,
+    "render_gd_trajectory_coverage_maps": false,
+    "render_all_gd_trajectory_frames": false,
+    "render_pso_gd_step_coverage_maps": false
+  },
+  "output_dir": "tmp_comparison_results2/office_experiments-no_reflector",
+  "verbose": true,
+  "iteration_equalization": {
+    "enabled": true,
+    "target_iterations": 65
+  }
+}
